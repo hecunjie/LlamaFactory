@@ -337,27 +337,18 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
             reasoning_labels = padded_reasoning["labels"]
 
         # Handle special_token_mask padding
-        special_token_mask = None
+        special_token_mask_list = None
         if "special_token_mask" in features[0]:
             special_token_mask_list = [feature.pop("special_token_mask") for feature in features]
-            # Pad manually
-            max_len = max(len(x) for x in special_token_mask_list)
-            if "input_ids" in features[0]: # Align with input_ids padding
-                # Wait, data collator might pad input_ids to a different length (multiple of 8 etc)
-                # We should wait until super call returns input_ids, then check length?
-                # But input_ids are padded in super().__call__.
-                pass
 
         features = super().__call__(features)
-        
+
         # Now fix special_token_mask padding to match input_ids
-        if special_token_mask is None and "special_token_mask" in vars() and special_token_mask_list:
-             # Find target length from padded input_ids
+        if special_token_mask_list is not None:
              target_len = features["input_ids"].shape[1]
              padded_masks = []
              for mask in special_token_mask_list:
                  pad_len = target_len - len(mask)
-                 # Pad with 0
                  if self.tokenizer.padding_side == "right":
                      padded_masks.append(mask + [0] * pad_len)
                  else:
