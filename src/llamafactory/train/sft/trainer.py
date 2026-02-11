@@ -117,103 +117,115 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return super()._get_train_sampler(*args, **kwargs)
 
-    @override
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # 1. Pop custom fields
+    def _compute_sft_and_reasoning_loss(
+        self,
+        model: "torch.nn.Module",
+        inputs: dict[str, Union["torch.Tensor", Any]],
+        num_items_in_batch: Optional[int] = None,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", Any]:
+        r"""Shared loss computation for both training and evaluation.
+
+        Returns:
+            total_loss: loss_sft + loss_reasoning
+            loss_sft: standard SFT cross-entropy loss
+            loss_reasoning: reasoning recovery loss (0 if no reasoning data)
+            outputs: model outputs (with logits, hidden_states, etc.)
+        """
+        # Pop custom fields
         reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
         reasoning_labels = inputs.pop("reasoning_labels", None)
+        inputs.pop("reasoning_attention_mask", None)
         special_token_mask = inputs.pop("special_token_mask", None)
 
-        # 2. Check if we should compute reasoning loss
-        do_reasoning = (
-            reasoning_input_ids is not None
-            and special_token_mask is not None
-        )
-
+        do_reasoning = reasoning_input_ids is not None and special_token_mask is not None
         if do_reasoning:
             inputs["output_hidden_states"] = True
 
-        # 3. Single forward pass
-        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        # Single forward pass — SFT loss
+        loss_sft, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
+        )
 
-        # 4. Compute Reasoning Loss using LM Head projection (no second forward)
-        added_reasoning_loss = torch.tensor(0.0, device=loss.device)
+        # Reasoning loss via LM Head projection (no second forward)
+        loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
         if do_reasoning:
             hidden_states = getattr(outputs, "hidden_states", None)
             if isinstance(outputs, dict):
                 hidden_states = outputs.get("hidden_states", hidden_states)
 
             if hidden_states is not None:
-                last_hidden_state = hidden_states[-1]  # (batch, seq, dim)
-                batch_size = last_hidden_state.size(0)
+                last_hidden = hidden_states[-1]  # (batch, seq, dim)
+                batch_size = last_hidden.size(0)
 
-                # Get LM Head from the model
-                unwrapped_model = model
-                while hasattr(unwrapped_model, "module"):
-                    unwrapped_model = unwrapped_model.module
-                lm_head = unwrapped_model.lm_head
+                unwrapped = model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                lm_head = unwrapped.lm_head
 
-                total_reasoning_loss = torch.tensor(0.0, device=loss.device)
-                valid_samples = 0
-
+                total, valid = torch.tensor(0.0, device=loss_sft.device), 0
                 for i in range(batch_size):
-                    mask = special_token_mask[i]  # (seq,)
+                    mask = special_token_mask[i]
                     n_special = mask.sum().item()
                     if n_special == 0:
                         continue
 
-                    # Get hidden states at special token positions
-                    spec_h = last_hidden_state[i][mask == 1]  # (n_special, dim)
-
-                    # Get reasoning labels for this sample
+                    spec_h = last_hidden[i][mask == 1]  # (n_special, dim)
                     r_lbls = reasoning_labels[i]
                     valid_len = (reasoning_input_ids[i] != self.processing_class.pad_token_id).sum().item()
-                    r_lbls = r_lbls[:valid_len]  # (n_reasoning,)
-
-                    # Match lengths: each special token predicts a reasoning token
+                    r_lbls = r_lbls[:valid_len]
                     n_predict = min(n_special, len(r_lbls))
                     if n_predict == 0:
                         continue
 
-                    # Project special token hidden states through LM Head to get logits
-                    spec_logits = lm_head(spec_h[:n_predict])  # (n_predict, vocab_size)
-
-                    # Cross-entropy loss: predict reasoning tokens from special token hidden states
-                    reasoning_loss_i = torch.nn.functional.cross_entropy(
-                        spec_logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
+                    logits = lm_head(spec_h[:n_predict])
+                    total = total + torch.nn.functional.cross_entropy(
+                        logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
                     )
-                    total_reasoning_loss = total_reasoning_loss + reasoning_loss_i
-                    valid_samples += 1
+                    valid += 1
 
-                if valid_samples > 0:
-                    added_reasoning_loss = total_reasoning_loss / valid_samples
-                    loss = loss + added_reasoning_loss
+                if valid > 0:
+                    loss_reasoning = total / valid
 
-        # Log Losses
+        total_loss = loss_sft + loss_reasoning
+        return total_loss, loss_sft, loss_reasoning, outputs
+
+    # ---- Training ----
+
+    @override
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        total_loss, loss_sft, loss_reasoning, outputs = self._compute_sft_and_reasoning_loss(
+            model, inputs, num_items_in_batch
+        )
+
         if self.model.training:
             if not hasattr(self, "_custom_loss_buffer"):
-                self._custom_loss_buffer = {"reasoning": [], "sft": []}
+                self._custom_loss_buffer = {"sft": [], "reasoning": []}
+            self._custom_loss_buffer["sft"].append(loss_sft.detach().float())
+            self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float())
 
-            sft_loss = loss - added_reasoning_loss
-            self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
-            self._custom_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
-
-        return loss if not return_outputs else (loss, outputs)
+        return total_loss if not return_outputs else (total_loss, outputs)
 
     @override
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        # Inject train-time split losses
         if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
-             # Average and add to logs
-             for k, v in self._custom_loss_buffer.items():
-                 if v: # Check if list is not empty
-                     avg = torch.stack(v).mean().item()
-                     logs[f"loss_{k}"] = round(avg, 4)
-             self._custom_loss_buffer = {"sft": [], "reasoning": []}
-             
+            for k, v in self._custom_loss_buffer.items():
+                if v:
+                    logs[f"loss_{k}"] = round(torch.stack(v).mean().item(), 4)
+            self._custom_loss_buffer = {"sft": [], "reasoning": []}
+
+        # Inject eval-time split losses (belt-and-suspenders with evaluation_loop)
+        if hasattr(self, "_eval_loss_buffer") and self._eval_loss_buffer:
+            for k, v in self._eval_loss_buffer.items():
+                if v:
+                    logs[f"eval_loss_{k}"] = round(torch.stack(v).mean().item(), 4)
+
         if start_time is not None:
-             super().log(logs, start_time)
+            super().log(logs, start_time)
         else:
-             super().log(logs)
+            super().log(logs)
+
+    # ---- Evaluation ----
 
     @override
     def prediction_step(
@@ -224,15 +236,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         ignore_keys: Optional[list[str]] = None,
         **gen_kwargs,
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
-        r"""Override to compute reasoning loss during eval and remove custom fields for generate."""
-        # Extract custom fields
-        reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
-        reasoning_labels = inputs.pop("reasoning_labels", None)
-        inputs.pop("reasoning_attention_mask", None)
-        special_token_mask = inputs.pop("special_token_mask", None)
-
+        r"""Compute eval loss (with reasoning split) or generate tokens."""
         if self.args.predict_with_generate:
-            # Generation mode: no reasoning loss, just generate
+            # Generation mode — pop custom fields and delegate
+            inputs.pop("reasoning_input_ids", None)
+            inputs.pop("reasoning_labels", None)
+            inputs.pop("reasoning_attention_mask", None)
+            inputs.pop("special_token_mask", None)
             labels = inputs.pop("labels", None)
             loss, generated_tokens, _ = super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
@@ -241,95 +251,36 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
                 generated_tokens = generated_tokens.contiguous()
             return loss, generated_tokens, labels
-        else:
-            # Non-generate eval: compute loss with reasoning split
-            labels = inputs.get("labels")
 
-            do_reasoning = (
-                reasoning_input_ids is not None
-                and special_token_mask is not None
-            )
+        # Non-generate eval: reuse the shared loss function
+        labels = inputs.get("labels")
+        with torch.no_grad():
+            total_loss, loss_sft, loss_reasoning, outputs = self._compute_sft_and_reasoning_loss(model, inputs)
 
-            if do_reasoning:
-                inputs["output_hidden_states"] = True
+        # Buffer for aggregation in evaluation_loop
+        if not hasattr(self, "_eval_loss_buffer"):
+            self._eval_loss_buffer = {"sft": [], "reasoning": []}
+        self._eval_loss_buffer["sft"].append(loss_sft.detach().float().cpu())
+        self._eval_loss_buffer["reasoning"].append(loss_reasoning.detach().float().cpu())
 
-            # Standard forward for SFT loss
-            with torch.no_grad():
-                loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+        logits = None
+        if not prediction_loss_only:
+            logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
 
-            # Compute reasoning loss (same logic as compute_loss)
-            added_reasoning_loss = torch.tensor(0.0, device=loss.device)
-            if do_reasoning:
-                hidden_states = getattr(outputs, "hidden_states", None)
-                if isinstance(outputs, dict):
-                    hidden_states = outputs.get("hidden_states", hidden_states)
-
-                if hidden_states is not None:
-                    last_hidden_state = hidden_states[-1]
-                    batch_size = last_hidden_state.size(0)
-
-                    unwrapped_model = model
-                    while hasattr(unwrapped_model, "module"):
-                        unwrapped_model = unwrapped_model.module
-                    lm_head = unwrapped_model.lm_head
-
-                    total_reasoning_loss = torch.tensor(0.0, device=loss.device)
-                    valid_samples = 0
-
-                    for i in range(batch_size):
-                        mask = special_token_mask[i]
-                        n_special = mask.sum().item()
-                        if n_special == 0:
-                            continue
-
-                        spec_h = last_hidden_state[i][mask == 1]
-                        r_lbls = reasoning_labels[i]
-                        valid_len = (reasoning_input_ids[i] != self.processing_class.pad_token_id).sum().item()
-                        r_lbls = r_lbls[:valid_len]
-
-                        n_predict = min(n_special, len(r_lbls))
-                        if n_predict == 0:
-                            continue
-
-                        spec_logits = lm_head(spec_h[:n_predict])
-                        reasoning_loss_i = torch.nn.functional.cross_entropy(
-                            spec_logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
-                        )
-                        total_reasoning_loss = total_reasoning_loss + reasoning_loss_i
-                        valid_samples += 1
-
-                    if valid_samples > 0:
-                        added_reasoning_loss = total_reasoning_loss / valid_samples
-
-            # Buffer eval losses for later aggregation
-            if not hasattr(self, "_eval_loss_buffer"):
-                self._eval_loss_buffer = {"sft": [], "reasoning": []}
-            self._eval_loss_buffer["sft"].append(loss.detach().float())
-            self._eval_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
-
-            total_loss = loss + added_reasoning_loss
-
-            # Get logits for metrics (e.g. exact match via argmax)
-            logits = None
-            if not prediction_loss_only:
-                if isinstance(outputs, dict):
-                    logits = outputs.get("logits")
-                elif hasattr(outputs, "logits"):
-                    logits = outputs.logits
-
-            return total_loss.detach(), logits, labels
+        return total_loss.detach(), logits, labels
 
     @override
     def evaluation_loop(self, *args, **kwargs):
-        # Reset eval loss buffer before eval loop
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         output = super().evaluation_loop(*args, **kwargs)
-        # Inject split losses into metrics BEFORE evaluate() logs them
-        if self._eval_loss_buffer:
-            for k, v in self._eval_loss_buffer.items():
-                if v:
-                    avg = torch.stack(v).mean().item()
-                    output.metrics[f"eval_loss_{k}"] = round(avg, 4)
+        # Inject split losses into metrics before evaluate() calls self.log()
+        for k, v in self._eval_loss_buffer.items():
+            if v:
+                output.metrics[f"eval_loss_{k}"] = round(torch.stack(v).mean().item(), 4)
+        logger.info_rank0(
+            f"[eval] eval_loss_sft={output.metrics.get('eval_loss_sft', 'N/A')}, "
+            f"eval_loss_reasoning={output.metrics.get('eval_loss_reasoning', 'N/A')}"
+        )
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         return output
 
