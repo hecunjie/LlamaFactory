@@ -113,9 +113,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                     response=response_1,
                     system=examples["_system"][i],
                     tools=examples["_tools"][i],
-                    images=examples["_images"][i] if "_images" in examples else [],
-                    videos=examples["_videos"][i] if "_videos" in examples else [],
-                    audios=examples["_audios"][i] if "_audios" in examples else [],
+                    images=examples["_images"][i] if "_images" in examples and examples["_images"][i] is not None else [],
+                    videos=examples["_videos"][i] if "_videos" in examples and examples["_videos"][i] is not None else [],
+                    audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
                 )
                 
                 # 2. Prepare Reasoning data (Tokenize regular text)
@@ -182,16 +182,26 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 response=examples["_response"][i],
                 system=examples["_system"][i],
                 tools=examples["_tools"][i],
-                images=examples["_images"][i] or [],
-                videos=examples["_videos"][i] or [],
-                audios=examples["_audios"][i] or [],
+                images=examples["_images"][i] if "_images" in examples and examples["_images"][i] is not None else [],
+                videos=examples["_videos"][i] if "_videos" in examples and examples["_videos"][i] is not None else [],
+                audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
             )
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
-            model_inputs["images"].append(examples["_images"][i])
-            model_inputs["videos"].append(examples["_videos"][i])
-            model_inputs["audios"].append(examples["_audios"][i])
+            
+            if "_images" in examples:
+                model_inputs["images"].append(examples["_images"][i])
+            if "_videos" in examples:
+                model_inputs["videos"].append(examples["_videos"][i])
+            if "_audios" in examples:
+                model_inputs["audios"].append(examples["_audios"][i])
+
+            # consistency for reasoning columns
+            model_inputs["special_token_mask"].append([0] * len(input_ids))
+            model_inputs["reasoning_input_ids"].append([])
+            model_inputs["reasoning_labels"].append([])
+            model_inputs["reasoning_attention_mask"].append([])
 
         return model_inputs
 

@@ -208,6 +208,45 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             else:  # for qwen vl
                 features["position_ids"], features["rope_deltas"] = self.get_rope_func(**rope_index_kwargs)
 
+        # Handle reasoning fields
+        reasoning_dict = {}
+        for key in ["reasoning_input_ids", "reasoning_labels", "reasoning_attention_mask", "special_token_mask"]:
+            if features and key in features[0]:
+                reasoning_dict[key] = [f.pop(key) for f in features]
+        
+        # Call super (handles basic keys)
+        features: dict[str, torch.Tensor] = super().__call__(features)
+
+        # Restore reasoning fields
+        if "special_token_mask" in reasoning_dict:
+             mask_list = reasoning_dict["special_token_mask"]
+             if any(len(x) > 0 for x in mask_list):
+                 input_ids = features["input_ids"]
+                 bsz, seq_len = input_ids.shape
+                 padded_mask = torch.zeros(bsz, seq_len, dtype=torch.long)
+                 for i, mask in enumerate(mask_list):
+                     l = len(mask)
+                     if l > 0:
+                         l = min(l, seq_len) # safety
+                         t = torch.tensor(mask[:l], dtype=torch.long)
+                         if self.tokenizer.padding_side == "left":
+                             padded_mask[i, seq_len-l:] = t
+                         else:
+                             padded_mask[i, :l] = t
+                 features["special_token_mask"] = padded_mask
+
+        for key in ["reasoning_input_ids", "reasoning_labels", "reasoning_attention_mask"]:
+             if key in reasoning_dict:
+                 data_list = reasoning_dict[key]
+                 if any(len(x) > 0 for x in data_list):
+                     if key == "reasoning_input_ids": pad_val = self.tokenizer.pad_token_id
+                     elif key == "reasoning_labels": pad_val = IGNORE_INDEX
+                     else: pad_val = 0
+                     
+                     # Force right padding for reasoning fields as required by trainer logic
+                     tensors = [torch.tensor(x, dtype=torch.long) for x in data_list]
+                     features[key] = torch.nn.utils.rnn.pad_sequence(tensors, batch_first=True, padding_value=pad_val)
+
         if (
             self.model is not None
             and getattr(self.model.config, "model_type", None)
