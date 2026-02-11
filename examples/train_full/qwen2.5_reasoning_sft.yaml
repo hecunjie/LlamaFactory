@@ -1,6 +1,8 @@
 ### model
 model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-1.5B-Instruct
 trust_remote_code: true
+resize_vocab: true
+add_special_tokens: "<think_start>,<calc>,<science>"
 
 ### method
 stage: sft

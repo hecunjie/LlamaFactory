@@ -291,6 +291,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         Subclass and override to inject custom behavior.
         """
+        # Pop custom fields that model.generate() / model.forward() don't understand
+        inputs.pop("reasoning_input_ids", None)
+        inputs.pop("reasoning_labels", None)
+        inputs.pop("reasoning_attention_mask", None)
+        inputs.pop("special_token_mask", None)
+
         if self.args.predict_with_generate:  # do not pass labels to model when generate
             labels = inputs.pop("labels", None)
         else:

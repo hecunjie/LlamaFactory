@@ -126,44 +126,26 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
 
                 # 3. Create Special Token Mask
-                # Find where special tokens are in the labels.
-                special_tokens_ids = self.tokenizer.encode(special_tokens, add_special_tokens=False)
+                # Strategy: encode the response with and without the special_tokens prefix
+                # to determine exactly how many tokens the special_tokens occupy.
+                # The response was: special_tokens + "\n" + original_response
+                # We encode special_tokens + "\n" alone to find its token count.
+                special_prefix = special_tokens + "\n"
+                special_prefix_ids = self.tokenizer.encode(special_prefix, add_special_tokens=False)
+                n_special = len(special_prefix_ids)
                 
-                # Find sub-sequence in labels
-                # labels has IGNORE_INDEX for input part.
                 special_token_mask = [0] * len(labels)
                 
-                # Simple search for the sequence
-                # Note: special_tokens might be tokenized differently when prepended to \n + original_response
-                # vs standalone. This is a risk.
-                # Ideally, we should check how it was encoded in _encode_data_example.
-                # Since we don't have easy access to the exact span from _encode_data_example,
-                # we search for the sequence in the labels.
+                # Find the first non-IGNORE_INDEX position in labels (= start of response tokens)
+                response_start = -1
+                for j in range(len(labels)):
+                    if labels[j] != IGNORE_INDEX:
+                        response_start = j
+                        break
                 
-                found = False
-                n = len(special_tokens_ids)
-                if n > 0:
-                    for j in range(len(labels) - n + 1):
-                        # Skip IGNORE_INDEX
-                        if labels[j] == IGNORE_INDEX:
-                            continue
-                        
-                        if labels[j:j+n] == special_tokens_ids:
-                            # Found match
-                            for k in range(j, j+n):
-                                special_token_mask[k] = 1
-                            found = True
-                            break # Assume first occurrence is the one (it's at the start of response)
-                
-                if not found:
-                     # Fallback check
-                     # logger.warning_rank0(f"Special tokens not found in labels! Tokens: {special_tokens}, IDs: {special_tokens_ids}")
-                     # Try finding subset or just first token? No, unsafe.
-                     # Just warn.
-                     pass 
-                
-                # Check consistency
-                # assert len(special_token_mask) == len(labels)
+                if response_start >= 0 and n_special > 0:
+                    for j in range(response_start, min(response_start + n_special, len(labels))):
+                        special_token_mask[j] = 1
 
 
                 model_inputs["input_ids"].append(input_ids)
