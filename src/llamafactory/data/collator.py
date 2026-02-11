@@ -180,6 +180,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             for i, feature in enumerate(features):
                 feature["token_type_ids"] = token_type_ids[i]
 
+        # Handle reasoning fields
+        reasoning_dict = {}
+        for key in ["reasoning_input_ids", "reasoning_labels", "reasoning_attention_mask", "special_token_mask"]:
+            if features and key in features[0]:
+                reasoning_dict[key] = [f.pop(key) for f in features]
+
         features: dict[str, torch.Tensor] = super().__call__(features)
 
         if self.get_rope_func is not None:
@@ -207,15 +213,6 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 ).unsqueeze(-1)
             else:  # for qwen vl
                 features["position_ids"], features["rope_deltas"] = self.get_rope_func(**rope_index_kwargs)
-
-        # Handle reasoning fields
-        reasoning_dict = {}
-        for key in ["reasoning_input_ids", "reasoning_labels", "reasoning_attention_mask", "special_token_mask"]:
-            if features and key in features[0]:
-                reasoning_dict[key] = [f.pop(key) for f in features]
-        
-        # Call super (handles basic keys)
-        features: dict[str, torch.Tensor] = super().__call__(features)
 
         # Restore reasoning fields
         if "special_token_mask" in reasoning_dict:
