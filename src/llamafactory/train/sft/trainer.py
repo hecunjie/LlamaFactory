@@ -224,29 +224,114 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         ignore_keys: Optional[list[str]] = None,
         **gen_kwargs,
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
-        r"""Remove the prompt part in the generated tokens.
-
-        Subclass and override to inject custom behavior.
-        """
-        # Pop custom fields that model.generate() / model.forward() don't understand
-        inputs.pop("reasoning_input_ids", None)
-        inputs.pop("reasoning_labels", None)
+        r"""Override to compute reasoning loss during eval and remove custom fields for generate."""
+        # Extract custom fields
+        reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
+        reasoning_labels = inputs.pop("reasoning_labels", None)
         inputs.pop("reasoning_attention_mask", None)
-        inputs.pop("special_token_mask", None)
+        special_token_mask = inputs.pop("special_token_mask", None)
 
-        if self.args.predict_with_generate:  # do not pass labels to model when generate
+        if self.args.predict_with_generate:
+            # Generation mode: no reasoning loss, just generate
             labels = inputs.pop("labels", None)
+            loss, generated_tokens, _ = super().prediction_step(
+                model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
+            )
+            if generated_tokens is not None:
+                generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
+                generated_tokens = generated_tokens.contiguous()
+            return loss, generated_tokens, labels
         else:
+            # Non-generate eval: compute loss with reasoning split
             labels = inputs.get("labels")
 
-        loss, generated_tokens, _ = super().prediction_step(
-            model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
-        )
-        if generated_tokens is not None and self.args.predict_with_generate:
-            generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
-            generated_tokens = generated_tokens.contiguous()
+            do_reasoning = (
+                reasoning_input_ids is not None
+                and special_token_mask is not None
+            )
 
-        return loss, generated_tokens, labels
+            if do_reasoning:
+                inputs["output_hidden_states"] = True
+
+            # Standard forward for SFT loss
+            with torch.no_grad():
+                loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+
+            # Compute reasoning loss (same logic as compute_loss)
+            added_reasoning_loss = torch.tensor(0.0, device=loss.device)
+            if do_reasoning:
+                hidden_states = getattr(outputs, "hidden_states", None)
+                if isinstance(outputs, dict):
+                    hidden_states = outputs.get("hidden_states", hidden_states)
+
+                if hidden_states is not None:
+                    last_hidden_state = hidden_states[-1]
+                    batch_size = last_hidden_state.size(0)
+
+                    unwrapped_model = model
+                    while hasattr(unwrapped_model, "module"):
+                        unwrapped_model = unwrapped_model.module
+                    lm_head = unwrapped_model.lm_head
+
+                    total_reasoning_loss = torch.tensor(0.0, device=loss.device)
+                    valid_samples = 0
+
+                    for i in range(batch_size):
+                        mask = special_token_mask[i]
+                        n_special = mask.sum().item()
+                        if n_special == 0:
+                            continue
+
+                        spec_h = last_hidden_state[i][mask == 1]
+                        r_lbls = reasoning_labels[i]
+                        valid_len = (reasoning_input_ids[i] != self.processing_class.pad_token_id).sum().item()
+                        r_lbls = r_lbls[:valid_len]
+
+                        n_predict = min(n_special, len(r_lbls))
+                        if n_predict == 0:
+                            continue
+
+                        spec_logits = lm_head(spec_h[:n_predict])
+                        reasoning_loss_i = torch.nn.functional.cross_entropy(
+                            spec_logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
+                        )
+                        total_reasoning_loss = total_reasoning_loss + reasoning_loss_i
+                        valid_samples += 1
+
+                    if valid_samples > 0:
+                        added_reasoning_loss = total_reasoning_loss / valid_samples
+
+            # Buffer eval losses for later aggregation
+            if not hasattr(self, "_eval_loss_buffer"):
+                self._eval_loss_buffer = {"sft": [], "reasoning": []}
+            self._eval_loss_buffer["sft"].append(loss.detach().float())
+            self._eval_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
+
+            total_loss = loss + added_reasoning_loss
+
+            # Get logits for metrics (e.g. exact match via argmax)
+            logits = None
+            if not prediction_loss_only:
+                if isinstance(outputs, dict):
+                    logits = outputs.get("logits")
+                elif hasattr(outputs, "logits"):
+                    logits = outputs.logits
+
+            return total_loss.detach(), logits, labels
+
+    @override
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", **gen_kwargs):
+        # Reset eval loss buffer
+        self._eval_loss_buffer = {"sft": [], "reasoning": []}
+        result = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs)
+        # Inject split losses into metrics
+        if self._eval_loss_buffer:
+            for k, v in self._eval_loss_buffer.items():
+                if v:
+                    avg = torch.stack(v).mean().item()
+                    result[f"{metric_key_prefix}_loss_{k}"] = round(avg, 4)
+        self._eval_loss_buffer = {"sft": [], "reasoning": []}
+        return result
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
