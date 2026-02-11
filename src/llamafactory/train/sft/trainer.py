@@ -124,6 +124,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         reasoning_labels = inputs.pop("reasoning_labels", None)
         special_token_mask = inputs.pop("special_token_mask", None)
         
+        # DEBUG PRINTS
+        if self.state.global_step % 10 == 0:
+             has_r_ids = reasoning_input_ids is not None
+             has_mask = special_token_mask is not None
+             # logger.info_rank0(f"Step {self.state.global_step}: Has R_ids: {has_r_ids}, Has Mask: {has_mask}")
+
         # 2. Add hidden states request if needed for reasoning
         # Check if we should do the reasoning loss pass
         do_reasoning = (
@@ -150,6 +156,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
              loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
 
         # 4. Compute Reasoning Loss
+        added_reasoning_loss = torch.tensor(0.0, device=loss.device)
         if do_reasoning:
             # outputs is (loss, logits, hidden_states, ...) or Seq2SeqLMOutput
             if isinstance(outputs, dict):
@@ -158,10 +165,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 hidden_states = outputs.hidden_states
             else:
                 # Tuple: loss, logits, hidden_states (if output_hidden_states=True)
-                # HF standard: if output_hidden_states=True, hidden_states is usually 3rd or inside.
-                # For CausalLM: (loss, logits, past_key_values, hidden_states, attentions)
-                # Let's hope it's index 2 or 3 depending on return_dict.
-                # Usually return_dict=True by default in TrainingArguments?
                 hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else None
 
             if hidden_states is not None:
@@ -204,8 +207,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                     # Get embeddings
                     # model.get_input_embeddings() works for CausalLM
-                    # For Seq2Seq (Encoder-Decoder), this logic is different.
-                    # Assuming CausalLM (LlamaFactory mostly SFTs Decoder models like Llama, Qwen).
                     model_embeds = model.get_input_embeddings()
                     r_embeds = model_embeds(r_ids) # (len, dim)
                     
@@ -214,11 +215,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     combined_embeds = torch.cat([spec_tokens_h, r_embeds], dim=0) # (k + len, dim)
                     
                     # Labels
-                    # Target: [IGNORE... (for SpecialTokens), ReasoningLabels]
-                    # Note: CausalLM shifts labels internally. 
-                    # If we pass labels matching input length, it calculates loss.
-                    # We want to predict Reasoning.
-                    # Labels for SpecialTokens part should be IGNORE_INDEX
                     prefix_labels = torch.full((spec_tokens_h.size(0),), IGNORE_INDEX, device=last_hidden_state.device, dtype=torch.long)
                     combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
                     
@@ -230,16 +226,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     # Pad sequences to batch them
                     from torch.nn.utils.rnn import pad_sequence
                     
-                    # Pad inputs_embeds
-                    # We can't use pad_sequence on embeddings directly easily if used with forward?
-                    # Yes we can. Pad with 0.
                     input_embeds_padded = pad_sequence(proj_inputs_list, batch_first=True, padding_value=0.0)
                     labels_padded = pad_sequence(reasoning_labels_list, batch_first=True, padding_value=IGNORE_INDEX)
                     
                     # Attention mask
-                    # 1 for real tokens, 0 for pad
-                    # lengths are in [x.size(0) for x in proj_inputs_list]
-                    # Create mask
                     seq_lens = [x.size(0) for x in proj_inputs_list]
                     max_len = max(seq_lens)
                     att_mask = torch.zeros((valid_samples, max_len), dtype=torch.long, device=last_hidden_state.device)
@@ -247,7 +237,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         att_mask[idx, :l] = 1
                         
                     # Forward Pass 2
-                    # Note: We must NOT pass input_ids, only inputs_embeds
                     outputs_reasoning = model(
                         inputs_embeds=input_embeds_padded,
                         attention_mask=att_mask,
@@ -256,30 +245,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     
                     batch_reasoning_loss = outputs_reasoning.loss
                     loss += batch_reasoning_loss
-                    
-                    # Store for logging
-                    if not hasattr(self, "_stored_logs"):
-                         self._stored_logs = {}
-                    
-                    # Store the standard loss (approximate if accumulation)
-                    # Note: We need to handle gradient accumulation averaging if we want it perfect,
-                    # but for simple logging:
-                    # current_loss = loss.item() # This is total
-                    # reasoning = batch_reasoning_loss.item()
-                    # sft = current_loss - reasoning 
-                    # But we are in a forward pass, detaching is needed.
-                    
-                    # We accumulate these into a buffer and average them in `log`?
-                    # HF Trainer averages `tr_loss` automatically.
-                    # We can use `self.log` directly? No, it triggers callbacks.
-                    
-                    # Let's accumulate into a simple buffer that gets cleared on log.
-                    if not hasattr(self, "_custom_loss_buffer"):
-                        self._custom_loss_buffer = {"sft": [], "reasoning": []}
-                        
-                    sft_loss = loss - batch_reasoning_loss
-                    self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
-                    self._custom_loss_buffer["reasoning"].append(batch_reasoning_loss.detach().float())
+                    added_reasoning_loss = batch_reasoning_loss
+
+        # Log Losses
+        if self.model.training:
+             if not hasattr(self, "_custom_loss_buffer"):
+                 self._custom_loss_buffer = {"reasoning": [], "sft": []}
+             
+             sft_loss = loss - added_reasoning_loss
+             self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
+             # Log reasoning loss even if 0 to match steps
+             self._custom_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
 
         return loss if not return_outputs else (loss, outputs)
 

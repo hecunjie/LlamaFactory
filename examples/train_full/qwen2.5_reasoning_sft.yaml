@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-1.5B-Instruct
 trust_remote_code: true
 
 ### method
@@ -15,19 +15,29 @@ cutoff_len: 2048
 max_samples: 1000
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
+remove_unused_columns: false
 
 ### output
-output_dir: saves/qwen3-4b/full/reasoning_sft
-logging_steps: 10
-save_steps: 500
+output_dir: /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/latent_thinking_test
+logging_steps: 1
+save_steps: 100
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: false
-report_to: none
+report_to: wandb
+run_name: latent_thinking_test
+
+### eval
+do_eval: true
+val_size: 0.1
+eval_strategy: steps
+eval_steps: 100
+predict_with_generate: true
+compute_exact_match: true
 
 ### train
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 learning_rate: 1.0e-5
 num_train_epochs: 10.0
 lr_scheduler_type: cosine
@@ -35,3 +45,11 @@ warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 180000000
 resume_from_checkpoint: null
+compute_exact_match: true
+
+### eval
+eval_dataset: reasoning_demo
+# val_size: 0.1
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 10
