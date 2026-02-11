@@ -158,97 +158,75 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # 4. Compute Reasoning Loss
         added_reasoning_loss = torch.tensor(0.0, device=loss.device)
         if do_reasoning:
-            # DEBUG
-            # if self.state.global_step % 10 == 0:
-            #    print(f"Doing reasoning. Batch size: {reasoning_input_ids.size(0)}")
-
             # outputs is (loss, logits, hidden_states, ...) or Seq2SeqLMOutput
             if isinstance(outputs, dict):
                 hidden_states = outputs.get("hidden_states")
             elif hasattr(outputs, "hidden_states"):
                 hidden_states = outputs.hidden_states
             else:
-                # Tuple: loss, logits, hidden_states (if output_hidden_states=True)
                 hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else None
 
             if hidden_states is not None:
-                # visible_hidden_states: Tuple of tensor (one for each layer). We want last layer.
-                last_hidden_state = hidden_states[-1] # (batch, seq, dim)
-                
-                # Construct inputs for reasoning pass
-                # We need to gather the hidden states corresponding to special tokens.
-                # special_token_mask: (batch, seq) - 1 for special tokens.
-                
-                # We iterate over batch to handle potentially different lengths or positions
+                last_hidden_state = hidden_states[-1]  # (batch, seq, dim)
                 batch_size = last_hidden_state.size(0)
-                reasoning_loss = 0.0
                 valid_samples = 0
-                
                 proj_inputs_list = []
                 reasoning_labels_list = []
-                
+
+                # Get the unwrapped model to avoid DeepSpeed double-reduction
+                unwrapped_model = model
+                while hasattr(unwrapped_model, "module"):
+                    unwrapped_model = unwrapped_model.module
+
                 for i in range(batch_size):
                     mask = special_token_mask[i]
                     if mask.sum() == 0:
                         continue
-                        
-                    # Extract hidden states
-                    # Logic: We take all hidden states marked by mask.
-                    # These form the "prompt" for the reasoning.
-                    spec_tokens_h = last_hidden_state[i][mask == 1] # (k, dim)
-                    
-                    # Reasoning input ids
-                    # These are standard token ids [r1, r2, ..., rn, eos]
-                    # We need embeddings.
+
+                    # IMPORTANT: detach hidden states to break gradient flow back to first forward pass
+                    spec_tokens_h = last_hidden_state[i][mask == 1].detach()
+
                     r_ids = reasoning_input_ids[i]
                     r_lbls = reasoning_labels[i]
-                    
-                    # Filter padding from reasoning if any (labels=IGNORE_INDEX or input_ids=PAD)
-                    # Assuming standard padding (right)
                     valid_len = (r_ids != self.processing_class.pad_token_id).sum()
                     r_ids = r_ids[:valid_len]
                     r_lbls = r_lbls[:valid_len]
 
-                    # Get embeddings
-                    # model.get_input_embeddings() works for CausalLM
-                    model_embeds = model.get_input_embeddings()
-                    r_embeds = model_embeds(r_ids) # (len, dim)
-                    
-                    # Concat
-                    # Input: [SpecialTokensH, ReasoningEmbeds]
-                    combined_embeds = torch.cat([spec_tokens_h, r_embeds], dim=0) # (k + len, dim)
-                    
-                    # Labels
-                    prefix_labels = torch.full((spec_tokens_h.size(0),), IGNORE_INDEX, device=last_hidden_state.device, dtype=torch.long)
+                    model_embeds = unwrapped_model.get_input_embeddings()
+                    r_embeds = model_embeds(r_ids)
+
+                    combined_embeds = torch.cat([spec_tokens_h, r_embeds], dim=0)
+                    prefix_labels = torch.full(
+                        (spec_tokens_h.size(0),), IGNORE_INDEX,
+                        device=last_hidden_state.device, dtype=torch.long,
+                    )
                     combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
-                    
+
                     proj_inputs_list.append(combined_embeds)
                     reasoning_labels_list.append(combined_labels)
                     valid_samples += 1
 
                 if valid_samples > 0:
-                    # Pad sequences to batch them
                     from torch.nn.utils.rnn import pad_sequence
-                    
+
                     input_embeds_padded = pad_sequence(proj_inputs_list, batch_first=True, padding_value=0.0)
                     labels_padded = pad_sequence(reasoning_labels_list, batch_first=True, padding_value=IGNORE_INDEX)
-                    
-                    # Attention mask
+
                     seq_lens = [x.size(0) for x in proj_inputs_list]
                     max_len = max(seq_lens)
                     att_mask = torch.zeros((valid_samples, max_len), dtype=torch.long, device=last_hidden_state.device)
                     for idx, l in enumerate(seq_lens):
                         att_mask[idx, :l] = 1
-                        
-                    # Forward Pass 2
-                    outputs_reasoning = model(
+
+                    # Use unwrapped model to avoid DeepSpeed gradient reduction conflict
+                    outputs_reasoning = unwrapped_model(
                         inputs_embeds=input_embeds_padded,
                         attention_mask=att_mask,
-                        labels=labels_padded
+                        labels=labels_padded,
                     )
-                    
+
                     batch_reasoning_loss = outputs_reasoning.loss
-                    loss += batch_reasoning_loss
+                    loss = loss + batch_reasoning_loss
                     added_reasoning_loss = batch_reasoning_loss
 
         # Log Losses
