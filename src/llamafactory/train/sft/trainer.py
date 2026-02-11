@@ -125,6 +125,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", Any]:
         r"""Shared loss computation for both training and evaluation.
 
+        Reasoning loss uses special token hidden states as prefix context,
+        concatenated with reasoning token embeddings, and passes through the
+        model (teacher forcing) to predict the ENTIRE reasoning sequence.
+
         Returns:
             total_loss: loss_sft + loss_reasoning
             loss_sft: standard SFT cross-entropy loss
@@ -141,12 +145,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if do_reasoning:
             inputs["output_hidden_states"] = True
 
-        # Single forward pass — SFT loss
+        # ---- First forward: SFT loss ----
         loss_sft, outputs = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
 
-        # Reasoning loss via LM Head projection (no second forward)
+        # ---- Second forward: Reasoning loss (teacher forcing) ----
         loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
         if do_reasoning:
             hidden_states = getattr(outputs, "hidden_states", None)
@@ -157,34 +161,68 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 last_hidden = hidden_states[-1]  # (batch, seq, dim)
                 batch_size = last_hidden.size(0)
 
+                # Get unwrapped model for embeddings and second forward
                 unwrapped = model
                 while hasattr(unwrapped, "module"):
                     unwrapped = unwrapped.module
-                lm_head = unwrapped.lm_head
 
-                total, valid = torch.tensor(0.0, device=loss_sft.device), 0
+                embed_fn = unwrapped.get_input_embeddings()
+                from torch.nn.utils.rnn import pad_sequence
+
+                embeds_list, labels_list = [], []
                 for i in range(batch_size):
                     mask = special_token_mask[i]
                     n_special = mask.sum().item()
                     if n_special == 0:
                         continue
 
-                    spec_h = last_hidden[i][mask == 1]  # (n_special, dim)
+                    # Detach special token hidden states to break gradient flow to first forward
+                    spec_h = last_hidden[i][mask == 1].detach()  # (n_special, dim)
+
+                    # Get reasoning token embeddings (teacher forcing input)
+                    r_ids = reasoning_input_ids[i]
                     r_lbls = reasoning_labels[i]
-                    valid_len = (reasoning_input_ids[i] != self.processing_class.pad_token_id).sum().item()
-                    r_lbls = r_lbls[:valid_len]
-                    n_predict = min(n_special, len(r_lbls))
-                    if n_predict == 0:
+                    valid_len = (r_ids != self.processing_class.pad_token_id).sum().item()
+                    if valid_len == 0:
                         continue
+                    r_ids = r_ids[:valid_len]
+                    r_lbls = r_lbls[:valid_len]
 
-                    logits = lm_head(spec_h[:n_predict])
-                    total = total + torch.nn.functional.cross_entropy(
-                        logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
+                    r_embeds = embed_fn(r_ids)  # (valid_len, dim)
+
+                    # Concatenate: [special_hidden_states, reasoning_embeddings]
+                    # The model sees special tokens as context, then predicts reasoning tokens
+                    combined_embeds = torch.cat([spec_h, r_embeds], dim=0)
+
+                    # Labels: IGNORE for special token prefix positions, actual labels for reasoning
+                    prefix_labels = torch.full(
+                        (n_special,), IGNORE_INDEX, device=loss_sft.device, dtype=torch.long
                     )
-                    valid += 1
+                    combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
 
-                if valid > 0:
-                    loss_reasoning = total / valid
+                    embeds_list.append(combined_embeds)
+                    labels_list.append(combined_labels)
+
+                if embeds_list:
+                    # Pad to batch
+                    input_embeds_padded = pad_sequence(embeds_list, batch_first=True, padding_value=0.0)
+                    labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+
+                    seq_lens = [e.size(0) for e in embeds_list]
+                    max_len = max(seq_lens)
+                    attn_mask = torch.zeros(
+                        (len(embeds_list), max_len), dtype=torch.long, device=loss_sft.device
+                    )
+                    for idx, l in enumerate(seq_lens):
+                        attn_mask[idx, :l] = 1
+
+                    # Second forward through unwrapped model (avoids DeepSpeed double reduction)
+                    outputs_reasoning = unwrapped(
+                        inputs_embeds=input_embeds_padded,
+                        attention_mask=attn_mask,
+                        labels=labels_padded,
+                    )
+                    loss_reasoning = outputs_reasoning.loss
 
         total_loss = loss_sft + loss_reasoning
         return total_loss, loss_sft, loss_reasoning, outputs
