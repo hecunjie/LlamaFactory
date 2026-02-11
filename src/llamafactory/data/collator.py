@@ -287,77 +287,56 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
     compute_dtype: "torch.dtype" = torch.float32
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
-        # Handle reasoning inputs if present
-        reasoning_input_ids = None
-        reasoning_labels = None
-        
-        # Check if reasoning_input_ids is in the features
+        # Pop reasoning fields before super().__call__() to avoid errors
+        reasoning_feats = None
         if "reasoning_input_ids" in features[0]:
-            # Pop so parent class doesn't fail
             reasoning_feats = []
             for feature in features:
                 reasoning_feats.append({
                     "input_ids": feature.pop("reasoning_input_ids"),
                     "attention_mask": feature.pop("reasoning_attention_mask"),
-                    "labels": feature.pop("reasoning_labels")
+                    "labels": feature.pop("reasoning_labels"),
                 })
-            
-            # Use super().call to pad reasoning features
-            # We create a temporary collator instance or just reuse super call logic if it wasn't tied to instance state.
-            # MultiModalDataCollatorForSeq2Seq uses super().__call__ (DataCollatorForSeq2Seq) which pads.
-            # But MultiModalDataCollatorForSeq2Seq adds multimodal logic. We don't need multimodal logic for reasoning text.
-            # So we can just use the base DataCollatorForSeq2Seq logic if we could access it, or just use self logic but careful about images?
-            # Reasoning doesn't have images.
-            
-            # Let's just manually pad for simplicity or use a helper
-            # Actually, we can reuse `super().__call__` on a subset of features.
-            # But `super()` refers to `MultiModalDataCollatorForSeq2Seq` which expects images etc.
-            # Let's create dummy features for reasoning that have empty images.
-            
-            # Better strategy: Pad manually using tokenizer.pad
-            # Or use parent's parent standard collation?
-            
-            # Let's try to trust standard DataCollatorForSeq2Seq behavior.
-            # `MultiModalDataCollatorForSeq2Seq` inherits from `DataCollatorForSeq2Seq`.
-            # Its `__call__` does image processing then calls `super().__call__` (DataCollatorForSeq2Seq).
-            
-            # So if we strip images from reasoning_feats, and call super(MultiModalDataCollatorForSeq2Seq, self).__call__(reasoning_feats) ?
-            # Python's super is tricky with args.
-            
-            # Easiest way: Use `self.tokenizer.pad`.
-            # We need to pad input_ids and labels.
-            padded_reasoning = self.tokenizer.pad(
-                reasoning_feats,
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors="pt",
-            )
-            reasoning_input_ids = padded_reasoning["input_ids"]
-            reasoning_labels = padded_reasoning["labels"]
 
-        # Handle special_token_mask padding
         special_token_mask_list = None
         if "special_token_mask" in features[0]:
             special_token_mask_list = [feature.pop("special_token_mask") for feature in features]
 
         features = super().__call__(features)
 
-        # Now fix special_token_mask padding to match input_ids
+        # Pad reasoning fields (keep ALL samples so batch dim matches hidden_states)
+        if reasoning_feats is not None:
+            # Find max reasoning length across the batch
+            max_r_len = max(len(f["input_ids"]) for f in reasoning_feats)
+            if max_r_len > 0:
+                # Fill empty samples with a single pad token so tokenizer.pad works
+                for f in reasoning_feats:
+                    if len(f["input_ids"]) == 0:
+                        pad_id = self.tokenizer.pad_token_id or 0
+                        f["input_ids"] = [pad_id]
+                        f["attention_mask"] = [0]  # masked out
+                        f["labels"] = [IGNORE_INDEX]
+                padded = self.tokenizer.pad(
+                    reasoning_feats,
+                    padding=self.padding,
+                    max_length=self.max_length,
+                    pad_to_multiple_of=self.pad_to_multiple_of,
+                    return_tensors="pt",
+                )
+                features["reasoning_input_ids"] = padded["input_ids"]
+                features["reasoning_labels"] = padded["labels"]
+
+        # Pad special_token_mask to match input_ids length
         if special_token_mask_list is not None:
-             target_len = features["input_ids"].shape[1]
-             padded_masks = []
-             for mask in special_token_mask_list:
-                 pad_len = target_len - len(mask)
-                 if self.tokenizer.padding_side == "right":
-                     padded_masks.append(mask + [0] * pad_len)
-                 else:
-                     padded_masks.append([0] * pad_len + mask)
-             features["special_token_mask"] = torch.tensor(padded_masks, dtype=torch.long)
-        
-        if reasoning_input_ids is not None:
-            features["reasoning_input_ids"] = reasoning_input_ids
-            features["reasoning_labels"] = reasoning_labels
+            target_len = features["input_ids"].shape[1]
+            padded_masks = []
+            for mask in special_token_mask_list:
+                pad_len = target_len - len(mask)
+                if self.tokenizer.padding_side == "right":
+                    padded_masks.append(mask + [0] * pad_len)
+                else:
+                    padded_masks.append([0] * pad_len + mask)
+            features["special_token_mask"] = torch.tensor(padded_masks, dtype=torch.long)
 
         if self.block_diag_attn and self.attn_implementation != "flash_attention_2":
             features["attention_mask"] = prepare_4d_attention_mask(features["attention_mask"], self.compute_dtype)

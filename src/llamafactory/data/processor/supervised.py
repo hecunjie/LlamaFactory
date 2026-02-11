@@ -105,7 +105,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 reasoning = examples["_reasoning"][i]
                 original_response = examples["_response"][i][0]["content"]
 
-                # 1. Main Sample: Prompt -> SpecialTokens + Answer
+                # 1. SFT part: Prompt -> SpecialTokens + Answer
                 response_content = special_tokens + "\n" + original_response
                 response_1 = [{"role": "assistant", "content": response_content}]
                 input_ids, labels = self._encode_data_example(
@@ -117,43 +117,32 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                     videos=examples["_videos"][i] if "_videos" in examples and examples["_videos"][i] is not None else [],
                     audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
                 )
-                
-                # 2. Prepare Reasoning data (Tokenize regular text)
-                # We need input_ids for reasoning. We will just tokenize the text.
-                # Assuming reasoning is just text.
-                # We add bos/eos if needed, but here we just need the ids for the labels.
-                reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False) 
+
+                # 2. Tokenize reasoning text (separate sequence for second forward)
+                reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
                 reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
 
-                # 3. Create Special Token Mask
-                # Strategy: encode the response with and without the special_tokens prefix
-                # to determine exactly how many tokens the special_tokens occupy.
-                # The response was: special_tokens + "\n" + original_response
-                # We encode special_tokens + "\n" alone to find its token count.
+                # 3. Build special_token_mask on the SFT sequence
                 special_prefix = special_tokens + "\n"
                 special_prefix_ids = self.tokenizer.encode(special_prefix, add_special_tokens=False)
                 n_special = len(special_prefix_ids)
-                
+
                 special_token_mask = [0] * len(labels)
-                
-                # Find the first non-IGNORE_INDEX position in labels (= start of response tokens)
                 response_start = -1
                 for j in range(len(labels)):
                     if labels[j] != IGNORE_INDEX:
                         response_start = j
                         break
-                
                 if response_start >= 0 and n_special > 0:
                     for j in range(response_start, min(response_start + n_special, len(labels))):
                         special_token_mask[j] = 1
-
 
                 model_inputs["input_ids"].append(input_ids)
                 model_inputs["attention_mask"].append([1] * len(input_ids))
                 model_inputs["labels"].append(labels)
                 model_inputs["special_token_mask"].append(special_token_mask)
                 model_inputs["reasoning_input_ids"].append(reasoning_ids)
-                model_inputs["reasoning_labels"].append(reasoning_ids) # Same for Causal LM, we shift inside loss
+                model_inputs["reasoning_labels"].append(reasoning_ids)
                 model_inputs["reasoning_attention_mask"].append([1] * len(reasoning_ids))
 
                 if "_images" in examples:
@@ -162,7 +151,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                      model_inputs["videos"].append(examples["_videos"][i])
                 if "_audios" in examples:
                      model_inputs["audios"].append(examples["_audios"][i])
-                
+
                 continue
 
             input_ids, labels = self._encode_data_example(
@@ -177,7 +166,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
-            
+
             if "_images" in examples:
                 model_inputs["images"].append(examples["_images"][i])
             if "_videos" in examples:
@@ -185,7 +174,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             if "_audios" in examples:
                 model_inputs["audios"].append(examples["_audios"][i])
 
-            # consistency for reasoning columns
+            # No reasoning for this sample
             model_inputs["special_token_mask"].append([0] * len(input_ids))
             model_inputs["reasoning_input_ids"].append([])
             model_inputs["reasoning_labels"].append([])
