@@ -320,18 +320,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return total_loss.detach(), logits, labels
 
     @override
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval", **gen_kwargs):
-        # Reset eval loss buffer
+    def evaluation_loop(self, *args, **kwargs):
+        # Reset eval loss buffer before eval loop
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
-        result = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs)
-        # Inject split losses into metrics
+        output = super().evaluation_loop(*args, **kwargs)
+        # Inject split losses into metrics BEFORE evaluate() logs them
         if self._eval_loss_buffer:
             for k, v in self._eval_loss_buffer.items():
                 if v:
                     avg = torch.stack(v).mean().item()
-                    result[f"{metric_key_prefix}_loss_{k}"] = round(avg, 4)
+                    output.metrics[f"eval_loss_{k}"] = round(avg, 4)
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
-        return result
+        return output
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
