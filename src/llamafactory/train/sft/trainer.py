@@ -284,7 +284,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return loss if not return_outputs else (loss, outputs)
 
     @override
-    def log(self, logs: dict[str, float]) -> None:
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
              # Average and add to logs
              for k, v in self._custom_loss_buffer.items():
@@ -293,7 +293,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                      logs[f"loss_{k}"] = round(avg, 4)
              self._custom_loss_buffer = {"sft": [], "reasoning": []}
              
-        super().log(logs)
+        if start_time is not None:
+             super().log(logs, start_time)
+        else:
+             super().log(logs)
 
     @override
     def prediction_step(
