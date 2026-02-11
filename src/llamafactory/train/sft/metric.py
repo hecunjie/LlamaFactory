@@ -85,6 +85,40 @@ class ComputeAccuracy:
 
 
 @dataclass
+class ComputeExactMatch:
+    r"""Compute exact match accuracy."""
+    tokenizer: "PreTrainedTokenizer"
+
+    def _dump(self) -> Optional[dict[str, float]]:
+        result = None
+        if hasattr(self, "score_dict"):
+            result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
+
+        self.score_dict = {"exact_match": []}
+        return result
+
+    def __post_init__(self):
+        self._dump()
+
+    def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
+        preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        
+        preds = np.where(preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id)
+        labels = np.where(labels != IGNORE_INDEX, labels, self.tokenizer.pad_token_id)
+
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        for pred, label in zip(decoded_preds, decoded_labels):
+            # Clean and compare strings
+            p = pred.strip()
+            l = label.strip()
+            self.score_dict["exact_match"].append(1.0 if p == l else 0.0)
+
+        if compute_result:
+            return self._dump()
+
+@dataclass
 class ComputeSimilarity:
     r"""Compute text similarity scores and support `batch_eval_metrics`.
 

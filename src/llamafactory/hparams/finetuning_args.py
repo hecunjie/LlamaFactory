@@ -514,6 +514,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},
     )
+    compute_exact_match: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to compute exact match at evaluation. Checks if generated response matches label."},
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},

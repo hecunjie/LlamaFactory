@@ -256,8 +256,44 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     
                     batch_reasoning_loss = outputs_reasoning.loss
                     loss += batch_reasoning_loss
+                    
+                    # Store for logging
+                    if not hasattr(self, "_stored_logs"):
+                         self._stored_logs = {}
+                    
+                    # Store the standard loss (approximate if accumulation)
+                    # Note: We need to handle gradient accumulation averaging if we want it perfect,
+                    # but for simple logging:
+                    # current_loss = loss.item() # This is total
+                    # reasoning = batch_reasoning_loss.item()
+                    # sft = current_loss - reasoning 
+                    # But we are in a forward pass, detaching is needed.
+                    
+                    # We accumulate these into a buffer and average them in `log`?
+                    # HF Trainer averages `tr_loss` automatically.
+                    # We can use `self.log` directly? No, it triggers callbacks.
+                    
+                    # Let's accumulate into a simple buffer that gets cleared on log.
+                    if not hasattr(self, "_custom_loss_buffer"):
+                        self._custom_loss_buffer = {"sft": [], "reasoning": []}
+                        
+                    sft_loss = loss - batch_reasoning_loss
+                    self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
+                    self._custom_loss_buffer["reasoning"].append(batch_reasoning_loss.detach().float())
 
         return loss if not return_outputs else (loss, outputs)
+
+    @override
+    def log(self, logs: dict[str, float]) -> None:
+        if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
+             # Average and add to logs
+             for k, v in self._custom_loss_buffer.items():
+                 if v:
+                     avg = torch.stack(v).mean().item()
+                     logs[f"loss_{k}"] = round(avg, 4)
+             self._custom_loss_buffer = {"sft": [], "reasoning": []}
+             
+        super().log(logs)
 
     @override
     def prediction_step(
