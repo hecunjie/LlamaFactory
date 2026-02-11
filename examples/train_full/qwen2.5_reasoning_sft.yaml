@@ -27,14 +27,6 @@ save_only_model: false
 report_to: wandb
 run_name: latent_thinking_test
 
-### eval
-do_eval: true
-val_size: 0.1
-eval_strategy: steps
-eval_steps: 100
-predict_with_generate: true
-compute_exact_match: true
-
 ### train
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 1

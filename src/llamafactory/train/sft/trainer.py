@@ -158,6 +158,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # 4. Compute Reasoning Loss
         added_reasoning_loss = torch.tensor(0.0, device=loss.device)
         if do_reasoning:
+            # DEBUG
+            # if self.state.global_step % 10 == 0:
+            #    print(f"Doing reasoning. Batch size: {reasoning_input_ids.size(0)}")
+
             # outputs is (loss, logits, hidden_states, ...) or Seq2SeqLMOutput
             if isinstance(outputs, dict):
                 hidden_states = outputs.get("hidden_states")
@@ -264,7 +268,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
              # Average and add to logs
              for k, v in self._custom_loss_buffer.items():
-                 if v:
+                 if v: # Check if list is not empty
                      avg = torch.stack(v).mean().item()
                      logs[f"loss_{k}"] = round(avg, 4)
              self._custom_loss_buffer = {"sft": [], "reasoning": []}

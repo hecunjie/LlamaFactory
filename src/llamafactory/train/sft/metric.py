@@ -92,7 +92,10 @@ class ComputeExactMatch:
     def _dump(self) -> Optional[dict[str, float]]:
         result = None
         if hasattr(self, "score_dict"):
-            result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
+            if len(self.score_dict["exact_match"]) > 0:
+                result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
+            else:
+                 result = {"exact_match": 0.0}
 
         self.score_dict = {"exact_match": []}
         return result
@@ -101,6 +104,8 @@ class ComputeExactMatch:
         self._dump()
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
+        # DEBUG
+        # print("Running ComputeExactMatch...")
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
         
         preds = np.where(preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id)
@@ -114,6 +119,9 @@ class ComputeExactMatch:
             p = pred.strip()
             l = label.strip()
             self.score_dict["exact_match"].append(1.0 if p == l else 0.0)
+
+        # print(f"DEBUG: score_dict len {len(self.score_dict['exact_match'])}")
+        # print(f"DEBUG Sample: P='{p}' L='{l}'")
 
         if compute_result:
             return self._dump()

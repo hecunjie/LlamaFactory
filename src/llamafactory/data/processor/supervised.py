@@ -156,9 +156,15 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                             break # Assume first occurrence is the one (it's at the start of response)
                 
                 if not found:
-                     # Fallback or warning?
-                     # Maybe encoding differed due to merge.
-                     pass
+                     # Fallback check
+                     # logger.warning_rank0(f"Special tokens not found in labels! Tokens: {special_tokens}, IDs: {special_tokens_ids}")
+                     # Try finding subset or just first token? No, unsafe.
+                     # Just warn.
+                     pass 
+                
+                # Check consistency
+                # assert len(special_token_mask) == len(labels)
+
 
                 model_inputs["input_ids"].append(input_ids)
                 model_inputs["attention_mask"].append([1] * len(input_ids))
