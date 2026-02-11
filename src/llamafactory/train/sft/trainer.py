@@ -123,121 +123,80 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
         reasoning_labels = inputs.pop("reasoning_labels", None)
         special_token_mask = inputs.pop("special_token_mask", None)
-        
-        # DEBUG PRINTS
-        if self.state.global_step % 10 == 0:
-             has_r_ids = reasoning_input_ids is not None
-             has_mask = special_token_mask is not None
-             # logger.info_rank0(f"Step {self.state.global_step}: Has R_ids: {has_r_ids}, Has Mask: {has_mask}")
 
-        # 2. Add hidden states request if needed for reasoning
-        # Check if we should do the reasoning loss pass
+        # 2. Check if we should compute reasoning loss
         do_reasoning = (
-            reasoning_input_ids is not None 
+            reasoning_input_ids is not None
             and special_token_mask is not None
         )
-        
+
         if do_reasoning:
             inputs["output_hidden_states"] = True
 
-        # 3. Call original compute_loss (which runs the model)
-        # We use super() which eventually calls model(**inputs)
-        # Note: self.compute_loss_func might be set by CustomSeq2SeqTrainer init.
-        # super().compute_loss handles calling it if it handles it (HF Trainer allows overriding compute_loss, 
-        # but to use a custom loss func inside standard compute_loss, one usually overrides `compute_loss` or assigns `self.compute_loss_func` if HF supports it. 
-        # HF Trainer supports `self.compute_loss_func`? No, it's a recent-ish addition or custom?
-        # Checking HF source: Trainer.compute_loss checks `if self.compute_loss_func is not None`.
-        # So we can safely call super().
-        
-        if return_outputs:
-             loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
-        else:
-             # We force return_outputs=True to get hidden states if we need them
-             loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        # 3. Single forward pass
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
 
-        # 4. Compute Reasoning Loss
+        # 4. Compute Reasoning Loss using LM Head projection (no second forward)
         added_reasoning_loss = torch.tensor(0.0, device=loss.device)
         if do_reasoning:
-            # outputs is (loss, logits, hidden_states, ...) or Seq2SeqLMOutput
+            hidden_states = getattr(outputs, "hidden_states", None)
             if isinstance(outputs, dict):
-                hidden_states = outputs.get("hidden_states")
-            elif hasattr(outputs, "hidden_states"):
-                hidden_states = outputs.hidden_states
-            else:
-                hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else None
+                hidden_states = outputs.get("hidden_states", hidden_states)
 
             if hidden_states is not None:
                 last_hidden_state = hidden_states[-1]  # (batch, seq, dim)
                 batch_size = last_hidden_state.size(0)
-                valid_samples = 0
-                proj_inputs_list = []
-                reasoning_labels_list = []
 
-                # Get the unwrapped model to avoid DeepSpeed double-reduction
+                # Get LM Head from the model
                 unwrapped_model = model
                 while hasattr(unwrapped_model, "module"):
                     unwrapped_model = unwrapped_model.module
+                lm_head = unwrapped_model.lm_head
+
+                total_reasoning_loss = torch.tensor(0.0, device=loss.device)
+                valid_samples = 0
 
                 for i in range(batch_size):
-                    mask = special_token_mask[i]
-                    if mask.sum() == 0:
+                    mask = special_token_mask[i]  # (seq,)
+                    n_special = mask.sum().item()
+                    if n_special == 0:
                         continue
 
-                    # IMPORTANT: detach hidden states to break gradient flow back to first forward pass
-                    spec_tokens_h = last_hidden_state[i][mask == 1].detach()
+                    # Get hidden states at special token positions
+                    spec_h = last_hidden_state[i][mask == 1]  # (n_special, dim)
 
-                    r_ids = reasoning_input_ids[i]
+                    # Get reasoning labels for this sample
                     r_lbls = reasoning_labels[i]
-                    valid_len = (r_ids != self.processing_class.pad_token_id).sum()
-                    r_ids = r_ids[:valid_len]
-                    r_lbls = r_lbls[:valid_len]
+                    valid_len = (reasoning_input_ids[i] != self.processing_class.pad_token_id).sum().item()
+                    r_lbls = r_lbls[:valid_len]  # (n_reasoning,)
 
-                    model_embeds = unwrapped_model.get_input_embeddings()
-                    r_embeds = model_embeds(r_ids)
+                    # Match lengths: each special token predicts a reasoning token
+                    n_predict = min(n_special, len(r_lbls))
+                    if n_predict == 0:
+                        continue
 
-                    combined_embeds = torch.cat([spec_tokens_h, r_embeds], dim=0)
-                    prefix_labels = torch.full(
-                        (spec_tokens_h.size(0),), IGNORE_INDEX,
-                        device=last_hidden_state.device, dtype=torch.long,
+                    # Project special token hidden states through LM Head to get logits
+                    spec_logits = lm_head(spec_h[:n_predict])  # (n_predict, vocab_size)
+
+                    # Cross-entropy loss: predict reasoning tokens from special token hidden states
+                    reasoning_loss_i = torch.nn.functional.cross_entropy(
+                        spec_logits, r_lbls[:n_predict], ignore_index=IGNORE_INDEX
                     )
-                    combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
-
-                    proj_inputs_list.append(combined_embeds)
-                    reasoning_labels_list.append(combined_labels)
+                    total_reasoning_loss = total_reasoning_loss + reasoning_loss_i
                     valid_samples += 1
 
                 if valid_samples > 0:
-                    from torch.nn.utils.rnn import pad_sequence
-
-                    input_embeds_padded = pad_sequence(proj_inputs_list, batch_first=True, padding_value=0.0)
-                    labels_padded = pad_sequence(reasoning_labels_list, batch_first=True, padding_value=IGNORE_INDEX)
-
-                    seq_lens = [x.size(0) for x in proj_inputs_list]
-                    max_len = max(seq_lens)
-                    att_mask = torch.zeros((valid_samples, max_len), dtype=torch.long, device=last_hidden_state.device)
-                    for idx, l in enumerate(seq_lens):
-                        att_mask[idx, :l] = 1
-
-                    # Use unwrapped model to avoid DeepSpeed gradient reduction conflict
-                    outputs_reasoning = unwrapped_model(
-                        inputs_embeds=input_embeds_padded,
-                        attention_mask=att_mask,
-                        labels=labels_padded,
-                    )
-
-                    batch_reasoning_loss = outputs_reasoning.loss
-                    loss = loss + batch_reasoning_loss
-                    added_reasoning_loss = batch_reasoning_loss
+                    added_reasoning_loss = total_reasoning_loss / valid_samples
+                    loss = loss + added_reasoning_loss
 
         # Log Losses
         if self.model.training:
-             if not hasattr(self, "_custom_loss_buffer"):
-                 self._custom_loss_buffer = {"reasoning": [], "sft": []}
-             
-             sft_loss = loss - added_reasoning_loss
-             self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
-             # Log reasoning loss even if 0 to match steps
-             self._custom_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
+            if not hasattr(self, "_custom_loss_buffer"):
+                self._custom_loss_buffer = {"reasoning": [], "sft": []}
+
+            sft_loss = loss - added_reasoning_loss
+            self._custom_loss_buffer["sft"].append(sft_loss.detach().float())
+            self._custom_loss_buffer["reasoning"].append(added_reasoning_loss.detach().float())
 
         return loss if not return_outputs else (loss, outputs)
 
