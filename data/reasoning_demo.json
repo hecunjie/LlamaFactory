@@ -1,0 +1,14 @@
+[
+  {
+    "instruction": "Calculate 15 * 6.",
+    "output": "The answer is 90.",
+    "reasoning": "Multiply 10 by 6 to get 60. Multiply 5 by 6 to get 30. 60 + 30 = 90.",
+    "special_tokens": "<think_start><calc>"
+  },
+  {
+    "instruction": "Explain why the sky is blue.",
+    "output": "The sky appears blue due to Rayleigh scattering.",
+    "reasoning": "Blue light has a shorter wavelength and is scattered more by the gases in the atmosphere than other colors.",
+    "special_tokens": "<think_start><science>"
+  }
+]

@@ -1,4 +1,13 @@
 {
+  "reasoning_demo": {
+    "file_name": "reasoning_demo.json",
+    "columns": {
+      "prompt": "instruction",
+      "response": "output",
+      "reasoning": "reasoning",
+      "special_tokens": "special_tokens"
+    }
+  },
   "identity": {
     "file_name": "identity.json"
   },

@@ -127,6 +127,8 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_reasoning": example[self.dataset_attr.reasoning] if self.dataset_attr.reasoning else "",
+            "_special_tokens": example[self.dataset_attr.special_tokens] if self.dataset_attr.special_tokens else "",
         }
         return output
 

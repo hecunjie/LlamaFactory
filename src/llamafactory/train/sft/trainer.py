@@ -118,8 +118,146 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # 1. Pop custom fields
+        reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
+        reasoning_labels = inputs.pop("reasoning_labels", None)
+        special_token_mask = inputs.pop("special_token_mask", None)
+        
+        # 2. Add hidden states request if needed for reasoning
+        # Check if we should do the reasoning loss pass
+        do_reasoning = (
+            reasoning_input_ids is not None 
+            and special_token_mask is not None
+        )
+        
+        if do_reasoning:
+            inputs["output_hidden_states"] = True
+
+        # 3. Call original compute_loss (which runs the model)
+        # We use super() which eventually calls model(**inputs)
+        # Note: self.compute_loss_func might be set by CustomSeq2SeqTrainer init.
+        # super().compute_loss handles calling it if it handles it (HF Trainer allows overriding compute_loss, 
+        # but to use a custom loss func inside standard compute_loss, one usually overrides `compute_loss` or assigns `self.compute_loss_func` if HF supports it. 
+        # HF Trainer supports `self.compute_loss_func`? No, it's a recent-ish addition or custom?
+        # Checking HF source: Trainer.compute_loss checks `if self.compute_loss_func is not None`.
+        # So we can safely call super().
+        
+        if return_outputs:
+             loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        else:
+             # We force return_outputs=True to get hidden states if we need them
+             loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+
+        # 4. Compute Reasoning Loss
+        if do_reasoning:
+            # outputs is (loss, logits, hidden_states, ...) or Seq2SeqLMOutput
+            if isinstance(outputs, dict):
+                hidden_states = outputs.get("hidden_states")
+            elif hasattr(outputs, "hidden_states"):
+                hidden_states = outputs.hidden_states
+            else:
+                # Tuple: loss, logits, hidden_states (if output_hidden_states=True)
+                # HF standard: if output_hidden_states=True, hidden_states is usually 3rd or inside.
+                # For CausalLM: (loss, logits, past_key_values, hidden_states, attentions)
+                # Let's hope it's index 2 or 3 depending on return_dict.
+                # Usually return_dict=True by default in TrainingArguments?
+                hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else None
+
+            if hidden_states is not None:
+                # visible_hidden_states: Tuple of tensor (one for each layer). We want last layer.
+                last_hidden_state = hidden_states[-1] # (batch, seq, dim)
+                
+                # Construct inputs for reasoning pass
+                # We need to gather the hidden states corresponding to special tokens.
+                # special_token_mask: (batch, seq) - 1 for special tokens.
+                
+                # We iterate over batch to handle potentially different lengths or positions
+                batch_size = last_hidden_state.size(0)
+                reasoning_loss = 0.0
+                valid_samples = 0
+                
+                proj_inputs_list = []
+                reasoning_labels_list = []
+                
+                for i in range(batch_size):
+                    mask = special_token_mask[i]
+                    if mask.sum() == 0:
+                        continue
+                        
+                    # Extract hidden states
+                    # Logic: We take all hidden states marked by mask.
+                    # These form the "prompt" for the reasoning.
+                    spec_tokens_h = last_hidden_state[i][mask == 1] # (k, dim)
+                    
+                    # Reasoning input ids
+                    # These are standard token ids [r1, r2, ..., rn, eos]
+                    # We need embeddings.
+                    r_ids = reasoning_input_ids[i]
+                    r_lbls = reasoning_labels[i]
+                    
+                    # Filter padding from reasoning if any (labels=IGNORE_INDEX or input_ids=PAD)
+                    # Assuming standard padding (right)
+                    valid_len = (r_ids != self.processing_class.pad_token_id).sum()
+                    r_ids = r_ids[:valid_len]
+                    r_lbls = r_lbls[:valid_len]
+
+                    # Get embeddings
+                    # model.get_input_embeddings() works for CausalLM
+                    # For Seq2Seq (Encoder-Decoder), this logic is different.
+                    # Assuming CausalLM (LlamaFactory mostly SFTs Decoder models like Llama, Qwen).
+                    model_embeds = model.get_input_embeddings()
+                    r_embeds = model_embeds(r_ids) # (len, dim)
+                    
+                    # Concat
+                    # Input: [SpecialTokensH, ReasoningEmbeds]
+                    combined_embeds = torch.cat([spec_tokens_h, r_embeds], dim=0) # (k + len, dim)
+                    
+                    # Labels
+                    # Target: [IGNORE... (for SpecialTokens), ReasoningLabels]
+                    # Note: CausalLM shifts labels internally. 
+                    # If we pass labels matching input length, it calculates loss.
+                    # We want to predict Reasoning.
+                    # Labels for SpecialTokens part should be IGNORE_INDEX
+                    prefix_labels = torch.full((spec_tokens_h.size(0),), IGNORE_INDEX, device=last_hidden_state.device, dtype=torch.long)
+                    combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
+                    
+                    proj_inputs_list.append(combined_embeds)
+                    reasoning_labels_list.append(combined_labels)
+                    valid_samples += 1
+
+                if valid_samples > 0:
+                    # Pad sequences to batch them
+                    from torch.nn.utils.rnn import pad_sequence
+                    
+                    # Pad inputs_embeds
+                    # We can't use pad_sequence on embeddings directly easily if used with forward?
+                    # Yes we can. Pad with 0.
+                    input_embeds_padded = pad_sequence(proj_inputs_list, batch_first=True, padding_value=0.0)
+                    labels_padded = pad_sequence(reasoning_labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+                    
+                    # Attention mask
+                    # 1 for real tokens, 0 for pad
+                    # lengths are in [x.size(0) for x in proj_inputs_list]
+                    # Create mask
+                    seq_lens = [x.size(0) for x in proj_inputs_list]
+                    max_len = max(seq_lens)
+                    att_mask = torch.zeros((valid_samples, max_len), dtype=torch.long, device=last_hidden_state.device)
+                    for idx, l in enumerate(seq_lens):
+                        att_mask[idx, :l] = 1
+                        
+                    # Forward Pass 2
+                    # Note: We must NOT pass input_ids, only inputs_embeds
+                    outputs_reasoning = model(
+                        inputs_embeds=input_embeds_padded,
+                        attention_mask=att_mask,
+                        labels=labels_padded
+                    )
+                    
+                    batch_reasoning_loss = outputs_reasoning.loss
+                    loss += batch_reasoning_loss
+
+        return loss if not return_outputs else (loss, outputs)
 
     @override
     def prediction_step(

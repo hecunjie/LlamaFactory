@@ -96,6 +96,87 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 )
                 continue
 
+            # Check for reasoning and special tokens
+            has_reasoning = "_reasoning" in examples and examples["_reasoning"][i]
+            has_special_tokens = "_special_tokens" in examples and examples["_special_tokens"][i]
+
+            if has_reasoning and has_special_tokens:
+                special_tokens = examples["_special_tokens"][i]
+                reasoning = examples["_reasoning"][i]
+                original_response = examples["_response"][i][0]["content"]
+
+                # 1. Main Sample: Prompt -> SpecialTokens + Answer
+                response_content = special_tokens + "\n" + original_response
+                response_1 = [{"role": "assistant", "content": response_content}]
+                input_ids, labels = self._encode_data_example(
+                    prompt=examples["_prompt"][i],
+                    response=response_1,
+                    system=examples["_system"][i],
+                    tools=examples["_tools"][i],
+                    images=examples["_images"][i] if "_images" in examples else [],
+                    videos=examples["_videos"][i] if "_videos" in examples else [],
+                    audios=examples["_audios"][i] if "_audios" in examples else [],
+                )
+                
+                # 2. Prepare Reasoning data (Tokenize regular text)
+                # We need input_ids for reasoning. We will just tokenize the text.
+                # Assuming reasoning is just text.
+                # We add bos/eos if needed, but here we just need the ids for the labels.
+                reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False) 
+                reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
+
+                # 3. Create Special Token Mask
+                # Find where special tokens are in the labels.
+                special_tokens_ids = self.tokenizer.encode(special_tokens, add_special_tokens=False)
+                
+                # Find sub-sequence in labels
+                # labels has IGNORE_INDEX for input part.
+                special_token_mask = [0] * len(labels)
+                
+                # Simple search for the sequence
+                # Note: special_tokens might be tokenized differently when prepended to \n + original_response
+                # vs standalone. This is a risk.
+                # Ideally, we should check how it was encoded in _encode_data_example.
+                # Since we don't have easy access to the exact span from _encode_data_example,
+                # we search for the sequence in the labels.
+                
+                found = False
+                n = len(special_tokens_ids)
+                if n > 0:
+                    for j in range(len(labels) - n + 1):
+                        # Skip IGNORE_INDEX
+                        if labels[j] == IGNORE_INDEX:
+                            continue
+                        
+                        if labels[j:j+n] == special_tokens_ids:
+                            # Found match
+                            for k in range(j, j+n):
+                                special_token_mask[k] = 1
+                            found = True
+                            break # Assume first occurrence is the one (it's at the start of response)
+                
+                if not found:
+                     # Fallback or warning?
+                     # Maybe encoding differed due to merge.
+                     pass
+
+                model_inputs["input_ids"].append(input_ids)
+                model_inputs["attention_mask"].append([1] * len(input_ids))
+                model_inputs["labels"].append(labels)
+                model_inputs["special_token_mask"].append(special_token_mask)
+                model_inputs["reasoning_input_ids"].append(reasoning_ids)
+                model_inputs["reasoning_labels"].append(reasoning_ids) # Same for Causal LM, we shift inside loss
+                model_inputs["reasoning_attention_mask"].append([1] * len(reasoning_ids))
+
+                if "_images" in examples:
+                     model_inputs["images"].append(examples["_images"][i])
+                if "_videos" in examples:
+                     model_inputs["videos"].append(examples["_videos"][i])
+                if "_audios" in examples:
+                     model_inputs["audios"].append(examples["_audios"][i])
+                
+                continue
+
             input_ids, labels = self._encode_data_example(
                 prompt=examples["_prompt"][i],
                 response=examples["_response"][i],
