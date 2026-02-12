@@ -329,133 +329,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
         r"""Compute eval loss (with reasoning split) or generate tokens."""
         if self.args.predict_with_generate:
-            # Save references before popping
-            special_token_mask = inputs.get("special_token_mask")
-            input_ids_for_hs = inputs.get("input_ids").clone()  # Save for later forward pass
-            attn_mask_for_hs = inputs.get("attention_mask")
-            if attn_mask_for_hs is not None:
-                attn_mask_for_hs = attn_mask_for_hs.clone()
-
-            # Pop extra fields so super().prediction_step can work normally
             inputs.pop("reasoning_input_ids", None)
             inputs.pop("reasoning_labels", None)
             inputs.pop("reasoning_attention_mask", None)
             inputs.pop("special_token_mask", None)
             labels = inputs.pop("labels", None)
-            
-            # Step 1: Standard answer generation
             loss, generated_tokens, _ = super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
             )
-
-            # Step 2: Reasoning recovery from special token hidden states
-            do_recovery = (
-                generated_tokens is not None
-                and special_token_mask is not None
-                and special_token_mask.sum() > 0
-            )
-            if do_recovery:
-                try:
-                    from torch.nn.utils.rnn import pad_sequence
-                    batch_size = generated_tokens.size(0)
-
-                    # 2a. Forward pass on ORIGINAL input_ids to get hidden states
-                    #     (teacher-forced, reliable, no search needed)
-                    with torch.no_grad():
-                        hs_outputs = model(
-                            input_ids=input_ids_for_hs.to(model.device),
-                            attention_mask=attn_mask_for_hs.to(model.device) if attn_mask_for_hs is not None else None,
-                            output_hidden_states=True,
-                        )
-                    hidden_states = hs_outputs.hidden_states[-1]  # (B, SeqLen, Dim)
-                    del hs_outputs
-
-                    # 2b. Unwrap model for direct forward (DeepSpeed / DDP wrappers)
-                    unwrapped = model
-                    while hasattr(unwrapped, "module"):
-                        unwrapped = unwrapped.module
-                    embed_fn = unwrapped.get_input_embeddings()
-
-                    # 2c. Per-sample: extract hidden states -> manual greedy decode reasoning
-                    reasoning_seqs = []
-                    for i in range(batch_size):
-                        mask_i = special_token_mask[i]
-                        n_special = mask_i.sum().item()
-                        if n_special == 0:
-                            reasoning_seqs.append(torch.tensor([], dtype=torch.long, device=model.device))
-                            continue
-
-                        # Extract hidden states at special token positions
-                        spec_h = hidden_states[i][mask_i == 1].unsqueeze(0)  # (1, n_special, dim)
-
-                        # Manual greedy decoding with KV cache
-                        generated_ids = []
-                        past_key_values = None
-
-                        # First step: process all special token hidden states
-                        with torch.no_grad():
-                            out = unwrapped(inputs_embeds=spec_h, use_cache=True)
-                            past_key_values = out.past_key_values
-                            next_logits = out.logits[0, -1, :]
-                            next_id = next_logits.argmax(dim=-1)
-                            generated_ids.append(next_id.item())
-
-                        # Subsequent steps: one token at a time with KV cache
-                        max_reasoning_tokens = 512
-                        for _step in range(max_reasoning_tokens - 1):
-                            if next_id.item() == self.processing_class.eos_token_id:
-                                break
-                            next_embed = embed_fn(next_id.reshape(1, 1))  # (1, 1, dim)
-                            with torch.no_grad():
-                                out = unwrapped(
-                                    inputs_embeds=next_embed,
-                                    past_key_values=past_key_values,
-                                    use_cache=True,
-                                )
-                                past_key_values = out.past_key_values
-                                next_logits = out.logits[0, -1, :]
-                                next_id = next_logits.argmax(dim=-1)
-                                generated_ids.append(next_id.item())
-
-                        del past_key_values  # free memory
-
-                        if generated_ids:
-                            r_tokens = torch.tensor(generated_ids, dtype=torch.long, device=model.device)
-                        else:
-                            r_tokens = torch.tensor([], dtype=torch.long, device=model.device)
-                        reasoning_seqs.append(r_tokens)
-
-                    # 2d. Concatenate answer tokens + reasoning tokens
-                    n_recovered = sum(1 for r in reasoning_seqs if len(r) > 0)
-                    logger.info_rank0(
-                        f"[predict] Reasoning recovered for {n_recovered}/{batch_size} samples"
-                    )
-
-                    if n_recovered > 0:
-                        new_gen_list = []
-                        for i in range(batch_size):
-                            g_ids = generated_tokens[i]
-                            valid_g = g_ids[g_ids != self.processing_class.pad_token_id]
-                            r_ids = reasoning_seqs[i]
-                            combined = torch.cat([valid_g, r_ids])
-                            new_gen_list.append(combined)
-
-                        generated_tokens = pad_sequence(
-                            new_gen_list, batch_first=True,
-                            padding_value=self.processing_class.pad_token_id,
-                        )
-
-                except Exception as e:
-                    import traceback
-                    logger.warning(
-                        f"Reasoning recovery failed: {e}\n{traceback.format_exc()}"
-                    )
-
-            # Step 3: Mask prompt portion as PAD
             if generated_tokens is not None:
-                prompt_len = inputs["input_ids"].size(-1)
-                if generated_tokens.size(-1) > prompt_len:
-                    generated_tokens[:, :prompt_len] = self.processing_class.pad_token_id
+                generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
                 generated_tokens = generated_tokens.contiguous()
             return loss, generated_tokens, labels
 
@@ -525,6 +408,69 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         return output
 
+    def _recover_reasoning_for_sample(
+        self, model, input_ids: torch.Tensor, special_token_mask: torch.Tensor, max_new_tokens: int = 512
+    ) -> str:
+        r"""Recover reasoning from a single sample's special token hidden states.
+        
+        Args:
+            model: unwrapped model (no DeepSpeed/DDP wrapper)
+            input_ids: (SeqLen,) token ids for this sample
+            special_token_mask: (SeqLen,) mask where 1 = special token position
+            max_new_tokens: max reasoning tokens to generate
+        
+        Returns:
+            Decoded reasoning text string.
+        """
+        device = next(model.parameters()).device
+        n_special = special_token_mask.sum().item()
+        if n_special == 0:
+            return ""
+
+        # 1. Forward pass to get hidden states
+        ids = input_ids.unsqueeze(0).to(device)  # (1, SeqLen)
+        mask = special_token_mask.to(device)
+        with torch.no_grad():
+            out = model(ids, output_hidden_states=True)
+        hidden_states = out.hidden_states[-1][0]  # (SeqLen, Dim)
+        del out
+
+        # 2. Extract hidden states at special token positions
+        spec_h = hidden_states[mask == 1].unsqueeze(0)  # (1, n_special, Dim)
+
+        # 3. Manual greedy decode with KV cache
+        embed_fn = model.get_input_embeddings()
+        generated_ids = []
+        past_key_values = None
+
+        with torch.no_grad():
+            # First step: feed all special token hidden states
+            out = model(inputs_embeds=spec_h, use_cache=True)
+            past_key_values = out.past_key_values
+            next_id = out.logits[0, -1, :].argmax(dim=-1)
+            generated_ids.append(next_id.item())
+
+            # Auto-regressive decoding
+            for _ in range(max_new_tokens - 1):
+                if next_id.item() == self.processing_class.eos_token_id:
+                    break
+                next_embed = embed_fn(next_id.reshape(1, 1))
+                out = model(
+                    inputs_embeds=next_embed,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                past_key_values = out.past_key_values
+                next_id = out.logits[0, -1, :].argmax(dim=-1)
+                generated_ids.append(next_id.item())
+
+        del past_key_values
+
+        if not generated_ids:
+            return ""
+
+        return self.processing_class.decode(generated_ids, skip_special_tokens=False)
+
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
     ) -> None:
@@ -555,54 +501,58 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
 
-        # Custom split logic for Answer and Reasoning
-        # The structure of preds[i] is [Answer ... EOS ... Reasoning ... EOS]
-        # We try to split by the first EOS token
-        
+        # Decode predicted answers (with special tokens visible)
         decoded_answers = []
-        decoded_reasonings = []
-        
-        eos_id = self.processing_class.eos_token_id
-        
         for i in range(len(preds)):
             seq = preds[i]
-            # Strip padding first (which is at the end)
             valid_len = (seq != self.processing_class.pad_token_id).sum()
             seq = seq[:valid_len]
-            
-            # Find first EOS
-            # We assume the first EOS separates Answer and Reasoning.
-            # If no reasoning was generated (because no special tokens were found), it will be just Answer+EOS.
-            
-            eos_indices = np.where(seq == eos_id)[0]
-            if len(eos_indices) > 0:
-                first_eos = eos_indices[0]
-                answer_seq = seq[:first_eos] # Exclude EOS
-                
-                # Check for reasoning part
-                # If there are tokens after first EOS, they are reasoning
-                if len(seq) > first_eos + 1:
-                    reasoning_seq = seq[first_eos + 1:]
-                    # Strip subsequent EOS if present in reasoning
-                    # (Reasoning generation might have produced its own EOS)
-                else:
-                    reasoning_seq = np.array([], dtype=seq.dtype)
-            else:
-                # No EOS found? Just treat whole thing as answer
-                answer_seq = seq
-                reasoning_seq = np.array([], dtype=seq.dtype)
-                
-            ans_text = self.processing_class.decode(answer_seq, skip_special_tokens=False)
-            rea_text = self.processing_class.decode(reasoning_seq, skip_special_tokens=False)
-            
+            ans_text = self.processing_class.decode(seq, skip_special_tokens=False)
             decoded_answers.append(ans_text)
-            decoded_reasonings.append(rea_text)
+
+        # ---- Reasoning Recovery ----
+        # Done here (not in prediction_step) for maximum reliability.
+        # We have full access to self.model, dataset, and can process sample-by-sample.
+        decoded_reasonings = [""] * len(preds)
+        has_mask = "special_token_mask" in dataset.column_names
+
+        if has_mask:
+            logger.info_rank0("[save_predictions] Starting reasoning recovery...")
+            # Unwrap model
+            unwrapped = self.model
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
+            unwrapped.eval()
+
+            n_recovered = 0
+            for i in range(len(preds)):
+                try:
+                    input_ids_i = torch.tensor(dataset[i]["input_ids"], dtype=torch.long)
+                    mask_i = torch.tensor(dataset[i]["special_token_mask"], dtype=torch.long)
+
+                    if mask_i.sum().item() == 0:
+                        continue
+
+                    reasoning_text = self._recover_reasoning_for_sample(
+                        unwrapped, input_ids_i, mask_i, max_new_tokens=512
+                    )
+                    decoded_reasonings[i] = reasoning_text
+                    if reasoning_text:
+                        n_recovered += 1
+
+                    if (i + 1) % 10 == 0:
+                        logger.info_rank0(f"[save_predictions] Processed {i+1}/{len(preds)} samples, recovered {n_recovered}")
+                except Exception as e:
+                    import traceback
+                    logger.warning(f"Reasoning recovery failed for sample {i}: {e}\n{traceback.format_exc()}")
+
+            logger.info_rank0(f"[save_predictions] Reasoning recovery done: {n_recovered}/{len(preds)} samples")
 
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, ans, rea, label in zip(decoded_inputs, decoded_answers, decoded_reasonings, decoded_labels):
                 f.write(json.dumps({
-                    "prompt": text, 
-                    "predict_answer": ans, 
-                    "predict_reasoning": rea, 
+                    "prompt": text,
+                    "predict_answer": ans,
+                    "predict_reasoning": rea,
                     "label": label
                 }, ensure_ascii=False) + "\n")
