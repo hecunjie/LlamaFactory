@@ -316,6 +316,27 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                         f["input_ids"] = [pad_id]
                         f["attention_mask"] = [0]  # masked out
                         f["labels"] = [IGNORE_INDEX]
+                
+                # Manually pad labels because tokenizer.pad() doesn't handle them correctly
+                # Determine target length after padding
+                if self.padding is True or self.padding == "longest":
+                    target_len = max(len(f["input_ids"]) for f in reasoning_feats)
+                else:
+                    target_len = self.max_length
+
+                if self.pad_to_multiple_of is not None:
+                     target_len = ((target_len + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of * self.pad_to_multiple_of)
+
+                # Pad labels
+                for f in reasoning_feats:
+                    dest_len = len(f["labels"])
+                    diff = target_len - dest_len
+                    if diff > 0:
+                        if self.tokenizer.padding_side == "right":
+                            f["labels"] = f["labels"] + [IGNORE_INDEX] * diff
+                        else:
+                            f["labels"] = [IGNORE_INDEX] * diff + f["labels"]
+
                 padded = self.tokenizer.pad(
                     reasoning_feats,
                     padding=self.padding,
