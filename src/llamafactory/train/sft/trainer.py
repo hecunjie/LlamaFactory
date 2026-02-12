@@ -512,28 +512,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             decoded_answers.append(ans_text)
 
         # ---- Reasoning Recovery ----
-        # Identify special token IDs from the tokenizer's added tokens
-        # These are the <latent_thinking_X> tokens that were added via add_special_tokens config
+        # Discover special token IDs for reasoning recovery.
+        # IMPORTANT: YAML config's add_special_tokens uses tokenizer.add_tokens(special_tokens=True),
+        # which does NOT put tokens in all_special_tokens / additional_special_tokens.
+        # We must use get_added_vocab() which returns ALL tokens added to the vocabulary.
         special_token_ids = set()
-        all_special = self.processing_class.all_special_tokens
-        all_special_ids = self.processing_class.all_special_ids
-        # Filter: only include tokens that look like custom latent/reasoning tokens
-        # (not standard ones like <|im_start|>, <|im_end|>, <|endoftext|>, etc.)
-        for tok, tok_id in zip(all_special, all_special_ids):
-            if "latent" in tok.lower() or "thinking" in tok.lower() or "reason" in tok.lower():
+        added_vocab = self.processing_class.get_added_vocab()  # {token_str: token_id}
+        for tok_str, tok_id in added_vocab.items():
+            tok_lower = str(tok_str).lower()
+            # Match custom reasoning tokens; skip standard Qwen tokens (contain "|")
+            if ("latent" in tok_lower or "thinking" in tok_lower or "reason" in tok_lower) and "|" not in tok_lower:
                 special_token_ids.add(tok_id)
-        
-        # If no known special tokens found by name, try using additional_special_tokens
-        if not special_token_ids:
-            additional = getattr(self.processing_class, "additional_special_tokens", [])
-            additional_ids = getattr(self.processing_class, "additional_special_tokens_ids", [])
-            for tok_id in additional_ids:
-                special_token_ids.add(tok_id)
-        
+
         logger.info_rank0(f"[save_predictions] Special token IDs for reasoning recovery: {special_token_ids}")
-        
+        # Also log the token strings for clarity
+        id_to_tok = {v: k for k, v in added_vocab.items() if v in special_token_ids}
+        logger.info_rank0(f"[save_predictions] Special token mapping: {id_to_tok}")
+
+        # Debug: log first sample's token IDs
+        if len(preds) > 0:
+            seq0 = preds[0]
+            valid_len0 = int((seq0 != self.processing_class.pad_token_id).sum())
+            seq0 = seq0[:valid_len0]
+            logger.info_rank0(f"[save_predictions] Sample 0: valid_len={valid_len0}, first 20 token IDs: {seq0[:20].tolist()}")
+            logger.info_rank0(f"[save_predictions] Sample 0 decoded: {self.processing_class.decode(seq0[:20], skip_special_tokens=False)}")
+
         decoded_reasonings = [""] * len(preds)
-        
+
         if special_token_ids:
             logger.info_rank0("[save_predictions] Starting reasoning recovery...")
             # Unwrap model
@@ -543,20 +548,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             unwrapped.eval()
 
             n_recovered = 0
+            n_has_positions = 0
             for i in range(len(preds)):
                 try:
                     seq = preds[i]
                     valid_len = int((seq != self.processing_class.pad_token_id).sum())
                     seq = seq[:valid_len]
-                    
+
                     # Find special token positions in the prediction
                     special_positions = [j for j in range(len(seq)) if int(seq[j]) in special_token_ids]
-                    
+
                     if not special_positions:
                         continue
-                    
+
+                    n_has_positions += 1
+                    if i == 0:
+                        logger.info_rank0(f"[save_predictions] Sample 0: found {len(special_positions)} special positions: {special_positions}")
+
                     token_ids = torch.tensor(seq, dtype=torch.long)
-                    
+
                     reasoning_text = self._recover_reasoning_for_sample(
                         unwrapped, token_ids, special_positions, max_new_tokens=512
                     )
@@ -564,13 +574,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     if reasoning_text:
                         n_recovered += 1
 
-                    if (i + 1) % 10 == 0:
-                        logger.info_rank0(f"[save_predictions] Processed {i+1}/{len(preds)} samples, recovered {n_recovered}")
+                    if (i + 1) % 50 == 0:
+                        logger.info_rank0(f"[save_predictions] Processed {i+1}/{len(preds)}, has_positions={n_has_positions}, recovered={n_recovered}")
                 except Exception as e:
                     import traceback
                     logger.warning(f"Reasoning recovery failed for sample {i}: {e}\n{traceback.format_exc()}")
 
-            logger.info_rank0(f"[save_predictions] Reasoning recovery done: {n_recovered}/{len(preds)} samples")
+            logger.info_rank0(f"[save_predictions] Reasoning recovery done: recovered={n_recovered}, has_positions={n_has_positions}, total={len(preds)}")
         else:
             logger.warning("[save_predictions] No special token IDs found in tokenizer. Skipping reasoning recovery.")
 
