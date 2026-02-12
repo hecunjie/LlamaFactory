@@ -273,6 +273,25 @@ def _get_preprocessed_dataset(
     return dataset
 
 
+
+def _add_special_tokens(dataset: Union["Dataset", "IterableDataset"], tokenizer: "PreTrainedTokenizer"):
+    if dataset is None or not hasattr(dataset, "column_names") or "_special_tokens" not in dataset.column_names:
+        return
+
+    try:
+        if hasattr(dataset, "unique"):
+            unique_tokens = set(dataset.unique("_special_tokens"))
+            unique_tokens = {t for t in unique_tokens if t}
+            if not unique_tokens:
+                return
+
+            num_added = tokenizer.add_special_tokens({"additional_special_tokens": list(unique_tokens)})
+            if num_added > 0:
+                logger.info_rank0(f"Added {num_added} special tokens to tokenizer: {unique_tokens}")
+    except Exception as e:
+        logger.warning_rank0(f"Failed to scan special tokens from dataset: {e}")
+
+
 def get_dataset(
     template: "Template",
     model_args: "ModelArguments",
@@ -309,6 +328,14 @@ def get_dataset(
             stage,
             return_dict=data_args.eval_on_each_dataset,
         )
+
+        if not data_args.streaming:
+            _add_special_tokens(dataset, tokenizer)
+            if isinstance(eval_dataset, dict):
+                for v in eval_dataset.values():
+                    _add_special_tokens(v, tokenizer)
+            else:
+                _add_special_tokens(eval_dataset, tokenizer)
 
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
         # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
