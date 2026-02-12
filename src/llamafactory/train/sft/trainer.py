@@ -370,12 +370,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     hidden_states = hs_outputs.hidden_states[-1]  # (B, SeqLen, Dim)
                     del hs_outputs
 
-                    # 2b. Unwrap model for .generate() (DeepSpeed / DDP wrappers don't support it)
+                    # 2b. Unwrap model for direct forward (DeepSpeed / DDP wrappers)
                     unwrapped = model
                     while hasattr(unwrapped, "module"):
                         unwrapped = unwrapped.module
+                    embed_fn = unwrapped.get_input_embeddings()
 
-                    # 2c. Per-sample: extract hidden states at special token positions -> generate reasoning
+                    # 2c. Per-sample: extract hidden states -> manual greedy decode reasoning
                     reasoning_seqs = []
                     for i in range(batch_size):
                         mask_i = special_token_mask[i]
@@ -385,19 +386,43 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                             continue
 
                         # Extract hidden states at special token positions
-                        spec_h = hidden_states[i][mask_i == 1]  # (n_special, dim)
-                        spec_h = spec_h.unsqueeze(0)  # (1, n_special, dim)
+                        spec_h = hidden_states[i][mask_i == 1].unsqueeze(0)  # (1, n_special, dim)
 
-                        # Generate reasoning from hidden states
+                        # Manual greedy decoding with KV cache
+                        generated_ids = []
+                        past_key_values = None
+
+                        # First step: process all special token hidden states
                         with torch.no_grad():
-                            r_out = unwrapped.generate(
-                                inputs_embeds=spec_h,
-                                max_new_tokens=512,
-                                do_sample=False,
-                            )
-                        # r_out[0] = [dummy_input_ids(n_special), generated_tokens...]
-                        # Skip the first n_special dummy positions
-                        r_tokens = r_out[0][n_special:]
+                            out = unwrapped(inputs_embeds=spec_h, use_cache=True)
+                            past_key_values = out.past_key_values
+                            next_logits = out.logits[0, -1, :]
+                            next_id = next_logits.argmax(dim=-1)
+                            generated_ids.append(next_id.item())
+
+                        # Subsequent steps: one token at a time with KV cache
+                        max_reasoning_tokens = 512
+                        for _step in range(max_reasoning_tokens - 1):
+                            if next_id.item() == self.processing_class.eos_token_id:
+                                break
+                            next_embed = embed_fn(next_id.reshape(1, 1))  # (1, 1, dim)
+                            with torch.no_grad():
+                                out = unwrapped(
+                                    inputs_embeds=next_embed,
+                                    past_key_values=past_key_values,
+                                    use_cache=True,
+                                )
+                                past_key_values = out.past_key_values
+                                next_logits = out.logits[0, -1, :]
+                                next_id = next_logits.argmax(dim=-1)
+                                generated_ids.append(next_id.item())
+
+                        del past_key_values  # free memory
+
+                        if generated_ids:
+                            r_tokens = torch.tensor(generated_ids, dtype=torch.long, device=model.device)
+                        else:
+                            r_tokens = torch.tensor([], dtype=torch.long, device=model.device)
                         reasoning_seqs.append(r_tokens)
 
                     # 2d. Concatenate answer tokens + reasoning tokens
