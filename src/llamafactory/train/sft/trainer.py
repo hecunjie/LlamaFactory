@@ -186,9 +186,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         r"""Reset DeepSpeed ZeRO's gradient reduction flags to allow a second backward pass."""
         # ZeRO Stage 1/2
         if hasattr(model, "optimizer") and hasattr(model.optimizer, "params_already_reduced"):
-            model.optimizer.params_already_reduced = [
-                False
-            ] * len(model.optimizer.params_already_reduced)
+            if isinstance(model.optimizer.params_already_reduced, list):
+                model.optimizer.params_already_reduced = [
+                    False
+                ] * len(model.optimizer.params_already_reduced)
         # ZeRO Stage 3 (uses a different mechanism)
         if hasattr(model, "optimizer") and hasattr(model.optimizer, "parameter_offload"):
             pass  # Stage 3 doesn't use params_already_reduced
