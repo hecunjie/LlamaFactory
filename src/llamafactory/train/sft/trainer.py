@@ -282,14 +282,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
             for k, v in self._custom_loss_buffer.items():
                 if v:
-                    logs[f"loss_{k}"] = round(torch.stack(v).mean().item(), 4)
+                    # 1. Compute local mean for this buffer flush (e.g. logging_steps=10)
+                    local_loss = torch.stack(v).mean()
+                    
+                    # 2. Sync across GPUs (All-Reduce Mean) to match main 'loss'
+                    if self.args.world_size > 1:
+                        import torch.distributed as dist
+                        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+                        local_loss = local_loss / self.args.world_size
+                    
+                    logs[f"loss_{k}"] = round(local_loss.item(), 4)
             self._custom_loss_buffer = {"sft": [], "reasoning": []}
 
         # Inject eval-time split losses
         if hasattr(self, "_eval_loss_buffer") and self._eval_loss_buffer:
             for k, v in self._eval_loss_buffer.items():
                 if v:
-                    logs[f"eval_loss_{k}"] = round(torch.stack(v).mean().item(), 4)
+                    # Eval is usually already gathered or run on rank 0, but if distributed eval:
+                    local_loss = torch.stack(v).mean()
+                    # (Optional) If you run eval in distributed mode without gather, sync here clearly.
+                    # Standard HF Helper handles eval metrics gather. 
+                    # For safety if this buffer is per-gpu:
+                    if self.args.world_size > 1:
+                        import torch.distributed as dist
+                        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+                        local_loss = local_loss / self.args.world_size
+                        
+                    logs[f"eval_loss_{k}"] = round(local_loss.item(), 4)
 
         if start_time is not None:
             super().log(logs, start_time)
