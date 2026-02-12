@@ -329,159 +329,108 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
         r"""Compute eval loss (with reasoning split) or generate tokens."""
         if self.args.predict_with_generate:
-            # Preserve references needed for reasoning recovery
-            # Clone to ensure we don't lose data if inputs is modified
-            gt_labels = inputs.get("labels")
-            gt_mask = inputs.get("special_token_mask")
-            input_ids = inputs.get("input_ids")
-            
+            # Save references before popping
+            special_token_mask = inputs.get("special_token_mask")
+            input_ids_for_hs = inputs.get("input_ids").clone()  # Save for later forward pass
+            attn_mask_for_hs = inputs.get("attention_mask")
+            if attn_mask_for_hs is not None:
+                attn_mask_for_hs = attn_mask_for_hs.clone()
+
+            # Pop extra fields so super().prediction_step can work normally
             inputs.pop("reasoning_input_ids", None)
             inputs.pop("reasoning_labels", None)
             inputs.pop("reasoning_attention_mask", None)
             inputs.pop("special_token_mask", None)
             labels = inputs.pop("labels", None)
             
+            # Step 1: Standard answer generation
             loss, generated_tokens, _ = super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
             )
 
-            # Attempt to recover reasoning if special tokens can be found in generation
-            if generated_tokens is not None and gt_mask is not None and gt_labels is not None:
-                 try:
-                    batch_size = generated_tokens.size(0)
-                    reasoning_seqs = []
-                    
-                    # We need the model to output hidden states on the concatenated inputs
-                    # Construct batch inputs
-                    full_input_ids_list = []
-                    signatures = []
-                    
-                    for i in range(batch_size):
-                        # Identify target signature from GT
-                        # Mask is 1 where special tokens are
-                        mask_i = gt_mask[i]
-                        lbl_i = gt_labels[i]
-                        # Verify valid labels at mask
-                        if mask_i.sum() > 0:
-                            sig = lbl_i[mask_i == 1]
-                            # Remove IGNORE_INDEX if any (shouldn't be, but safety)
-                            sig = sig[sig != IGNORE_INDEX]
-                            signatures.append(sig)
-                        else:
-                            signatures.append(None)
-                            
-                        # generated_tokens usually includes the prompt for causal models (checked via post-processing logic below)
-                        g_ids = generated_tokens[i]
-                        valid_g = g_ids[g_ids != self.processing_class.pad_token_id]
-                        
-                        full_input_ids_list.append(valid_g)
-
-                    # Pad full inputs
+            # Step 2: Reasoning recovery from special token hidden states
+            do_recovery = (
+                generated_tokens is not None
+                and special_token_mask is not None
+                and special_token_mask.sum() > 0
+            )
+            if do_recovery:
+                try:
                     from torch.nn.utils.rnn import pad_sequence
-                    full_batch = pad_sequence(full_input_ids_list, batch_first=True, padding_value=self.processing_class.pad_token_id)
-                    full_batch = full_batch.to(model.device)
-                    
-                    # Forward pass
+                    batch_size = generated_tokens.size(0)
+
+                    # 2a. Forward pass on ORIGINAL input_ids to get hidden states
+                    #     (teacher-forced, reliable, no search needed)
                     with torch.no_grad():
-                        outputs = model(full_batch, output_hidden_states=True)
-                        hidden_states_all = outputs.hidden_states[-1]
-                        
-                    # Extract hidden states and Generate Reasoning
+                        hs_outputs = model(
+                            input_ids=input_ids_for_hs.to(model.device),
+                            attention_mask=attn_mask_for_hs.to(model.device) if attn_mask_for_hs is not None else None,
+                            output_hidden_states=True,
+                        )
+                    hidden_states = hs_outputs.hidden_states[-1]  # (B, SeqLen, Dim)
+                    del hs_outputs
+
+                    # 2b. Unwrap model for .generate() (DeepSpeed / DDP wrappers don't support it)
+                    unwrapped = model
+                    while hasattr(unwrapped, "module"):
+                        unwrapped = unwrapped.module
+
+                    # 2c. Per-sample: extract hidden states at special token positions -> generate reasoning
+                    reasoning_seqs = []
                     for i in range(batch_size):
-                        sig = signatures[i]
-                        if sig is None or len(sig) == 0:
-                             reasoning_seqs.append(torch.tensor([], dtype=torch.long, device=model.device))
-                             continue
-                             
-                        # Find signature in valid_g (inside full_batch)
-                        # Offset by len(valid_p)
-                        full_seq = full_batch[i] # Padded
-                        # Re-calculate valid length to avoid padding issues
-                        valid_len = (full_seq != self.processing_class.pad_token_id).sum()
-                        # Searching in the whole sequence is safer
-                        
-                        # Search for sequence 'sig' in 'full_seq[:valid_len]'
-                        # Simplified search: match only the FIRST token of the signature (the primary special token)
-                        # This avoids issues where '\n' is part of the signature but handled differently in generation
-                        found_idx = -1
-                        match_len = 0
-                        
-                        seq_np = full_seq[:valid_len].cpu().numpy()
-                        
-                        if len(sig) > 0:
-                            # Use only the first token of signature as anchor
-                            anchor_token = sig[0].item()
-                            
-                            # Find anchor in sequence
-                            anchor_indices = np.where(seq_np == anchor_token)[0]
-                            if len(anchor_indices) > 0:
-                                found_idx = anchor_indices[0] # Take the first occurrence
-                                match_len = 1 # We primarily use 1 token's hidden state
-                                
-                                # Check subsequent matches up to sig length
-                                # (Optional, but good for robustness if we want to extract multi-token contexts)
-                                k = 0
-                                while found_idx + k < len(seq_np) and k < len(sig) and seq_np[found_idx + k] == sig[k].item():
-                                    k += 1
-                                match_len = k
-                        
-                        if found_idx != -1:
-                            # Found special tokens. Hidden states are at these positions.
-                            # We want to use these hidden states to generate reasoning.
-                            # Extract hidden states
-                            spec_h = hidden_states_all[i, found_idx : found_idx+match_len] # (L, D)
-                            
-                            if spec_h.size(0) == 0:
-                                reasoning_seqs.append(torch.tensor([], dtype=torch.long, device=model.device))
-                                continue
-                            
-                            # Generate
-                            # We need to wrap model.generate to make it accept inputs_embeds primarily
-                            # and start generation.
-                            # Usually model.generate takes inputs_embeds.
-                            # We must provide inputs_embeds in shape (1, L, D).
-                            spec_h = spec_h.unsqueeze(0) # (1, L, D)
-                            
-                            # Generate
-                            r_out = model.generate(
-                                inputs_embeds=spec_h, 
-                                max_new_tokens=512, # Reasonable limit
-                                do_sample=False # Greedy for deterministic reasoning
-                            ) 
-                            # r_out includes the "input" usually? 
-                            # For inputs_embeds, it outputs only new tokens usually or full?
-                            # HF generate with inputs_embeds: usually returns new tokens if decoder-only?
-                            # Let's check: generated sequence usually includes prompt.
-                            
-                            # Flatten
-                            r_seq = r_out[0]
-                            reasoning_seqs.append(r_seq)
-                        else:
+                        mask_i = special_token_mask[i]
+                        n_special = mask_i.sum().item()
+                        if n_special == 0:
                             reasoning_seqs.append(torch.tensor([], dtype=torch.long, device=model.device))
-                    
-                    # Pad reasoning seqs
-                    max_r_len = max([len(x) for x in reasoning_seqs]) if reasoning_seqs else 0
-                    if max_r_len > 0:
-                        # Append to generated_tokens
-                        # We need to rebuild generated_tokens to accommodate the extra length
-                        # generated_tokens is already padded.
-                        # We will construct a new list of concatenated tensors
+                            continue
+
+                        # Extract hidden states at special token positions
+                        spec_h = hidden_states[i][mask_i == 1]  # (n_special, dim)
+                        spec_h = spec_h.unsqueeze(0)  # (1, n_special, dim)
+
+                        # Generate reasoning from hidden states
+                        with torch.no_grad():
+                            r_out = unwrapped.generate(
+                                inputs_embeds=spec_h,
+                                max_new_tokens=512,
+                                do_sample=False,
+                            )
+                        # r_out[0] = [dummy_input_ids(n_special), generated_tokens...]
+                        # Skip the first n_special dummy positions
+                        r_tokens = r_out[0][n_special:]
+                        reasoning_seqs.append(r_tokens)
+
+                    # 2d. Concatenate answer tokens + reasoning tokens
+                    n_recovered = sum(1 for r in reasoning_seqs if len(r) > 0)
+                    logger.info_rank0(
+                        f"[predict] Reasoning recovered for {n_recovered}/{batch_size} samples"
+                    )
+
+                    if n_recovered > 0:
                         new_gen_list = []
                         for i in range(batch_size):
-                             g_ids = generated_tokens[i]
-                             valid_g = g_ids[g_ids != self.processing_class.pad_token_id]
-                             r_ids = reasoning_seqs[i]
-                             # Concatenate
-                             combined = torch.cat([valid_g, r_ids])
-                             new_gen_list.append(combined)
-                        
-                        generated_tokens = pad_sequence(new_gen_list, batch_first=True, padding_value=self.processing_class.pad_token_id)
-                        
-                 except Exception as e:
-                     logger.warning(f"Reasoning recovery failed: {e}")
+                            g_ids = generated_tokens[i]
+                            valid_g = g_ids[g_ids != self.processing_class.pad_token_id]
+                            r_ids = reasoning_seqs[i]
+                            combined = torch.cat([valid_g, r_ids])
+                            new_gen_list.append(combined)
 
+                        generated_tokens = pad_sequence(
+                            new_gen_list, batch_first=True,
+                            padding_value=self.processing_class.pad_token_id,
+                        )
+
+                except Exception as e:
+                    import traceback
+                    logger.warning(
+                        f"Reasoning recovery failed: {e}\n{traceback.format_exc()}"
+                    )
+
+            # Step 3: Mask prompt portion as PAD
             if generated_tokens is not None:
-                generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
+                prompt_len = inputs["input_ids"].size(-1)
+                if generated_tokens.size(-1) > prompt_len:
+                    generated_tokens[:, :prompt_len] = self.processing_class.pad_token_id
                 generated_tokens = generated_tokens.contiguous()
             return loss, generated_tokens, labels
 
