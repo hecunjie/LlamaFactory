@@ -1,0 +1,24 @@
+### model
+model_name_or_path: saves/qwen/full/sft  # 请修改为你训练后的模型路径
+
+### method
+stage: sft
+do_predict: true
+finetuning_type: full  # 如果是 LoRA，请改为 lora 并添加 adapter_name_or_path
+
+### dataset
+dataset: reasoning_demo  # 请修改为你的测试集名称 (test dataset)
+template: qwen
+cutoff_len: 1024
+max_samples: 50
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### output
+output_dir: saves/qwen/predict
+overwrite_output_dir: true
+
+### eval
+per_device_eval_batch_size: 1
+predict_with_generate: true
+ddp_timeout: 180000000

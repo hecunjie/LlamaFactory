@@ -436,9 +436,56 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
 
         decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
-        decoded_preds = self.processing_class.batch_decode(preds, skip_special_tokens=skip_special_tokens)
         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
 
+        # Custom split logic for Answer and Reasoning
+        # The structure of preds[i] is [Answer ... EOS ... Reasoning ... EOS]
+        # We try to split by the first EOS token
+        
+        decoded_answers = []
+        decoded_reasonings = []
+        
+        eos_id = self.processing_class.eos_token_id
+        
+        for i in range(len(preds)):
+            seq = preds[i]
+            # Strip padding first (which is at the end)
+            valid_len = (seq != self.processing_class.pad_token_id).sum()
+            seq = seq[:valid_len]
+            
+            # Find first EOS
+            # We assume the first EOS separates Answer and Reasoning.
+            # If no reasoning was generated (because no special tokens were found), it will be just Answer+EOS.
+            
+            eos_indices = np.where(seq == eos_id)[0]
+            if len(eos_indices) > 0:
+                first_eos = eos_indices[0]
+                answer_seq = seq[:first_eos] # Exclude EOS
+                
+                # Check for reasoning part
+                # If there are tokens after first EOS, they are reasoning
+                if len(seq) > first_eos + 1:
+                    reasoning_seq = seq[first_eos + 1:]
+                    # Strip subsequent EOS if present in reasoning
+                    # (Reasoning generation might have produced its own EOS)
+                else:
+                    reasoning_seq = np.array([], dtype=seq.dtype)
+            else:
+                # No EOS found? Just treat whole thing as answer
+                answer_seq = seq
+                reasoning_seq = np.array([], dtype=seq.dtype)
+                
+            ans_text = self.processing_class.decode(answer_seq, skip_special_tokens=skip_special_tokens)
+            rea_text = self.processing_class.decode(reasoning_seq, skip_special_tokens=skip_special_tokens)
+            
+            decoded_answers.append(ans_text)
+            decoded_reasonings.append(rea_text)
+
         with open(output_prediction_file, "w", encoding="utf-8") as f:
-            for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
-                f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+            for text, ans, rea, label in zip(decoded_inputs, decoded_answers, decoded_reasonings, decoded_labels):
+                f.write(json.dumps({
+                    "prompt": text, 
+                    "predict_answer": ans, 
+                    "predict_reasoning": rea, 
+                    "label": label
+                }, ensure_ascii=False) + "\n")
