@@ -618,8 +618,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 answer_seq = seq
                 reasoning_seq = np.array([], dtype=seq.dtype)
                 
-            ans_text = self.processing_class.decode(answer_seq, skip_special_tokens=skip_special_tokens)
-            rea_text = self.processing_class.decode(reasoning_seq, skip_special_tokens=skip_special_tokens)
+            ans_text = self.processing_class.decode(answer_seq, skip_special_tokens=False)
+            rea_text = self.processing_class.decode(reasoning_seq, skip_special_tokens=False)
             
             decoded_answers.append(ans_text)
             decoded_reasonings.append(rea_text)
