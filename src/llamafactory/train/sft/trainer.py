@@ -122,10 +122,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     ):
         r"""Build inputs for reasoning forward pass from special token hidden states.
 
-        Takes the hidden states at special token positions (detached) and
-        concatenates them as prefix context with reasoning token embeddings.
-        The model then predicts the ENTIRE reasoning sequence using only
-        special token representations as context.
+        Takes the hidden states at special token positions (WITHOUT detach, so
+        gradient flows back) and concatenates them as prefix context with
+        reasoning token embeddings. The model then predicts the ENTIRE reasoning
+        sequence. Gradient flows: reasoning_loss → spec_h → first forward → params.
 
         Returns (inputs_embeds, attention_mask, labels) or None if no valid samples.
         """
@@ -145,8 +145,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if n_special == 0:
                 continue
 
-            # Detach: break gradient flow back to first forward
-            spec_h = hidden_states[i][mask == 1].detach()  # (n_special, dim)
+            # Keep gradient flow: reasoning loss must update how model produces
+            # hidden states at special token positions (the core training signal).
+            spec_h = hidden_states[i][mask == 1]  # (n_special, dim) — gradient flows through!
 
             r_ids = reasoning_input_ids[i]
             r_lbls = reasoning_labels[i]
@@ -203,10 +204,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         inputs: dict[str, Union["torch.Tensor", Any]],
         num_items_in_batch: Optional[int] = None,
     ) -> "torch.Tensor":
-        r"""Two-pass training step: SFT forward+backward, then reasoning forward+backward.
+        r"""Combined training step: SFT forward → Reasoning forward → SINGLE backward.
 
-        This avoids DeepSpeed's 'parameter already reduced' error by resetting
-        the reduction state between the two backward passes.
+        Key design: NO detach on hidden states, so reasoning loss gradients flow
+        back through spec_h → first forward → model parameters. This teaches the
+        model to encode reasoning information into special token hidden states.
+
+        Single backward avoids DeepSpeed's 'parameter already reduced' error.
         """
         model.train()
 
@@ -224,50 +228,49 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if do_reasoning:
             inputs["output_hidden_states"] = True
 
-        # ---- Pass 1: SFT forward + backward ----
+        # ---- Forward 1: SFT ----
         with self.compute_loss_context_manager():
             loss_sft, outputs = super().compute_loss(
                 model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
             )
 
-        # Save hidden states before backward
-        hidden_states = None
+        # ---- Forward 2: Reasoning (gradient flows through hidden_states!) ----
+        loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
         if do_reasoning:
             hs = getattr(outputs, "hidden_states", None)
             if isinstance(outputs, dict):
                 hs = outputs.get("hidden_states", hs)
             if hs is not None:
-                hidden_states = hs[-1].detach().clone()
+                # NO detach, NO clone — keep the computation graph alive
+                hidden_states = hs[-1]
+                reasoning_inputs = self._build_reasoning_inputs(
+                    model, hidden_states, special_token_mask,
+                    reasoning_input_ids, reasoning_labels
+                )
+                if reasoning_inputs is not None:
+                    input_embeds, attn_mask, labels_padded = reasoning_inputs
+                    with self.compute_loss_context_manager():
+                        outputs_r = model(
+                            inputs_embeds=input_embeds,
+                            attention_mask=attn_mask,
+                            labels=labels_padded,
+                        )
+                        loss_reasoning = outputs_r.loss
+                    del outputs_r
 
         del outputs
+
+        # ---- SINGLE backward with combined loss ----
+        # Gradient path for reasoning_loss:
+        #   loss_reasoning → second forward → input_embeds → spec_h
+        #   → hidden_states at special positions → first forward → model params
+        # This is the KEY signal that teaches the model to compress reasoning into hidden states.
+        total_loss = loss_sft + loss_reasoning
 
         kwargs = {}
         if hasattr(self, "_grad_norm_kwargs"):
             kwargs = self._grad_norm_kwargs
-        self.accelerator.backward(loss_sft, **kwargs)
-
-        # ---- Pass 2: Reasoning forward + backward ----
-        loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
-        if do_reasoning and hidden_states is not None:
-            reasoning_inputs = self._build_reasoning_inputs(
-                model, hidden_states, special_token_mask, reasoning_input_ids, reasoning_labels
-            )
-            if reasoning_inputs is not None:
-                input_embeds, attn_mask, labels_padded = reasoning_inputs
-
-                # Reset DeepSpeed reduction state so second backward is allowed
-                self._reset_ds_reduction_state(model)
-
-                with self.compute_loss_context_manager():
-                    outputs_r = model(
-                        inputs_embeds=input_embeds,
-                        attention_mask=attn_mask,
-                        labels=labels_padded,
-                    )
-                    loss_reasoning = outputs_r.loss
-
-                del outputs_r
-                self.accelerator.backward(loss_reasoning, **kwargs)
+        self.accelerator.backward(total_loss, **kwargs)
 
         # Log split losses
         if not hasattr(self, "_custom_loss_buffer"):
@@ -275,7 +278,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._custom_loss_buffer["sft"].append(loss_sft.detach().float())
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float())
 
-        return (loss_sft + loss_reasoning).detach()
+        return total_loss.detach()
 
     @override
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
