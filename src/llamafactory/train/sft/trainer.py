@@ -415,6 +415,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         generated_ids_np: "np.ndarray",
         special_positions_in_gen: list[int],
         max_new_tokens: int = 512,
+        sample_idx: int = -1,
     ) -> str:
         r"""Recover reasoning from special token hidden states with FULL context.
 
@@ -428,6 +429,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             generated_ids_np: (GenLen,) np array – the generated part (special + answer).
             special_positions_in_gen: positions of special tokens *within generated_ids_np*.
             max_new_tokens: max reasoning tokens to generate.
+            sample_idx: sample index for diagnostic logging.
 
         Returns:
             Decoded reasoning text string.
@@ -436,6 +438,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return ""
 
         device = next(model.parameters()).device
+        do_log = sample_idx < 3  # detailed logging for first 3 samples
 
         # 1. Build FULL sequence: [prompt] + [generated]
         gen_tensor = torch.tensor(generated_ids_np, dtype=torch.long)
@@ -457,6 +460,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         spec_h = hidden_states[pos_tensor].unsqueeze(0)  # (1, n_special, Dim)
         del hidden_states
 
+        # Diagnostic: log spec_h statistics
+        if do_log:
+            norms = spec_h.squeeze(0).norm(dim=-1).tolist()
+            first_vals = spec_h.squeeze(0)[0, :5].tolist()  # first 5 values of first vector
+            logger.info_rank0(
+                f"  [sample {sample_idx}] spec_h norms={[f'{n:.2f}' for n in norms]}, "
+                f"first_vec[:5]={[f'{v:.4f}' for v in first_vals]}"
+            )
+
         # 4. Manual greedy decode with KV cache
         embed_fn = model.get_input_embeddings()
         result_ids = []
@@ -466,8 +478,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # First step: feed all special token hidden states as prefix
             out = model(inputs_embeds=spec_h, use_cache=True)
             past_key_values = out.past_key_values
-            next_id = out.logits[0, -1, :].argmax(dim=-1)
+            logits_first = out.logits[0, -1, :]  # (vocab_size,)
+            next_id = logits_first.argmax(dim=-1)
             result_ids.append(next_id.item())
+
+            # Diagnostic: log first-step logit distribution
+            if do_log:
+                probs = torch.softmax(logits_first.float(), dim=-1)
+                topk_probs, topk_ids = probs.topk(5)
+                top_tokens = [(self.processing_class.decode([tid.item()]), f"{p.item():.4f}") for tid, p in zip(topk_ids, topk_probs)]
+                logger.info_rank0(f"  [sample {sample_idx}] first-step top5: {top_tokens}")
 
             # Auto-regressive decoding
             for _ in range(max_new_tokens - 1):
@@ -488,11 +508,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not result_ids:
             return ""
 
-        # Log the first few tokens for debugging
-        logger.info_rank0(
-            f"  [reasoning decode] prompt_len={prompt_len}, "
-            f"abs_positions={abs_positions}, first 5 tokens: {result_ids[:5]}"
-        )
+        if do_log:
+            logger.info_rank0(
+                f"  [sample {sample_idx}] decoded {len(result_ids)} tokens, "
+                f"first 10: {result_ids[:10]}"
+            )
 
         return self.processing_class.decode(result_ids, skip_special_tokens=False)
 
@@ -594,7 +614,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         )
 
                     reasoning_text = self._recover_reasoning_for_sample(
-                        unwrapped, prompt_ids, seq, special_positions_in_gen, max_new_tokens=512
+                        unwrapped, prompt_ids, seq, special_positions_in_gen,
+                        max_new_tokens=512, sample_idx=i
                     )
                     decoded_reasonings[i] = reasoning_text
                     if reasoning_text:
