@@ -409,46 +409,65 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return output
 
     def _recover_reasoning_for_sample(
-        self, model, token_ids: torch.Tensor, special_positions: list[int], max_new_tokens: int = 512
+        self,
+        model,
+        prompt_ids: torch.Tensor,
+        generated_ids_np: "np.ndarray",
+        special_positions_in_gen: list[int],
+        max_new_tokens: int = 512,
     ) -> str:
-        r"""Recover reasoning from a single sample's special token hidden states.
-        
+        r"""Recover reasoning from special token hidden states with FULL context.
+
+        During training the model sees [Prompt][Special_1..5][\n][Answer] as one
+        sequence, so hidden states at special-token positions are contextualised
+        by the prompt.  We must replicate this at inference time.
+
         Args:
-            model: unwrapped model (no DeepSpeed/DDP wrapper)
-            token_ids: (SeqLen,) token ids for this sample (the generated prediction)
-            special_positions: list of int positions where special tokens are located
-            max_new_tokens: max reasoning tokens to generate
-        
+            model: unwrapped model (no DeepSpeed / DDP wrapper).
+            prompt_ids: (PromptLen,) – the input_ids of the prompt (from dataset).
+            generated_ids_np: (GenLen,) np array – the generated part (special + answer).
+            special_positions_in_gen: positions of special tokens *within generated_ids_np*.
+            max_new_tokens: max reasoning tokens to generate.
+
         Returns:
             Decoded reasoning text string.
         """
-        if not special_positions:
+        if not special_positions_in_gen:
             return ""
-            
+
         device = next(model.parameters()).device
 
-        # 1. Forward pass to get hidden states
-        ids = token_ids.unsqueeze(0).to(device)  # (1, SeqLen)
+        # 1. Build FULL sequence: [prompt] + [generated]
+        gen_tensor = torch.tensor(generated_ids_np, dtype=torch.long)
+        full_ids = torch.cat([prompt_ids.to("cpu"), gen_tensor], dim=0)
+        prompt_len = prompt_ids.shape[0]
+
+        # Absolute positions of special tokens in the full sequence
+        abs_positions = [prompt_len + p for p in special_positions_in_gen]
+
+        # 2. Forward the full sequence to get contextualized hidden states
+        ids = full_ids.unsqueeze(0).to(device)  # (1, FullLen)
         with torch.no_grad():
             out = model(ids, output_hidden_states=True)
-        hidden_states = out.hidden_states[-1][0]  # (SeqLen, Dim)
+        hidden_states = out.hidden_states[-1][0]  # (FullLen, Dim)
         del out
 
-        # 2. Extract hidden states at special token positions
-        pos_tensor = torch.tensor(special_positions, dtype=torch.long, device=device)
+        # 3. Extract hidden states at special token positions (now with prompt context!)
+        pos_tensor = torch.tensor(abs_positions, dtype=torch.long, device=device)
         spec_h = hidden_states[pos_tensor].unsqueeze(0)  # (1, n_special, Dim)
+        del hidden_states
 
-        # 3. Manual greedy decode with KV cache
+        # 4. Manual greedy decode with KV cache
         embed_fn = model.get_input_embeddings()
-        generated_ids = []
+        result_ids = []
         past_key_values = None
 
         with torch.no_grad():
-            # First step: feed all special token hidden states
+            # First step: feed all special token hidden states as prefix
             out = model(inputs_embeds=spec_h, use_cache=True)
             past_key_values = out.past_key_values
             next_id = out.logits[0, -1, :].argmax(dim=-1)
-            generated_ids.append(next_id.item())
+            result_ids.append(next_id.item())
 
             # Auto-regressive decoding
             for _ in range(max_new_tokens - 1):
@@ -462,18 +481,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 )
                 past_key_values = out.past_key_values
                 next_id = out.logits[0, -1, :].argmax(dim=-1)
-                generated_ids.append(next_id.item())
+                result_ids.append(next_id.item())
 
         del past_key_values
 
-        if not generated_ids:
+        if not result_ids:
             return ""
-        
-        # Log the first few tokens for debugging
-        first_tokens = generated_ids[:5]
-        logger.info_rank0(f"  [reasoning decode] first tokens: {first_tokens}")
 
-        return self.processing_class.decode(generated_ids, skip_special_tokens=False)
+        # Log the first few tokens for debugging
+        logger.info_rank0(
+            f"  [reasoning decode] prompt_len={prompt_len}, "
+            f"abs_positions={abs_positions}, first 5 tokens: {result_ids[:5]}"
+        )
+
+        return self.processing_class.decode(result_ids, skip_special_tokens=False)
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
@@ -555,20 +576,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     valid_len = int((seq != self.processing_class.pad_token_id).sum())
                     seq = seq[:valid_len]
 
-                    # Find special token positions in the prediction
-                    special_positions = [j for j in range(len(seq)) if int(seq[j]) in special_token_ids]
+                    # Find special token positions in the GENERATED part
+                    special_positions_in_gen = [j for j in range(len(seq)) if int(seq[j]) in special_token_ids]
 
-                    if not special_positions:
+                    if not special_positions_in_gen:
                         continue
 
                     n_has_positions += 1
-                    if i == 0:
-                        logger.info_rank0(f"[save_predictions] Sample 0: found {len(special_positions)} special positions: {special_positions}")
 
-                    token_ids = torch.tensor(seq, dtype=torch.long)
+                    # Get prompt input_ids for this sample (needed for full-context forward)
+                    prompt_ids = torch.tensor(dataset[i]["input_ids"], dtype=torch.long)
+
+                    if i == 0:
+                        logger.info_rank0(
+                            f"[save_predictions] Sample 0: prompt_len={len(prompt_ids)}, "
+                            f"gen_len={len(seq)}, special_positions_in_gen={special_positions_in_gen}"
+                        )
 
                     reasoning_text = self._recover_reasoning_for_sample(
-                        unwrapped, token_ids, special_positions, max_new_tokens=512
+                        unwrapped, prompt_ids, seq, special_positions_in_gen, max_new_tokens=512
                     )
                     decoded_reasonings[i] = reasoning_text
                     if reasoning_text:
