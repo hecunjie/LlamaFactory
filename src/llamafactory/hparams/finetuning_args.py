@@ -498,6 +498,10 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "The alpha parameter for EAFT loss to control the power of adaptive weight."},
     )
+    reasoning_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient for reasoning loss. total_loss = loss_sft + reasoning_loss_weight * loss_reasoning."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

@@ -125,6 +125,17 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether or not to enable thinking mode for reasoning models."},
     )
+    num_latent_thinking_token: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of latent thinking token positions inserted at the start of the response. "
+                "When > 0, N filler tokens are inserted before the answer; their labels are IGNORE_INDEX "
+                "(no SFT loss) and their hidden states are used for reasoning recovery. "
+                "Set to 0 to use the legacy _special_tokens field approach."
+            )
+        },
+    )
     tokenized_path: str | None = field(
         default=None,
         metadata={

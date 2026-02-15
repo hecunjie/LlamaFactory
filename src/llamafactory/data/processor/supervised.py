@@ -99,13 +99,87 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             # Check for reasoning and special tokens
             has_reasoning = "_reasoning" in examples and examples["_reasoning"][i]
             has_special_tokens = "_special_tokens" in examples and examples["_special_tokens"][i]
+            num_latent = self.data_args.num_latent_thinking_token
 
-            if has_reasoning and has_special_tokens:
+            if has_reasoning and num_latent > 0:
+                # ---- New approach: insert N filler tokens, no special vocabulary needed ----
+                reasoning = examples["_reasoning"][i]
+                original_response = examples["_response"][i][0]["content"]
+
+                # 1. Encode response as just the answer (no special token prefix)
+                response_1 = [{"role": "assistant", "content": original_response}]
+                input_ids, labels = self._encode_data_example(
+                    prompt=examples["_prompt"][i],
+                    response=response_1,
+                    system=examples["_system"][i],
+                    tools=examples["_tools"][i],
+                    images=examples["_images"][i] if "_images" in examples and examples["_images"][i] is not None else [],
+                    videos=examples["_videos"][i] if "_videos" in examples and examples["_videos"][i] is not None else [],
+                    audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
+                )
+
+                # 2. Find response_start (first non-IGNORE label)
+                response_start = -1
+                for j in range(len(labels)):
+                    if labels[j] != IGNORE_INDEX:
+                        response_start = j
+                        break
+
+                # 3. Insert N filler tokens at response_start
+                #    Use newline token as filler — it already exists in vocab.
+                #    Labels for filler positions = IGNORE_INDEX (no SFT loss).
+                if response_start >= 0:
+                    filler_id = self.tokenizer.encode("\n", add_special_tokens=False)[0]
+                    input_ids = (
+                        input_ids[:response_start]
+                        + [filler_id] * num_latent
+                        + input_ids[response_start:]
+                    )
+                    labels = (
+                        labels[:response_start]
+                        + [IGNORE_INDEX] * num_latent
+                        + labels[response_start:]
+                    )
+
+                # 4. Truncate to cutoff_len if needed
+                cutoff = self.data_args.cutoff_len
+                if len(input_ids) > cutoff:
+                    input_ids = input_ids[:cutoff]
+                    labels = labels[:cutoff]
+
+                # 5. Build special_token_mask for the N filler positions
+                special_token_mask = [0] * len(input_ids)
+                if response_start >= 0:
+                    for j in range(response_start, min(response_start + num_latent, len(input_ids))):
+                        special_token_mask[j] = 1
+
+                # 6. Tokenize reasoning text (separate sequence for second forward)
+                reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
+                reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
+
+                model_inputs["input_ids"].append(input_ids)
+                model_inputs["attention_mask"].append([1] * len(input_ids))
+                model_inputs["labels"].append(labels)
+                model_inputs["special_token_mask"].append(special_token_mask)
+                model_inputs["reasoning_input_ids"].append(reasoning_ids)
+                model_inputs["reasoning_labels"].append(reasoning_ids)
+                model_inputs["reasoning_attention_mask"].append([1] * len(reasoning_ids))
+
+                if "_images" in examples:
+                     model_inputs["images"].append(examples["_images"][i])
+                if "_videos" in examples:
+                     model_inputs["videos"].append(examples["_videos"][i])
+                if "_audios" in examples:
+                     model_inputs["audios"].append(examples["_audios"][i])
+
+                continue
+
+            elif has_reasoning and has_special_tokens:
+                # ---- Legacy approach: use special tokens from data ----
                 special_tokens = examples["_special_tokens"][i]
                 reasoning = examples["_reasoning"][i]
                 original_response = examples["_response"][i][0]["content"]
 
-                # 1. SFT part: Prompt -> SpecialTokens + Answer
                 response_content = special_tokens + "\n" + original_response
                 response_1 = [{"role": "assistant", "content": response_content}]
                 input_ids, labels = self._encode_data_example(
@@ -118,11 +192,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                     audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
                 )
 
-                # 2. Tokenize reasoning text (separate sequence for second forward)
                 reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
                 reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
 
-                # 3. Build special_token_mask on the SFT sequence
                 special_prefix = special_tokens + "\n"
                 special_prefix_ids = self.tokenizer.encode(special_prefix, add_special_tokens=False)
                 n_special = len(special_prefix_ids)
