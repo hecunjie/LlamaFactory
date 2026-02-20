@@ -48,6 +48,14 @@ def run_sft(
 ):
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
+
+    # Auto-add latent thinking tokens when num_latent_thinking_token > 0
+    if data_args.num_latent_thinking_token > 0:
+        latent_tokens = [f"<latent_{i}>" for i in range(data_args.num_latent_thinking_token)]
+        num_added = tokenizer.add_tokens(latent_tokens, special_tokens=True)
+        if num_added > 0:
+            logger.info(f"Added {num_added} latent thinking tokens to vocabulary: {latent_tokens}")
+
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)

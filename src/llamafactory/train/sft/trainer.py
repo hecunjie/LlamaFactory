@@ -206,13 +206,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         inputs: dict[str, Union["torch.Tensor", Any]],
         num_items_in_batch: Optional[int] = None,
     ) -> "torch.Tensor":
-        r"""Combined training step: SFT forward → Reasoning forward → SINGLE backward.
+        r"""Combined training step: Answer forward → Reasoning forward → SINGLE backward.
+
+        The think block (<think>..latent..</think>) has IGNORE_INDEX labels,
+        so loss_sft only covers the answer portion. The latent tokens are part
+        of the input context — their hidden states encode prompt information via
+        causal attention. Reasoning loss uses these hidden states to predict
+        the ground-truth reasoning chain.
 
         Key design: NO detach on hidden states, so reasoning loss gradients flow
-        back through spec_h → first forward → model parameters. This teaches the
-        model to encode reasoning information into special token hidden states.
-
-        Single backward avoids DeepSpeed's 'parameter already reduced' error.
+        back through spec_h → first forward → model parameters.
+        Loss = loss_answer + w * loss_reasoning.
         """
         model.train()
 
@@ -263,10 +267,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         del outputs
 
         # ---- SINGLE backward with combined loss ----
+        # loss_sft covers answer tokens only (think block labels = IGNORE_INDEX).
         # Gradient path for reasoning_loss:
         #   loss_reasoning → second forward → input_embeds → spec_h
-        #   → hidden_states at special positions → first forward → model params
-        # This is the KEY signal that teaches the model to compress reasoning into hidden states.
+        #   → hidden_states at latent positions → first forward → model params
+        # This teaches the model to compress reasoning into latent token hidden states.
         w = self.finetuning_args.reasoning_loss_weight
         total_loss = loss_sft + w * loss_reasoning
 
@@ -419,30 +424,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         model,
         prompt_ids: torch.Tensor,
         generated_ids_np: "np.ndarray",
-        special_positions_in_gen: list[int],
+        special_positions_in_gen: list[int] = None,
+        special_positions_in_full: list[int] = None,
+        positions_are_absolute: bool = False,
         max_new_tokens: int = 512,
         sample_idx: int = -1,
     ) -> str:
         r"""Recover reasoning from special token hidden states with FULL context.
 
-        During training the model sees [Prompt][Special_1..5][\n][Answer] as one
-        sequence, so hidden states at special-token positions are contextualised
-        by the prompt.  We must replicate this at inference time.
+        Builds the full sequence [prompt_ids + generated_ids], does a forward pass,
+        extracts hidden states at special token positions, then greedy-decodes
+        the reasoning chain from those hidden states.
 
         Args:
             model: unwrapped model (no DeepSpeed / DDP wrapper).
             prompt_ids: (PromptLen,) – the input_ids of the prompt (from dataset).
-            generated_ids_np: (GenLen,) np array – the generated part (special + answer).
-            special_positions_in_gen: positions of special tokens *within generated_ids_np*.
+            generated_ids_np: (GenLen,) np array – the generated part (answer tokens).
+            special_positions_in_gen: positions of special tokens *within generated_ids_np*
+                (legacy mode, used when positions_are_absolute=False).
+            special_positions_in_full: absolute positions of special tokens in the full
+                sequence [prompt_ids + generated_ids] (new mode, positions_are_absolute=True).
+            positions_are_absolute: if True, use special_positions_in_full directly.
             max_new_tokens: max reasoning tokens to generate.
             sample_idx: sample index for diagnostic logging.
 
         Returns:
             Decoded reasoning text string.
         """
-        if not special_positions_in_gen:
-            return ""
-
         device = next(model.parameters()).device
         do_log = sample_idx < 3  # detailed logging for first 3 samples
 
@@ -451,8 +459,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         full_ids = torch.cat([prompt_ids.to("cpu"), gen_tensor], dim=0)
         prompt_len = prompt_ids.shape[0]
 
-        # Absolute positions of special tokens in the full sequence
-        abs_positions = [prompt_len + p for p in special_positions_in_gen]
+        # Determine absolute positions of special tokens in the full sequence
+        if positions_are_absolute and special_positions_in_full is not None:
+            abs_positions = special_positions_in_full
+        elif special_positions_in_gen is not None:
+            abs_positions = [prompt_len + p for p in special_positions_in_gen]
+        else:
+            return ""
+
+        if not abs_positions:
+            return ""
 
         # 2. Forward the full sequence to get contextualized hidden states
         ids = full_ids.unsqueeze(0).to(device)  # (1, FullLen)
@@ -525,7 +541,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
     ) -> None:
-        r"""Save model predictions to `output_dir`."""
+        r"""Save model predictions to `output_dir`.
+
+        When num_latent_thinking_token > 0:
+        - input_ids (from dataset) includes the think block as prompt context
+        - generated preds contain only the answer (model doesn't generate think block)
+        - Latent token positions are found in input_ids, not in preds
+        - For reasoning recovery: forward [input_ids + answer], extract latent hidden states
+        """
         if not self.is_world_process_zero():
             return
 
@@ -549,7 +572,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
 
-        # Decode predicted answers (with special tokens visible)
+        # ---- Reasoning Recovery ----
+        num_latent = getattr(self.data_args, "num_latent_thinking_token", 0) if self.data_args else 0
+
+        # Decode predicted answers (generated part is answer only, no think block)
         decoded_answers = []
         for i in range(len(preds)):
             seq = preds[i]
@@ -558,64 +584,97 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             ans_text = self.processing_class.decode(seq, skip_special_tokens=False)
             decoded_answers.append(ans_text)
 
-        # ---- Reasoning Recovery ----
-        num_latent = getattr(self.data_args, "num_latent_thinking_token", 0) if self.data_args else 0
-
-        # Debug: log first sample's token IDs
+        # Debug: log first sample
         if len(preds) > 0:
             seq0 = preds[0]
             valid_len0 = int((seq0 != self.processing_class.pad_token_id).sum())
             seq0 = seq0[:valid_len0]
             logger.info_rank0(f"[save_predictions] Sample 0: valid_len={valid_len0}, first 20 token IDs: {seq0[:20].tolist()}")
             logger.info_rank0(f"[save_predictions] Sample 0 decoded: {self.processing_class.decode(seq0[:20], skip_special_tokens=False)}")
+            logger.info_rank0(f"[save_predictions] Sample 0 input_ids len: {len(dataset[0]['input_ids'])}")
 
         decoded_reasonings = [""] * len(preds)
 
         if num_latent > 0:
-            # ---- New approach: first num_latent tokens of each generation are latent positions ----
-            logger.info_rank0(f"[save_predictions] Using num_latent_thinking_token={num_latent} for reasoning recovery")
+            # ---- Latent thinking: find latent positions in input_ids (prompt context) ----
+            # At prediction time, input_ids = [prompt + think_block], preds = [answer]
+            # Latent token positions are in the input_ids, NOT in the generated output.
+            latent_token_ids = set()
+            for j in range(num_latent):
+                name = f"<latent_{j}>"
+                tok_ids = self.processing_class.encode(name, add_special_tokens=False)
+                if len(tok_ids) == 1:
+                    latent_token_ids.add(tok_ids[0])
 
-            unwrapped = self.model
-            while hasattr(unwrapped, "module"):
-                unwrapped = unwrapped.module
-            unwrapped.eval()
+            logger.info_rank0(f"[save_predictions] Latent token IDs for reasoning recovery: {latent_token_ids}")
 
-            n_recovered = 0
-            for i in range(len(preds)):
-                try:
-                    seq = preds[i]
-                    valid_len = int((seq != self.processing_class.pad_token_id).sum())
-                    seq = seq[:valid_len]
+            if not latent_token_ids:
+                logger.warning("[save_predictions] Cannot resolve latent token IDs. Skipping reasoning recovery.")
+            else:
+                unwrapped = self.model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                unwrapped.eval()
 
-                    if valid_len < num_latent:
-                        continue  # generated sequence too short
+                n_recovered = 0
+                n_has_latent = 0
+                for i in range(len(preds)):
+                    try:
+                        # input_ids includes prompt + think block
+                        input_ids_i = dataset[i]["input_ids"]
 
-                    # The first num_latent positions of generated output are latent
-                    special_positions_in_gen = list(range(num_latent))
+                        # Find latent token positions in input_ids
+                        latent_positions_in_input = [
+                            j for j in range(len(input_ids_i))
+                            if int(input_ids_i[j]) in latent_token_ids
+                        ]
 
-                    prompt_ids = torch.tensor(dataset[i]["input_ids"], dtype=torch.long)
+                        if not latent_positions_in_input:
+                            continue
 
-                    if i == 0:
-                        logger.info_rank0(
-                            f"[save_predictions] Sample 0: prompt_len={len(prompt_ids)}, "
-                            f"gen_len={len(seq)}, latent_positions={special_positions_in_gen}"
+                        n_has_latent += 1
+
+                        # Get generated answer tokens
+                        seq = preds[i]
+                        valid_len = int((seq != self.processing_class.pad_token_id).sum())
+                        answer_ids = seq[:valid_len]
+
+                        if i == 0:
+                            logger.info_rank0(
+                                f"[save_predictions] Sample 0: input_len={len(input_ids_i)}, "
+                                f"answer_len={len(answer_ids)}, "
+                                f"latent_positions_in_input={latent_positions_in_input}"
+                            )
+
+                        # Build full sequence: [input_ids (with think block)] + [answer]
+                        # and forward to get hidden states at latent positions
+                        prompt_ids = torch.tensor(input_ids_i, dtype=torch.long)
+                        reasoning_text = self._recover_reasoning_for_sample(
+                            unwrapped,
+                            prompt_ids=prompt_ids,
+                            generated_ids_np=answer_ids,
+                            special_positions_in_full=latent_positions_in_input,
+                            positions_are_absolute=True,
+                            max_new_tokens=512,
+                            sample_idx=i,
                         )
+                        decoded_reasonings[i] = reasoning_text
+                        if reasoning_text:
+                            n_recovered += 1
 
-                    reasoning_text = self._recover_reasoning_for_sample(
-                        unwrapped, prompt_ids, seq, special_positions_in_gen,
-                        max_new_tokens=512, sample_idx=i
-                    )
-                    decoded_reasonings[i] = reasoning_text
-                    if reasoning_text:
-                        n_recovered += 1
+                        if (i + 1) % 50 == 0:
+                            logger.info_rank0(
+                                f"[save_predictions] Processed {i+1}/{len(preds)}, "
+                                f"has_latent={n_has_latent}, recovered={n_recovered}"
+                            )
+                    except Exception as e:
+                        import traceback
+                        logger.warning(f"Reasoning recovery failed for sample {i}: {e}\n{traceback.format_exc()}")
 
-                    if (i + 1) % 50 == 0:
-                        logger.info_rank0(f"[save_predictions] Processed {i+1}/{len(preds)}, recovered={n_recovered}")
-                except Exception as e:
-                    import traceback
-                    logger.warning(f"Reasoning recovery failed for sample {i}: {e}\n{traceback.format_exc()}")
-
-            logger.info_rank0(f"[save_predictions] Reasoning recovery done: recovered={n_recovered}, total={len(preds)}")
+                logger.info_rank0(
+                    f"[save_predictions] Reasoning recovery done: "
+                    f"recovered={n_recovered}, has_latent={n_has_latent}, total={len(preds)}"
+                )
 
         else:
             # ---- Legacy approach: discover special token IDs from tokenizer vocabulary ----
@@ -652,12 +711,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         n_has_positions += 1
                         prompt_ids = torch.tensor(dataset[i]["input_ids"], dtype=torch.long)
 
-                        if i == 0:
-                            logger.info_rank0(
-                                f"[save_predictions] Sample 0: prompt_len={len(prompt_ids)}, "
-                                f"gen_len={len(seq)}, special_positions_in_gen={special_positions_in_gen}"
-                            )
-
                         reasoning_text = self._recover_reasoning_for_sample(
                             unwrapped, prompt_ids, seq, special_positions_in_gen,
                             max_new_tokens=512, sample_idx=i
@@ -667,12 +720,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                             n_recovered += 1
 
                         if (i + 1) % 50 == 0:
-                            logger.info_rank0(f"[save_predictions] Processed {i+1}/{len(preds)}, has_positions={n_has_positions}, recovered={n_recovered}")
+                            logger.info_rank0(
+                                f"[save_predictions] Processed {i+1}/{len(preds)}, "
+                                f"has_positions={n_has_positions}, recovered={n_recovered}"
+                            )
                     except Exception as e:
                         import traceback
                         logger.warning(f"Reasoning recovery failed for sample {i}: {e}\n{traceback.format_exc()}")
 
-                logger.info_rank0(f"[save_predictions] Reasoning recovery done: recovered={n_recovered}, has_positions={n_has_positions}, total={len(preds)}")
+                logger.info_rank0(
+                    f"[save_predictions] Reasoning recovery done: "
+                    f"recovered={n_recovered}, has_positions={n_has_positions}, total={len(preds)}"
+                )
             else:
                 logger.warning("[save_predictions] No special token IDs found in tokenizer. Skipping reasoning recovery.")
 

@@ -102,12 +102,24 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             num_latent = self.data_args.num_latent_thinking_token
 
             if has_reasoning and num_latent > 0:
-                # ---- New approach: insert N filler tokens, no special vocabulary needed ----
+                # ---- Latent thinking: think block as prompt context ----
+                # Response = <think>\n<latent_0>...<latent_N-1>\n</think>\n\n{answer}
+                # But labels for the <think>...</think>\n\n block = IGNORE_INDEX (prompt-like).
+                # Only the {answer} portion gets real SFT labels.
+                # During forward, latent tokens attend to all prior tokens (causal),
+                # so their hidden states encode prompt context autoregressively.
+                # At inference, the think block is prepended to input (part of prompt),
+                # and the model only generates the answer.
+                # special_token_mask marks <latent_*> positions → reasoning loss.
+                # Loss = loss_answer + w * loss_reasoning.
                 reasoning = examples["_reasoning"][i]
                 original_response = examples["_response"][i][0]["content"]
 
-                # 1. Encode response as just the answer (no special token prefix)
-                response_1 = [{"role": "assistant", "content": original_response}]
+                latent_names = [f"<latent_{j}>" for j in range(num_latent)]
+                # Build the think prefix that will have IGNORE labels
+                think_prefix = "<think>\n" + "".join(latent_names) + "\n</think>\n\n"
+                response_content = think_prefix + original_response
+                response_1 = [{"role": "assistant", "content": response_content}]
                 input_ids, labels = self._encode_data_example(
                     prompt=examples["_prompt"][i],
                     response=response_1,
@@ -118,42 +130,36 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                     audios=examples["_audios"][i] if "_audios" in examples and examples["_audios"][i] is not None else [],
                 )
 
-                # 2. Find response_start (first non-IGNORE label)
+                # Discover latent token IDs
+                latent_token_ids = set()
+                for name in latent_names:
+                    tok_ids = self.tokenizer.encode(name, add_special_tokens=False)
+                    if len(tok_ids) == 1:
+                        latent_token_ids.add(tok_ids[0])
+
+                # Find the response start (first non-IGNORE label)
                 response_start = -1
                 for j in range(len(labels)):
                     if labels[j] != IGNORE_INDEX:
                         response_start = j
                         break
 
-                # 3. Insert N filler tokens at response_start
-                #    Use newline token as filler — it already exists in vocab.
-                #    Labels for filler positions = IGNORE_INDEX (no SFT loss).
-                if response_start >= 0:
-                    filler_id = self.tokenizer.encode("\n", add_special_tokens=False)[0]
-                    input_ids = (
-                        input_ids[:response_start]
-                        + [filler_id] * num_latent
-                        + input_ids[response_start:]
-                    )
-                    labels = (
-                        labels[:response_start]
-                        + [IGNORE_INDEX] * num_latent
-                        + labels[response_start:]
-                    )
+                # Tokenize the think prefix to determine how many tokens to mask
+                think_prefix_ids = self.tokenizer.encode(think_prefix, add_special_tokens=False)
+                n_think_prefix = len(think_prefix_ids)
 
-                # 4. Truncate to cutoff_len if needed
-                cutoff = self.data_args.cutoff_len
-                if len(input_ids) > cutoff:
-                    input_ids = input_ids[:cutoff]
-                    labels = labels[:cutoff]
+                # Mask the think block labels to IGNORE_INDEX (only answer gets SFT loss)
+                if response_start >= 0 and n_think_prefix > 0:
+                    for j in range(response_start, min(response_start + n_think_prefix, len(labels))):
+                        labels[j] = IGNORE_INDEX
 
-                # 5. Build special_token_mask for the N filler positions
+                # Build special_token_mask on latent positions
                 special_token_mask = [0] * len(input_ids)
-                if response_start >= 0:
-                    for j in range(response_start, min(response_start + num_latent, len(input_ids))):
+                for j in range(len(input_ids)):
+                    if input_ids[j] in latent_token_ids:
                         special_token_mask[j] = 1
 
-                # 6. Tokenize reasoning text (separate sequence for second forward)
+                # Tokenize reasoning text (separate sequence for second forward)
                 reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
                 reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
 

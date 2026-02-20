@@ -6,13 +6,18 @@ stage: sft
 do_predict: true
 finetuning_type: full  # 如果是 LoRA，请改为 lora 并添加 adapter_name_or_path
 
+### latent thinking — 必须与训练时一致
+num_latent_thinking_token: 5
+
 ### dataset
 eval_dataset: reasoning_test_gsm8k
+# eval_dataset: reasoning_demo
 template: qwen
 cutoff_len: 1024
 # max_samples: 50
 overwrite_cache: true
 preprocessing_num_workers: 16
+remove_unused_columns: false
 
 ### output
 output_dir: /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/latent_thinking_gsm8k/predict
@@ -20,5 +25,5 @@ overwrite_output_dir: true
 
 ### eval
 per_device_eval_batch_size: 2
-predict_with_generate: true
+predict_with_generate: true  # model generates answer; think block auto-prepended to input
 ddp_timeout: 180000000

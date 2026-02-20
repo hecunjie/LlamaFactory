@@ -59,6 +59,8 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         # build inputs with format `<bos> X` and labels with format `Y <eos>`
         model_inputs = defaultdict(list)
+        num_latent = self.data_args.num_latent_thinking_token
+
         for i in range(len(examples["_prompt"])):
             if len(examples["_prompt"][i]) % 2 != 1:
                 logger.warning_rank0(
@@ -75,6 +77,16 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
             )
+
+            # When using latent thinking, append think block to input_ids
+            # so the model generates only the answer at inference time.
+            # Sequence: [prompt]<think>\n<latent_0>...<latent_N-1>\n</think>\n\n  →  model generates answer
+            if num_latent > 0:
+                latent_names = [f"<latent_{j}>" for j in range(num_latent)]
+                think_prefix = "<think>\n" + "".join(latent_names) + "\n</think>\n\n"
+                think_prefix_ids = self.tokenizer.encode(think_prefix, add_special_tokens=False)
+                input_ids = input_ids + think_prefix_ids
+
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
