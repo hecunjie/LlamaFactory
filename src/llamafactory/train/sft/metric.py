@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -86,7 +87,14 @@ class ComputeAccuracy:
 
 @dataclass
 class ComputeExactMatch:
-    r"""Compute exact match accuracy."""
+    r"""Compute exact match accuracy for the answer portion.
+
+    In non-generate mode, uses the label mask to extract only the answer
+    tokens from predictions (accounting for autoregressive shift).
+    Supports numerical comparison for math tasks — extracts the last number
+    from both predicted and ground truth answers for robust matching.
+    """
+
     tokenizer: "PreTrainedTokenizer"
 
     def _dump(self) -> Optional[dict[str, float]]:
@@ -95,7 +103,7 @@ class ComputeExactMatch:
             if len(self.score_dict["exact_match"]) > 0:
                 result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
             else:
-                 result = {"exact_match": 0.0}
+                result = {"exact_match": 0.0}
 
         self.score_dict = {"exact_match": []}
         return result
@@ -103,25 +111,61 @@ class ComputeExactMatch:
     def __post_init__(self):
         self._dump()
 
+    @staticmethod
+    def _extract_last_number(text: str) -> Optional[float]:
+        """Extract the last number from text for numerical comparison."""
+        text = text.replace(",", "")
+        numbers = re.findall(r"-?\d+\.?\d*", text)
+        if numbers:
+            try:
+                return float(numbers[-1])
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _compare_answers(pred: str, label: str) -> bool:
+        """Compare predicted and ground truth answers.
+
+        First tries exact string match, then numerical comparison.
+        """
+        if pred == label:
+            return True
+
+        # Try numerical comparison for math tasks
+        pred_num = ComputeExactMatch._extract_last_number(pred)
+        label_num = ComputeExactMatch._extract_last_number(label)
+        if pred_num is not None and label_num is not None:
+            return abs(pred_num - label_num) < 1e-6
+
+        return False
+
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
-        # DEBUG
-        # print("Running ComputeExactMatch...")
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
-        
-        preds = np.where(preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id)
-        labels = np.where(labels != IGNORE_INDEX, labels, self.tokenizer.pad_token_id)
 
-        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        for i in range(len(preds)):
+            # Handle autoregressive shift: preds[j] predicts labels[j+1]
+            pred = preds[i, :-1]
+            label = labels[i, 1:]
 
-        for pred, label in zip(decoded_preds, decoded_labels):
-            # Clean and compare strings
-            p = pred.strip()
-            l = label.strip()
-            self.score_dict["exact_match"].append(1.0 if p == l else 0.0)
+            # Only keep answer positions where labels are valid (not IGNORE_INDEX).
+            # In the reasoning SFT setup, labels only have real token IDs at the
+            # answer portion; prompt and think-block positions are IGNORE_INDEX.
+            label_mask = label != IGNORE_INDEX
+            pred_answer_ids = pred[label_mask]
+            label_answer_ids = label[label_mask]
 
-        # print(f"DEBUG: score_dict len {len(self.score_dict['exact_match'])}")
-        # print(f"DEBUG Sample: P='{p}' L='{l}'")
+            if len(label_answer_ids) == 0:
+                self.score_dict["exact_match"].append(0.0)
+                continue
+
+            # Decode to strings
+            decoded_pred = self.tokenizer.decode(pred_answer_ids, skip_special_tokens=True).strip()
+            decoded_label = self.tokenizer.decode(label_answer_ids, skip_special_tokens=True).strip()
+
+            # Compare (exact string match + numerical fallback for math)
+            match = self._compare_answers(decoded_pred, decoded_label)
+            self.score_dict["exact_match"].append(1.0 if match else 0.0)
 
         if compute_result:
             return self._dump()
