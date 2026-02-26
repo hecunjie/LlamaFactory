@@ -1,0 +1,50 @@
+### GSM8K Standard SFT Training Config
+### Train on full CoT + answer, evaluate with exact match accuracy.
+
+### model
+model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-7B-Instruct
+# model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-32B-Instruct
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+# Prepare data first: python scripts/prepare_gsm8k_sft.py --output-dir data
+dataset: gsm8k_sft_train
+template: qwen
+cutoff_len: 1024
+preprocessing_num_workers: 64
+dataloader_num_workers: 64
+
+### output
+output_dir: /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/gsm8k_sft_7B
+logging_steps: 1
+save_steps: 100
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: wandb
+run_name: gsm8k_sft_7B
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 5.0e-6
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### eval — exact match accuracy on GSM8K test set
+# ComputeExactMatch extracts the last number from both pred and label,
+# so it naturally handles the "#### <number>" GSM8K format.
+compute_exact_match: true
+eval_dataset: gsm8k_sft_test
+per_device_eval_batch_size: 4
+eval_strategy: steps
+eval_steps: 50

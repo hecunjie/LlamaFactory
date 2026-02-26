@@ -1,4 +1,18 @@
 {
+  "gsm8k_sft_train": {
+    "file_name": "gsm8k_sft_train.json",
+    "columns": {
+      "prompt": "instruction",
+      "response": "output"
+    }
+  },
+  "gsm8k_sft_test": {
+    "file_name": "gsm8k_sft_test.json",
+    "columns": {
+      "prompt": "instruction",
+      "response": "output"
+    }
+  },
   "reasoning_demo": {
     "file_name": "reasoning_demo.json",
     "columns": {
