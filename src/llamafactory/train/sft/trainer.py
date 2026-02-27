@@ -249,6 +249,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             if hs is not None:
                 # NO detach, NO clone — keep the computation graph alive
                 hidden_states = hs[-1]
+                # Align with LM head inputs: apply model's final norm if available
+                unwrapped = model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                base_model = getattr(unwrapped, "model", unwrapped)
+                final_norm = getattr(base_model, "norm", None)
+                if final_norm is not None:
+                    hidden_states = final_norm(hidden_states)
                 reasoning_inputs = self._build_reasoning_inputs(
                     model, hidden_states, special_token_mask,
                     reasoning_input_ids, reasoning_labels
@@ -379,6 +387,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     hs = outputs.get("hidden_states", hs)
                 if hs is not None:
                     hidden_states = hs[-1]
+                    # Align with LM head inputs: apply model's final norm if available
+                    unwrapped = model
+                    while hasattr(unwrapped, "module"):
+                        unwrapped = unwrapped.module
+                    base_model = getattr(unwrapped, "model", unwrapped)
+                    final_norm = getattr(base_model, "norm", None)
+                    if final_norm is not None:
+                        hidden_states = final_norm(hidden_states)
                     reasoning_inputs = self._build_reasoning_inputs(
                         model, hidden_states, special_token_mask,
                         reasoning_input_ids, reasoning_labels
@@ -475,6 +491,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with torch.no_grad():
             out = model(ids, output_hidden_states=True)
         hidden_states = out.hidden_states[-1][0]  # (FullLen, Dim)
+        # Align with LM head inputs: apply model's final norm if available
+        base_model = getattr(model, "model", model)
+        final_norm = getattr(base_model, "norm", None)
+        if final_norm is not None:
+            hidden_states = final_norm(hidden_states)
         del out
 
         # 3. Extract hidden states at special token positions (now with prompt context!)
