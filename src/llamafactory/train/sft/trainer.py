@@ -256,6 +256,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 base_model = getattr(unwrapped, "model", unwrapped)
                 final_norm = getattr(base_model, "norm", None)
                 if final_norm is not None:
+                    # Log hidden state norms before/after final norm (first time only)
+                    if getattr(self, "_log_final_norm_stats_once", True):
+                        with torch.no_grad():
+                            # Compute per-token L2 norms then take batch mean
+                            pre_token_norms = hidden_states.norm(dim=-1)  # (bsz, seq)
+                            pre_mean = pre_token_norms.mean().item()
+                        logger.info_rank0(
+                            f"[reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
+                        )
                     hidden_states = final_norm(hidden_states)
                     # Log once to confirm final norm is applied for reasoning
                     if getattr(self, "_log_final_norm_once", True):
@@ -264,6 +273,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                             "to hidden_states before building reasoning inputs."
                         )
                         self._log_final_norm_once = False
+                        with torch.no_grad():
+                            post_token_norms = hidden_states.norm(dim=-1)
+                            post_mean = post_token_norms.mean().item()
+                        logger.info_rank0(
+                            f"[reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
+                        )
+                        self._log_final_norm_stats_once = False
                 reasoning_inputs = self._build_reasoning_inputs(
                     model, hidden_states, special_token_mask,
                     reasoning_input_ids, reasoning_labels
@@ -401,6 +417,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     base_model = getattr(unwrapped, "model", unwrapped)
                     final_norm = getattr(base_model, "norm", None)
                     if final_norm is not None:
+                        with torch.no_grad():
+                            pre_token_norms = hidden_states.norm(dim=-1)
+                            pre_mean = pre_token_norms.mean().item()
+                        logger.info_rank0(
+                            f"[eval reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
+                        )
                         hidden_states = final_norm(hidden_states)
                         # Log once to confirm final norm is applied in eval as well
                         if getattr(self, "_log_final_norm_eval_once", True):
@@ -409,6 +431,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                                 "to hidden_states before building reasoning inputs."
                             )
                             self._log_final_norm_eval_once = False
+                            with torch.no_grad():
+                                post_token_norms = hidden_states.norm(dim=-1)
+                                post_mean = post_token_norms.mean().item()
+                            logger.info_rank0(
+                                f"[eval reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
+                            )
                     reasoning_inputs = self._build_reasoning_inputs(
                         model, hidden_states, special_token_mask,
                         reasoning_input_ids, reasoning_labels
@@ -509,10 +537,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         base_model = getattr(model, "model", model)
         final_norm = getattr(base_model, "norm", None)
         if final_norm is not None:
+            with torch.no_grad():
+                pre_token_norms = hidden_states.norm(dim=-1)
+                pre_mean = pre_token_norms.mean().item()
+            logger.info_rank0(
+                f"[recover_reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
+            )
             hidden_states = final_norm(hidden_states)
             logger.info_rank0(
                 f"[recover_reasoning] Applying final norm ({final_norm.__class__.__name__}) "
                 "to hidden_states before extracting special token states."
+            )
+            with torch.no_grad():
+                post_token_norms = hidden_states.norm(dim=-1)
+                post_mean = post_token_norms.mean().item()
+            logger.info_rank0(
+                f"[recover_reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
             )
         del out
 
