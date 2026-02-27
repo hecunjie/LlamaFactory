@@ -257,6 +257,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 final_norm = getattr(base_model, "norm", None)
                 if final_norm is not None:
                     hidden_states = final_norm(hidden_states)
+                    # Log once to confirm final norm is applied for reasoning
+                    if getattr(self, "_log_final_norm_once", True):
+                        logger.info_rank0(
+                            f"[reasoning] Applying final norm ({final_norm.__class__.__name__}) "
+                            "to hidden_states before building reasoning inputs."
+                        )
+                        self._log_final_norm_once = False
                 reasoning_inputs = self._build_reasoning_inputs(
                     model, hidden_states, special_token_mask,
                     reasoning_input_ids, reasoning_labels
@@ -395,6 +402,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     final_norm = getattr(base_model, "norm", None)
                     if final_norm is not None:
                         hidden_states = final_norm(hidden_states)
+                        # Log once to confirm final norm is applied in eval as well
+                        if getattr(self, "_log_final_norm_eval_once", True):
+                            logger.info_rank0(
+                                f"[eval reasoning] Applying final norm ({final_norm.__class__.__name__}) "
+                                "to hidden_states before building reasoning inputs."
+                            )
+                            self._log_final_norm_eval_once = False
                     reasoning_inputs = self._build_reasoning_inputs(
                         model, hidden_states, special_token_mask,
                         reasoning_input_ids, reasoning_labels
@@ -496,6 +510,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         final_norm = getattr(base_model, "norm", None)
         if final_norm is not None:
             hidden_states = final_norm(hidden_states)
+            logger.info_rank0(
+                f"[recover_reasoning] Applying final norm ({final_norm.__class__.__name__}) "
+                "to hidden_states before extracting special token states."
+            )
         del out
 
         # 3. Extract hidden states at special token positions (now with prompt context!)
