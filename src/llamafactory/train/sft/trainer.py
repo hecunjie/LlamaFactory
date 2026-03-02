@@ -210,108 +210,122 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         embed_fn = unwrapped.get_input_embeddings()
         latent_norm = getattr(unwrapped, "latent_hidden_norm", None)  # dedicated LayerNorm
 
+        # Gradient checkpointing forces use_cache=False inside transformers,
+        # which breaks our KV-cache-based sequential latent chain.
+        # Temporarily disable it here; per-sample forwards are small so
+        # the extra memory is negligible.
+        _base_model = getattr(unwrapped, "model", unwrapped)
+        _gc_was_enabled = getattr(_base_model, "gradient_checkpointing", False)
+        if _gc_was_enabled:
+            _base_model.gradient_checkpointing = False
+
         total_loss = torch.tensor(0.0, device=device)
         latent_hs_list: list[torch.Tensor | None] = []
         valid_count = 0
 
-        for b in range(batch_size):
-            sample_ids = input_ids[b]
-            sample_attn = attention_mask[b]
-            sample_labels = labels[b]
-            sample_mask = special_token_mask[b]
+        try:
+            for b in range(batch_size):
+                sample_ids = input_ids[b]
+                sample_attn = attention_mask[b]
+                sample_labels = labels[b]
+                sample_mask = special_token_mask[b]
 
-            valid_len = int(sample_attn.sum().item())
-            latent_pos = (sample_mask[:valid_len] == 1).nonzero(as_tuple=True)[0]
+                valid_len = int(sample_attn.sum().item())
+                latent_pos = (sample_mask[:valid_len] == 1).nonzero(as_tuple=True)[0]
 
-            if len(latent_pos) == 0:
-                # No latent tokens → standard forward for this sample
-                out = model(
-                    input_ids=sample_ids[:valid_len].unsqueeze(0),
-                    attention_mask=torch.ones(1, valid_len, device=device, dtype=sample_attn.dtype),
-                    labels=sample_labels[:valid_len].unsqueeze(0),
-                )
-                total_loss = total_loss + out.loss
-                valid_count += 1
-                latent_hs_list.append(None)
-                del out
-                continue
+                if len(latent_pos) == 0:
+                    # No latent tokens → standard forward for this sample
+                    out = model(
+                        input_ids=sample_ids[:valid_len].unsqueeze(0),
+                        attention_mask=torch.ones(1, valid_len, device=device, dtype=sample_attn.dtype),
+                        labels=sample_labels[:valid_len].unsqueeze(0),
+                    )
+                    total_loss = total_loss + out.loss
+                    valid_count += 1
+                    latent_hs_list.append(None)
+                    del out
+                    continue
 
-            first_pos = latent_pos[0].item()
-            last_pos = latent_pos[-1].item()
-            num_latent = len(latent_pos)
+                first_pos = latent_pos[0].item()
+                last_pos = latent_pos[-1].item()
+                num_latent = len(latent_pos)
 
-            # ---- Phase 1: Forward prefix (before first latent) ----
-            if first_pos > 0:
-                prefix_out = model(
-                    input_ids=sample_ids[:first_pos].unsqueeze(0),
-                    attention_mask=torch.ones(1, first_pos, device=device, dtype=sample_attn.dtype),
-                    use_cache=True,
-                )
-                past_kv = prefix_out.past_key_values
-                del prefix_out
-            else:
-                past_kv = None
-
-            # ---- Phase 2: Sequential latent tokens ----
-            latent_hs: list[torch.Tensor] = []
-            for i in range(num_latent):
-                pos = latent_pos[i].item()
-                if i == 0:
-                    # First latent: use word embedding
-                    inp = embed_fn(sample_ids[pos : pos + 1]).unsqueeze(0)  # (1,1,dim)
+                # ---- Phase 1: Forward prefix (before first latent) ----
+                if first_pos > 0:
+                    prefix_out = model(
+                        input_ids=sample_ids[:first_pos].unsqueeze(0),
+                        attention_mask=torch.ones(1, first_pos, device=device, dtype=sample_attn.dtype),
+                        use_cache=True,
+                    )
+                    past_kv = prefix_out.past_key_values
+                    del prefix_out
                 else:
-                    # Subsequent: apply latent_hidden_norm to h_{i-1} so its
-                    # scale matches word embeddings, then use as input
-                    prev_h = latent_hs[-1]  # (dim,)
-                    if latent_norm is not None:
-                        prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
-                    inp = prev_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
+                    past_kv = None
 
-                cum_len = first_pos + i + 1
-                step_attn = torch.ones(1, cum_len, device=device, dtype=sample_attn.dtype)
+                # ---- Phase 2: Sequential latent tokens ----
+                latent_hs: list[torch.Tensor] = []
+                for i in range(num_latent):
+                    pos = latent_pos[i].item()
+                    if i == 0:
+                        # First latent: use word embedding
+                        inp = embed_fn(sample_ids[pos : pos + 1]).unsqueeze(0)  # (1,1,dim)
+                    else:
+                        # Subsequent: apply latent_hidden_norm to h_{i-1} so its
+                        # scale matches word embeddings, then use as input
+                        prev_h = latent_hs[-1]  # (dim,)
+                        if latent_norm is not None:
+                            prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
+                        inp = prev_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
 
-                lat_out = model(
-                    inputs_embeds=inp,
-                    attention_mask=step_attn,
-                    past_key_values=past_kv,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                past_kv = lat_out.past_key_values
-                h_i = lat_out.hidden_states[-1][0, -1, :]  # (dim,)
-                latent_hs.append(h_i)
-                del lat_out
+                    cum_len = first_pos + i + 1
+                    step_attn = torch.ones(1, cum_len, device=device, dtype=sample_attn.dtype)
 
-            latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
+                    lat_out = model(
+                        inputs_embeds=inp,
+                        attention_mask=step_attn,
+                        past_key_values=past_kv,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    past_kv = lat_out.past_key_values
+                    h_i = lat_out.hidden_states[-1][0, -1, :]  # (dim,)
+                    latent_hs.append(h_i)
+                    del lat_out
 
-            # ---- Phase 3: Forward suffix (answer portion) ----
-            suffix_start = last_pos + 1
-            suffix_end = valid_len
-            suffix_len = suffix_end - suffix_start
+                latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
 
-            if suffix_len > 1:
-                full_ctx_len = first_pos + num_latent + suffix_len
-                suffix_out = model(
-                    input_ids=sample_ids[suffix_start:suffix_end].unsqueeze(0),
-                    attention_mask=torch.ones(
-                        1, full_ctx_len, device=device, dtype=sample_attn.dtype
-                    ),
-                    past_key_values=past_kv,
-                )
-                # CE loss: logits[j] predicts token at suffix_start + j + 1
-                logits = suffix_out.logits[0]  # (suffix_len, vocab)
-                shift_logits = logits[:-1, :]  # (suffix_len-1, vocab)
-                shift_labels = sample_labels[suffix_start + 1 : suffix_end]
-                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-                sample_loss = loss_fn(
-                    shift_logits.contiguous().view(-1, shift_logits.size(-1)),
-                    shift_labels.contiguous().view(-1),
-                )
-                total_loss = total_loss + sample_loss
-                valid_count += 1
-                del suffix_out
+                # ---- Phase 3: Forward suffix (answer portion) ----
+                suffix_start = last_pos + 1
+                suffix_end = valid_len
+                suffix_len = suffix_end - suffix_start
 
-            del past_kv
+                if suffix_len > 1:
+                    full_ctx_len = first_pos + num_latent + suffix_len
+                    suffix_out = model(
+                        input_ids=sample_ids[suffix_start:suffix_end].unsqueeze(0),
+                        attention_mask=torch.ones(
+                            1, full_ctx_len, device=device, dtype=sample_attn.dtype
+                        ),
+                        past_key_values=past_kv,
+                    )
+                    # CE loss: logits[j] predicts token at suffix_start + j + 1
+                    logits = suffix_out.logits[0]  # (suffix_len, vocab)
+                    shift_logits = logits[:-1, :]  # (suffix_len-1, vocab)
+                    shift_labels = sample_labels[suffix_start + 1 : suffix_end]
+                    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+                    sample_loss = loss_fn(
+                        shift_logits.contiguous().view(-1, shift_logits.size(-1)),
+                        shift_labels.contiguous().view(-1),
+                    )
+                    total_loss = total_loss + sample_loss
+                    valid_count += 1
+                    del suffix_out
+
+                del past_kv
+        finally:
+            # Always restore gradient checkpointing state
+            if _gc_was_enabled:
+                _base_model.gradient_checkpointing = True
 
         avg_loss = total_loss / max(valid_count, 1)
         return avg_loss, latent_hs_list
