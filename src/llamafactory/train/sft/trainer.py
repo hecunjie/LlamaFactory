@@ -184,6 +184,193 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return input_embeds, attn_mask, labels_padded
 
+    def _forward_with_latent_chain(self, model, input_ids, attention_mask, labels, special_token_mask):
+        r"""Sequential forward: each latent token uses the previous latent's
+        output hidden state as its input (instead of its word embedding).
+
+        Process (per sample):
+          1. Forward prefix (before first latent) → KV cache
+          2. latent_0: input = embed(<latent_0>)              → forward → h_0
+             latent_i (i>0): input = latent_hidden_norm(h_{i-1}) → forward → h_i
+             (dedicated LayerNorm maps hidden states to embedding scale)
+          3. Forward suffix (after last latent) → logits → CE loss on answer
+
+        Returns:
+            loss_answer: averaged CE loss on answer tokens across batch.
+            latent_hs_list: list of (num_latent, dim) tensors per sample
+                (raw hidden states, before norm). None for samples
+                without latent tokens.
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        embed_fn = unwrapped.get_input_embeddings()
+        latent_norm = getattr(unwrapped, "latent_hidden_norm", None)  # dedicated LayerNorm
+
+        total_loss = torch.tensor(0.0, device=device)
+        latent_hs_list: list[torch.Tensor | None] = []
+        valid_count = 0
+
+        for b in range(batch_size):
+            sample_ids = input_ids[b]
+            sample_attn = attention_mask[b]
+            sample_labels = labels[b]
+            sample_mask = special_token_mask[b]
+
+            valid_len = int(sample_attn.sum().item())
+            latent_pos = (sample_mask[:valid_len] == 1).nonzero(as_tuple=True)[0]
+
+            if len(latent_pos) == 0:
+                # No latent tokens → standard forward for this sample
+                out = model(
+                    input_ids=sample_ids[:valid_len].unsqueeze(0),
+                    attention_mask=torch.ones(1, valid_len, device=device, dtype=sample_attn.dtype),
+                    labels=sample_labels[:valid_len].unsqueeze(0),
+                )
+                total_loss = total_loss + out.loss
+                valid_count += 1
+                latent_hs_list.append(None)
+                del out
+                continue
+
+            first_pos = latent_pos[0].item()
+            last_pos = latent_pos[-1].item()
+            num_latent = len(latent_pos)
+
+            # ---- Phase 1: Forward prefix (before first latent) ----
+            if first_pos > 0:
+                prefix_out = model(
+                    input_ids=sample_ids[:first_pos].unsqueeze(0),
+                    attention_mask=torch.ones(1, first_pos, device=device, dtype=sample_attn.dtype),
+                    use_cache=True,
+                )
+                past_kv = prefix_out.past_key_values
+                del prefix_out
+            else:
+                past_kv = None
+
+            # ---- Phase 2: Sequential latent tokens ----
+            latent_hs: list[torch.Tensor] = []
+            for i in range(num_latent):
+                pos = latent_pos[i].item()
+                if i == 0:
+                    # First latent: use word embedding
+                    inp = embed_fn(sample_ids[pos : pos + 1]).unsqueeze(0)  # (1,1,dim)
+                else:
+                    # Subsequent: apply latent_hidden_norm to h_{i-1} so its
+                    # scale matches word embeddings, then use as input
+                    prev_h = latent_hs[-1]  # (dim,)
+                    if latent_norm is not None:
+                        prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
+                    inp = prev_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
+
+                cum_len = first_pos + i + 1
+                step_attn = torch.ones(1, cum_len, device=device, dtype=sample_attn.dtype)
+
+                lat_out = model(
+                    inputs_embeds=inp,
+                    attention_mask=step_attn,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                past_kv = lat_out.past_key_values
+                h_i = lat_out.hidden_states[-1][0, -1, :]  # (dim,)
+                latent_hs.append(h_i)
+                del lat_out
+
+            latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
+
+            # ---- Phase 3: Forward suffix (answer portion) ----
+            suffix_start = last_pos + 1
+            suffix_end = valid_len
+            suffix_len = suffix_end - suffix_start
+
+            if suffix_len > 1:
+                full_ctx_len = first_pos + num_latent + suffix_len
+                suffix_out = model(
+                    input_ids=sample_ids[suffix_start:suffix_end].unsqueeze(0),
+                    attention_mask=torch.ones(
+                        1, full_ctx_len, device=device, dtype=sample_attn.dtype
+                    ),
+                    past_key_values=past_kv,
+                )
+                # CE loss: logits[j] predicts token at suffix_start + j + 1
+                logits = suffix_out.logits[0]  # (suffix_len, vocab)
+                shift_logits = logits[:-1, :]  # (suffix_len-1, vocab)
+                shift_labels = sample_labels[suffix_start + 1 : suffix_end]
+                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+                sample_loss = loss_fn(
+                    shift_logits.contiguous().view(-1, shift_logits.size(-1)),
+                    shift_labels.contiguous().view(-1),
+                )
+                total_loss = total_loss + sample_loss
+                valid_count += 1
+                del suffix_out
+
+            del past_kv
+
+        avg_loss = total_loss / max(valid_count, 1)
+        return avg_loss, latent_hs_list
+
+    def _build_reasoning_inputs_from_latent_hs(
+        self, model, latent_hs_list, reasoning_input_ids, reasoning_labels
+    ):
+        r"""Build reasoning forward inputs from pre-computed latent hidden states.
+
+        Similar to _build_reasoning_inputs but takes a list of per-sample latent
+        hidden state tensors directly (already extracted via the sequential chain).
+        """
+        from torch.nn.utils.rnn import pad_sequence
+
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        embed_fn = unwrapped.get_input_embeddings()
+
+        embeds_list, labels_list = [], []
+
+        for i, spec_h in enumerate(latent_hs_list):
+            if spec_h is None:
+                continue
+
+            n_special = spec_h.size(0)
+            r_ids = reasoning_input_ids[i]
+            r_lbls = reasoning_labels[i]
+            valid_len = (r_ids != self.processing_class.pad_token_id).sum().item()
+            if valid_len == 0:
+                continue
+            r_ids = r_ids[:valid_len]
+            r_lbls = r_lbls[:valid_len]
+
+            r_embeds = embed_fn(r_ids)
+            combined = torch.cat([spec_h, r_embeds], dim=0)
+            prefix_labels = torch.full(
+                (n_special,), IGNORE_INDEX, device=spec_h.device, dtype=torch.long
+            )
+            combined_labels = torch.cat([prefix_labels, r_lbls], dim=0)
+
+            embeds_list.append(combined)
+            labels_list.append(combined_labels)
+
+        if not embeds_list:
+            return None
+
+        input_embeds = pad_sequence(embeds_list, batch_first=True, padding_value=0.0)
+        labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+        seq_lens = [e.size(0) for e in embeds_list]
+        max_len = max(seq_lens)
+        attn_mask = torch.zeros(
+            (len(embeds_list), max_len), dtype=torch.long, device=embeds_list[0].device
+        )
+        for idx, l in enumerate(seq_lens):
+            attn_mask[idx, :l] = 1
+
+        return input_embeds, attn_mask, labels_padded
+
     @staticmethod
     def _reset_ds_reduction_state(model):
         r"""Reset DeepSpeed ZeRO's gradient reduction flags to allow a second backward pass."""
@@ -206,16 +393,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         inputs: dict[str, Union["torch.Tensor", Any]],
         num_items_in_batch: Optional[int] = None,
     ) -> "torch.Tensor":
-        r"""Combined training step: Answer forward → Reasoning forward → SINGLE backward.
+        r"""Combined training step: Sequential latent chain → Reasoning → SINGLE backward.
 
-        The think block (<think>..latent..</think>) has IGNORE_INDEX labels,
-        so loss_sft only covers the answer portion. The latent tokens are part
-        of the input context — their hidden states encode prompt information via
-        causal attention. Reasoning loss uses these hidden states to predict
-        the ground-truth reasoning chain.
+        Latent tokens are processed SEQUENTIALLY: each latent token uses the
+        previous latent's output hidden state as its input embedding (not its
+        word embedding). This creates a recurrent chain:
+          latent_0: input = embed(<latent_0>)  →  h_0
+          latent_i: input = h_{i-1}            →  h_i   (for i > 0)
 
-        Key design: NO detach on hidden states, so reasoning loss gradients flow
-        back through spec_h → first forward → model parameters.
+        The suffix (answer) is forwarded with KV cache from the latent chain.
+        loss_answer is CE on answer tokens only (think block = IGNORE_INDEX).
+        loss_reasoning uses the latent hidden states (with latent_hidden_norm) to
+        predict the ground-truth reasoning chain.
+
         Loss = loss_answer + w * loss_reasoning.
         """
         model.train()
@@ -232,80 +422,72 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         )
 
         if do_reasoning:
-            inputs["output_hidden_states"] = True
-
-        # ---- Forward 1: SFT ----
-        with self.compute_loss_context_manager():
-            loss_sft, outputs = super().compute_loss(
-                model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
-            )
-
-        # ---- Forward 2: Reasoning (gradient flows through hidden_states!) ----
-        loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
-        if do_reasoning:
-            hs = getattr(outputs, "hidden_states", None)
-            if isinstance(outputs, dict):
-                hs = outputs.get("hidden_states", hs)
-            if hs is not None:
-                # NO detach, NO clone — keep the computation graph alive
-                hidden_states = hs[-1]
-                # Align with LM head inputs: apply model's final norm if available
-                unwrapped = model
-                while hasattr(unwrapped, "module"):
-                    unwrapped = unwrapped.module
-                base_model = getattr(unwrapped, "model", unwrapped)
-                final_norm = getattr(base_model, "norm", None)
-                if final_norm is not None:
-                    # Log hidden state norms before/after final norm (first time only)
-                    if getattr(self, "_log_final_norm_stats_once", True):
-                        with torch.no_grad():
-                            # Compute per-token L2 norms then take batch mean
-                            pre_token_norms = hidden_states.norm(dim=-1)  # (bsz, seq)
-                            pre_mean = pre_token_norms.mean().item()
-                        logger.info_rank0(
-                            f"[reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
-                        )
-                    hidden_states = final_norm(hidden_states)
-                    # Log once to confirm final norm is applied for reasoning
-                    if getattr(self, "_log_final_norm_once", True):
-                        logger.info_rank0(
-                            f"[reasoning] Applying final norm ({final_norm.__class__.__name__}) "
-                            "to hidden_states before building reasoning inputs."
-                        )
-                        self._log_final_norm_once = False
-                        with torch.no_grad():
-                            post_token_norms = hidden_states.norm(dim=-1)
-                            post_mean = post_token_norms.mean().item()
-                        logger.info_rank0(
-                            f"[reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
-                        )
-                        self._log_final_norm_stats_once = False
-                reasoning_inputs = self._build_reasoning_inputs(
-                    model, hidden_states, special_token_mask,
-                    reasoning_input_ids, reasoning_labels
+            # ---- Forward 1: Sequential latent chain + answer CE ----
+            with self.compute_loss_context_manager():
+                loss_answer, latent_hs_list = self._forward_with_latent_chain(
+                    model,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    inputs["labels"],
+                    special_token_mask,
                 )
-                if reasoning_inputs is not None:
-                    input_embeds, attn_mask, labels_padded = reasoning_inputs
-                    with self.compute_loss_context_manager():
-                        outputs_r = model(
-                            inputs_embeds=input_embeds,
-                            attention_mask=attn_mask,
-                            labels=labels_padded,
+
+            # Apply latent_hidden_norm to latent hidden states for reasoning forward
+            unwrapped = model
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
+            latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
+
+            normed_hs_list: list[torch.Tensor | None] = []
+            for hs in latent_hs_list:
+                if hs is not None and latent_norm is not None:
+                    if getattr(self, "_log_latent_norm_once", True):
+                        with torch.no_grad():
+                            pre_mean = hs.norm(dim=-1).mean().item()
+                        logger.info_rank0(
+                            f"[reasoning] latent hidden_states L2 mean before latent_hidden_norm: {pre_mean:.4f}"
                         )
-                        loss_reasoning = outputs_r.loss
-                    del outputs_r
+                    normed = latent_norm(hs)
+                    if getattr(self, "_log_latent_norm_once", True):
+                        with torch.no_grad():
+                            post_mean = normed.norm(dim=-1).mean().item()
+                        logger.info_rank0(
+                            f"[reasoning] latent_hidden_norm L2 mean after: {post_mean:.4f}"
+                        )
+                        self._log_latent_norm_once = False
+                    normed_hs_list.append(normed)
+                else:
+                    normed_hs_list.append(hs)
 
-        del outputs
+            # ---- Forward 2: Reasoning (gradient flows through latent chain!) ----
+            loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
+            reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
+                model, normed_hs_list, reasoning_input_ids, reasoning_labels
+            )
+            if reasoning_inputs is not None:
+                input_embeds, attn_mask, labels_padded = reasoning_inputs
+                with self.compute_loss_context_manager():
+                    outputs_r = model(
+                        inputs_embeds=input_embeds,
+                        attention_mask=attn_mask,
+                        labels=labels_padded,
+                    )
+                    loss_reasoning = outputs_r.loss
+                del outputs_r
 
-        # ---- SINGLE backward with combined loss ----
-        # loss_sft covers answer tokens only (think block labels = IGNORE_INDEX).
-        # Gradient path for reasoning_loss:
-        #   loss_reasoning → second forward → input_embeds → spec_h
-        #   → hidden_states at latent positions → first forward → model params
-        # This teaches the model to compress reasoning into latent token hidden states.
-        w = self.finetuning_args.reasoning_loss_weight
-        total_loss = loss_sft + w * loss_reasoning
+            w = self.finetuning_args.reasoning_loss_weight
+            total_loss = loss_answer + w * loss_reasoning
+        else:
+            # ---- Standard SFT forward (no latent tokens) ----
+            with self.compute_loss_context_manager():
+                loss_answer, outputs = super().compute_loss(
+                    model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
+                )
+            del outputs
+            loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
+            total_loss = loss_answer
 
+        # ---- SINGLE backward ----
         kwargs = {}
         if hasattr(self, "_grad_norm_kwargs"):
             kwargs = self._grad_norm_kwargs
@@ -314,7 +496,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Log split losses
         if not hasattr(self, "_custom_loss_buffer"):
             self._custom_loss_buffer = {"sft": [], "reasoning": []}
-        self._custom_loss_buffer["sft"].append(loss_sft.detach().float())
+        self._custom_loss_buffer["sft"].append(loss_answer.detach().float())
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float())
 
         return total_loss.detach()
@@ -384,7 +566,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 generated_tokens = generated_tokens.contiguous()
             return loss, generated_tokens, labels
 
-        # Non-generate eval: two forwards under no_grad (no DeepSpeed issues)
+        # Non-generate eval: sequential latent chain under no_grad
         reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
         reasoning_labels = inputs.pop("reasoning_labels", None)
         inputs.pop("reasoning_attention_mask", None)
@@ -397,69 +579,56 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             and special_token_mask.sum() > 0
         )
 
-        if do_reasoning:
-            inputs["output_hidden_states"] = True
-
         with torch.no_grad():
-            loss_sft, outputs = super().compute_loss(model, inputs, return_outputs=True)
-
-            loss_reasoning = torch.tensor(0.0, device=loss_sft.device)
             if do_reasoning:
-                hs = getattr(outputs, "hidden_states", None)
-                if isinstance(outputs, dict):
-                    hs = outputs.get("hidden_states", hs)
-                if hs is not None:
-                    hidden_states = hs[-1]
-                    # Align with LM head inputs: apply model's final norm if available
-                    unwrapped = model
-                    while hasattr(unwrapped, "module"):
-                        unwrapped = unwrapped.module
-                    base_model = getattr(unwrapped, "model", unwrapped)
-                    final_norm = getattr(base_model, "norm", None)
-                    if final_norm is not None:
-                        with torch.no_grad():
-                            pre_token_norms = hidden_states.norm(dim=-1)
-                            pre_mean = pre_token_norms.mean().item()
-                        logger.info_rank0(
-                            f"[eval reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
-                        )
-                        hidden_states = final_norm(hidden_states)
-                        # Log once to confirm final norm is applied in eval as well
-                        if getattr(self, "_log_final_norm_eval_once", True):
-                            logger.info_rank0(
-                                f"[eval reasoning] Applying final norm ({final_norm.__class__.__name__}) "
-                                "to hidden_states before building reasoning inputs."
-                            )
-                            self._log_final_norm_eval_once = False
-                            with torch.no_grad():
-                                post_token_norms = hidden_states.norm(dim=-1)
-                                post_mean = post_token_norms.mean().item()
-                            logger.info_rank0(
-                                f"[eval reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
-                            )
-                    reasoning_inputs = self._build_reasoning_inputs(
-                        model, hidden_states, special_token_mask,
-                        reasoning_input_ids, reasoning_labels
-                    )
-                    if reasoning_inputs is not None:
-                        input_embeds, attn_mask, labels_padded = reasoning_inputs
-                        outputs_r = model(
-                            inputs_embeds=input_embeds,
-                            attention_mask=attn_mask,
-                            labels=labels_padded,
-                        )
-                        loss_reasoning = outputs_r.loss
+                # Sequential latent chain + answer CE
+                loss_answer, latent_hs_list = self._forward_with_latent_chain(
+                    model,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    inputs["labels"],
+                    special_token_mask,
+                )
 
-        total_loss = loss_sft + loss_reasoning
+                # Apply latent_hidden_norm for reasoning
+                unwrapped = model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
+
+                normed_hs_list: list[torch.Tensor | None] = []
+                for hs in latent_hs_list:
+                    if hs is not None and latent_norm is not None:
+                        normed_hs_list.append(latent_norm(hs))
+                    else:
+                        normed_hs_list.append(hs)
+
+                reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
+                    model, normed_hs_list, reasoning_input_ids, reasoning_labels
+                )
+                loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
+                if reasoning_inputs is not None:
+                    input_embeds, attn_mask, labels_padded = reasoning_inputs
+                    outputs_r = model(
+                        inputs_embeds=input_embeds,
+                        attention_mask=attn_mask,
+                        labels=labels_padded,
+                    )
+                    loss_reasoning = outputs_r.loss
+
+                total_loss = loss_answer + loss_reasoning
+            else:
+                loss_answer, outputs = super().compute_loss(model, inputs, return_outputs=True)
+                loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
+                total_loss = loss_answer
 
         if not hasattr(self, "_eval_loss_buffer"):
             self._eval_loss_buffer = {"sft": [], "reasoning": []}
-        self._eval_loss_buffer["sft"].append(loss_sft.detach().float().cpu())
+        self._eval_loss_buffer["sft"].append(loss_answer.detach().float().cpu())
         self._eval_loss_buffer["reasoning"].append(loss_reasoning.detach().float().cpu())
 
+        # logits not available from sequential chain; set to None
         logits = None
-        if not prediction_loss_only:
-            logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
 
         return total_loss.detach(), logits, labels
 
@@ -488,11 +657,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         max_new_tokens: int = 512,
         sample_idx: int = -1,
     ) -> str:
-        r"""Recover reasoning from special token hidden states with FULL context.
+        r"""Recover reasoning from latent hidden states using sequential chain.
 
-        Builds the full sequence [prompt_ids + generated_ids], does a forward pass,
-        extracts hidden states at special token positions, then greedy-decodes
-        the reasoning chain from those hidden states.
+        Processes latent tokens sequentially (each using previous output as input),
+        applies final norm, then greedy-decodes the reasoning chain.
 
         Args:
             model: unwrapped model (no DeepSpeed / DDP wrapper).
@@ -510,14 +678,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             Decoded reasoning text string.
         """
         device = next(model.parameters()).device
-        do_log = sample_idx < 3  # detailed logging for first 3 samples
+        do_log = sample_idx < 3
 
         # 1. Build FULL sequence: [prompt] + [generated]
         gen_tensor = torch.tensor(generated_ids_np, dtype=torch.long)
         full_ids = torch.cat([prompt_ids.to("cpu"), gen_tensor], dim=0)
         prompt_len = prompt_ids.shape[0]
 
-        # Determine absolute positions of special tokens in the full sequence
         if positions_are_absolute and special_positions_in_full is not None:
             abs_positions = special_positions_in_full
         elif special_positions_in_gen is not None:
@@ -528,83 +695,105 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not abs_positions:
             return ""
 
-        # 2. Forward the full sequence to get contextualized hidden states
-        ids = full_ids.unsqueeze(0).to(device)  # (1, FullLen)
-        with torch.no_grad():
-            out = model(ids, output_hidden_states=True)
-        hidden_states = out.hidden_states[-1][0]  # (FullLen, Dim)
-        # Align with LM head inputs: apply model's final norm if available
-        base_model = getattr(model, "model", model)
-        final_norm = getattr(base_model, "norm", None)
-        if final_norm is not None:
-            with torch.no_grad():
-                pre_token_norms = hidden_states.norm(dim=-1)
-                pre_mean = pre_token_norms.mean().item()
-            logger.info_rank0(
-                f"[recover_reasoning] hidden_states L2 mean before final norm: {pre_mean:.4f}"
-            )
-            hidden_states = final_norm(hidden_states)
-            logger.info_rank0(
-                f"[recover_reasoning] Applying final norm ({final_norm.__class__.__name__}) "
-                "to hidden_states before extracting special token states."
-            )
-            with torch.no_grad():
-                post_token_norms = hidden_states.norm(dim=-1)
-                post_mean = post_token_norms.mean().item()
-            logger.info_rank0(
-                f"[recover_reasoning] hidden_states L2 mean after final norm: {post_mean:.4f}"
-            )
-        del out
-
-        # 3. Extract hidden states at special token positions (now with prompt context!)
-        pos_tensor = torch.tensor(abs_positions, dtype=torch.long, device=device)
-        spec_h = hidden_states[pos_tensor].unsqueeze(0)  # (1, n_special, Dim)
-        del hidden_states
-
-        # Diagnostic: log spec_h statistics
-        if do_log:
-            norms = spec_h.squeeze(0).norm(dim=-1).tolist()
-            first_vals = spec_h.squeeze(0)[0, :5].tolist()  # first 5 values of first vector
-            logger.info_rank0(
-                f"  [sample {sample_idx}] spec_h norms={[f'{n:.2f}' for n in norms]}, "
-                f"first_vec[:5]={[f'{v:.4f}' for v in first_vals]}"
-            )
-
-        # 4. Manual greedy decode with KV cache
+        first_pos = abs_positions[0]
+        num_latent = len(abs_positions)
         embed_fn = model.get_input_embeddings()
-        result_ids = []
-        past_key_values = None
+        latent_norm = getattr(model, "latent_hidden_norm", None)
 
         with torch.no_grad():
-            # First step: feed all special token hidden states as prefix
+            # ---- Phase 1: Forward prefix (before first latent) ----
+            if first_pos > 0:
+                prefix_ids = full_ids[:first_pos].unsqueeze(0).to(device)
+                prefix_out = model(input_ids=prefix_ids, use_cache=True)
+                past_kv = prefix_out.past_key_values
+                del prefix_out
+            else:
+                past_kv = None
+
+            # ---- Phase 2: Sequential latent tokens ----
+            latent_hs = []
+            for i in range(num_latent):
+                pos = abs_positions[i]
+                if i == 0:
+                    inp = embed_fn(full_ids[pos : pos + 1].to(device)).unsqueeze(0)
+                else:
+                    prev_h = latent_hs[-1]
+                    if latent_norm is not None:
+                        prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
+                    inp = prev_h.unsqueeze(0).unsqueeze(0)
+
+                cum_len = first_pos + i + 1
+                step_attn = torch.ones(1, cum_len, device=device, dtype=torch.long)
+
+                lat_out = model(
+                    inputs_embeds=inp,
+                    attention_mask=step_attn,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                past_kv = lat_out.past_key_values
+                h_i = lat_out.hidden_states[-1][0, -1, :]
+                latent_hs.append(h_i)
+                del lat_out
+
+            del past_kv  # free context KV cache
+
+            spec_h = torch.stack(latent_hs)  # (num_latent, dim)
+
+            # Apply latent_hidden_norm for reasoning recovery
+            if latent_norm is not None:
+                if do_log:
+                    pre_mean = spec_h.norm(dim=-1).mean().item()
+                    logger.info_rank0(
+                        f"[recover_reasoning] latent hs L2 mean before latent_hidden_norm: {pre_mean:.4f}"
+                    )
+                spec_h = latent_norm(spec_h)
+                if do_log:
+                    post_mean = spec_h.norm(dim=-1).mean().item()
+                    logger.info_rank0(
+                        f"[recover_reasoning] latent hs L2 mean after latent_hidden_norm: {post_mean:.4f}"
+                    )
+
+            spec_h = spec_h.unsqueeze(0)  # (1, num_latent, dim)
+
+            if do_log:
+                norms = spec_h.squeeze(0).norm(dim=-1).tolist()
+                logger.info_rank0(
+                    f"  [sample {sample_idx}] spec_h norms={[f'{n:.2f}' for n in norms]}"
+                )
+
+            # ---- Greedy decode reasoning from latent hidden states ----
+            result_ids = []
             out = model(inputs_embeds=spec_h, use_cache=True)
-            past_key_values = out.past_key_values
-            logits_first = out.logits[0, -1, :]  # (vocab_size,)
+            decode_kv = out.past_key_values
+            logits_first = out.logits[0, -1, :]
             next_id = logits_first.argmax(dim=-1)
             result_ids.append(next_id.item())
 
-            # Diagnostic: log first-step logit distribution
             if do_log:
                 probs = torch.softmax(logits_first.float(), dim=-1)
                 topk_probs, topk_ids = probs.topk(5)
-                top_tokens = [(self.processing_class.decode([tid.item()]), f"{p.item():.4f}") for tid, p in zip(topk_ids, topk_probs)]
+                top_tokens = [
+                    (self.processing_class.decode([tid.item()]), f"{p.item():.4f}")
+                    for tid, p in zip(topk_ids, topk_probs)
+                ]
                 logger.info_rank0(f"  [sample {sample_idx}] first-step top5: {top_tokens}")
 
-            # Auto-regressive decoding
             for _ in range(max_new_tokens - 1):
                 if next_id.item() == self.processing_class.eos_token_id:
                     break
                 next_embed = embed_fn(next_id.reshape(1, 1))
                 out = model(
                     inputs_embeds=next_embed,
-                    past_key_values=past_key_values,
+                    past_key_values=decode_kv,
                     use_cache=True,
                 )
-                past_key_values = out.past_key_values
+                decode_kv = out.past_key_values
                 next_id = out.logits[0, -1, :].argmax(dim=-1)
                 result_ids.append(next_id.item())
 
-        del past_key_values
+            del decode_kv
 
         if not result_ids:
             return ""

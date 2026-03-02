@@ -60,6 +60,16 @@ def run_sft(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
+    # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.
+    # The model's final_norm (RMSNorm) is trained for the LM head and does NOT produce
+    # outputs with the same distribution as word embeddings. This learnable LayerNorm
+    # bridges that gap. Attached to the model so DeepSpeed / optimizer manage it.
+    if data_args.num_latent_thinking_token > 0:
+        import torch.nn as nn
+        hidden_size = model.config.hidden_size
+        model.latent_hidden_norm = nn.LayerNorm(hidden_size)
+        logger.info(f"Added latent_hidden_norm (LayerNorm, dim={hidden_size}) to model for latent chain.")
+
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
