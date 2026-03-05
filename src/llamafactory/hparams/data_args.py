@@ -140,10 +140,10 @@ class DataArguments:
         default=False,
         metadata={
             "help": (
-                "When True, insert the latent thinking block even if the sample has no _reasoning field. "
-                "The latent chain will still be constructed (answer loss computed through latent KV), "
-                "but reasoning_input_ids will be empty so reasoning forward is skipped (no reasoning loss). "
-                "Useful for training answer quality with latent bottleneck on data without reasoning annotations."
+                "When True, skip the latent thinking chain and reasoning forward even if the sample "
+                "has _reasoning data. Samples with reasoning will be treated as normal SFT (answer only). "
+                "Useful for ablation studies or when you want to disable the reasoning pipeline "
+                "without modifying the dataset."
             )
         },
     )
