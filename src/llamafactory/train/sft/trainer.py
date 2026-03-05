@@ -196,11 +196,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
              (dedicated LayerNorm maps hidden states to embedding scale)
           3. Forward suffix (after last latent) → logits → CE loss on answer
 
+        Phase 1 and Phase 2 run under torch.no_grad() to avoid DeepSpeed
+        gradient double-reduction (model parameters must only appear in ONE
+        backward-reachable forward pass). Only Phase 3 carries gradients.
+        Latent hidden states are returned detached; latent_hidden_norm still
+        receives gradient through the reasoning forward path.
+
         Returns:
             loss_answer: averaged CE loss on answer tokens across batch.
             latent_hs_list: list of (num_latent, dim) tensors per sample
-                (raw hidden states, before norm). None for samples
-                without latent tokens.
+                (detached hidden states). None for samples without latent tokens.
+            suffix_preds_list: list of (suffix_start, argmax_ids) per sample
+                for metric computation. None for samples without suffix.
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -211,49 +218,41 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         embed_fn = unwrapped.get_input_embeddings()
         latent_norm = getattr(unwrapped, "latent_hidden_norm", None)  # dedicated LayerNorm
 
-        # Gradient checkpointing forces use_cache=False inside transformers,
-        # which breaks our KV-cache-based sequential latent chain.
-        # Temporarily disable it here; per-sample forwards are small so
-        # the extra memory is negligible.
-        _base_model = getattr(unwrapped, "model", unwrapped)
-        _gc_was_enabled = getattr(_base_model, "gradient_checkpointing", False)
-        if _gc_was_enabled:
-            _base_model.gradient_checkpointing = False
-
         total_loss = torch.tensor(0.0, device=device)
         latent_hs_list: list[torch.Tensor | None] = []
         suffix_preds_list: list[tuple[int, torch.Tensor] | None] = []  # (suffix_start, argmax_ids) per sample
         valid_count = 0
 
-        try:
-            for b in range(batch_size):
-                sample_ids = input_ids[b]
-                sample_attn = attention_mask[b]
-                sample_labels = labels[b]
-                sample_mask = special_token_mask[b]
+        for b in range(batch_size):
+            sample_ids = input_ids[b]
+            sample_attn = attention_mask[b]
+            sample_labels = labels[b]
+            sample_mask = special_token_mask[b]
 
-                valid_len = int(sample_attn.sum().item())
-                latent_pos = (sample_mask[:valid_len] == 1).nonzero(as_tuple=True)[0]
+            valid_len = int(sample_attn.sum().item())
+            latent_pos = (sample_mask[:valid_len] == 1).nonzero(as_tuple=True)[0]
 
-                if len(latent_pos) == 0:
-                    # No latent tokens → standard forward for this sample
-                    out = model(
-                        input_ids=sample_ids[:valid_len].unsqueeze(0),
-                        attention_mask=torch.ones(1, valid_len, device=device, dtype=sample_attn.dtype),
-                        labels=sample_labels[:valid_len].unsqueeze(0),
-                    )
-                    total_loss = total_loss + out.loss
-                    valid_count += 1
-                    latent_hs_list.append(None)
-                    suffix_preds_list.append((0, out.logits[0].argmax(dim=-1).detach()))
-                    del out
-                    continue
+            if len(latent_pos) == 0:
+                # No latent tokens → standard forward for this sample
+                out = model(
+                    input_ids=sample_ids[:valid_len].unsqueeze(0),
+                    attention_mask=torch.ones(1, valid_len, device=device, dtype=sample_attn.dtype),
+                    labels=sample_labels[:valid_len].unsqueeze(0),
+                )
+                total_loss = total_loss + out.loss
+                valid_count += 1
+                latent_hs_list.append(None)
+                suffix_preds_list.append((0, out.logits[0].argmax(dim=-1).detach()))
+                del out
+                continue
 
-                first_pos = latent_pos[0].item()
-                last_pos = latent_pos[-1].item()
-                num_latent = len(latent_pos)
+            first_pos = latent_pos[0].item()
+            last_pos = latent_pos[-1].item()
+            num_latent = len(latent_pos)
 
-                # ---- Phase 1: Forward prefix (before first latent) ----
+            # ---- Phase 1 & 2: no_grad (avoids DeepSpeed double-reduction) ----
+            with torch.no_grad():
+                # Phase 1: Forward prefix (before first latent)
                 if first_pos > 0:
                     prefix_out = model(
                         input_ids=sample_ids[:first_pos].unsqueeze(0),
@@ -268,7 +267,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     past_kv = None
                     prefix_last_h = None
 
-                # ---- Phase 2: Sequential latent tokens ----
+                # Phase 2: Sequential latent tokens
                 latent_hs: list[torch.Tensor] = []
                 for i in range(num_latent):
                     pos = latent_pos[i].item()
@@ -304,76 +303,73 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     latent_hs.append(h_i)
                     del lat_out
 
-                latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
+            # latent_hs are already detached (computed under no_grad)
+            latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
 
-                # ---- Debug: log L2 norms of hidden states vs word embeddings ----
-                _gs = self.state.global_step if hasattr(self, "state") and self.state is not None else 0
-                if b == 0 and (_gs <= 5 or _gs % 100 == 0):
-                    try:
-                        with torch.no_grad():
-                            stacked_hs = torch.stack(latent_hs)  # (num_latent, dim)
-                            hs_norms = stacked_hs.norm(dim=-1)  # (num_latent,)
-                            # Word embedding norms for the same latent token positions
-                            latent_ids = sample_ids[latent_pos]  # (num_latent,)
-                            word_embs = embed_fn(latent_ids)  # (num_latent, dim)
-                            emb_norms = word_embs.norm(dim=-1)  # (num_latent,)
-                            # Prefix last hidden state norm
-                            prefix_h_norm = prefix_last_h.norm().item() if prefix_last_h is not None else 0.0
-                            # Normed input norms (what actually goes into the model)
-                            if latent_norm is not None:
-                                normed_prefix = latent_norm(prefix_last_h.unsqueeze(0)).squeeze(0) if prefix_last_h is not None else None
-                                normed_prefix_norm = normed_prefix.norm().item() if normed_prefix is not None else 0.0
-                                normed_hs = latent_norm(stacked_hs)
-                                normed_hs_norms = normed_hs.norm(dim=-1)
-                            else:
-                                normed_prefix_norm = prefix_h_norm
-                                normed_hs_norms = hs_norms
-                            logger.info_rank0(
-                                f"[latent_chain] step={_gs}\n"
-                                f"  raw hidden_states L2 norms:  {[f'{n:.4f}' for n in hs_norms.tolist()]}\n"
-                                f"  normed hidden_states L2 norms (input to next): {[f'{n:.4f}' for n in normed_hs_norms.tolist()]}\n"
-                                f"  word embedding L2 norms:     {[f'{n:.4f}' for n in emb_norms.tolist()]}\n"
-                                f"  prefix_last_h raw L2 norm:   {prefix_h_norm:.4f}\n"
-                                f"  prefix_last_h normed L2 (input to latent_0): {normed_prefix_norm:.4f}"
-                            )
-                    except Exception as e:
-                        logger.warning_rank0(f"[latent_chain] norm logging failed: {e}")
+            # ---- Debug: log L2 norms of hidden states vs word embeddings ----
+            _gs = self.state.global_step if hasattr(self, "state") and self.state is not None else 0
+            if b == 0 and (_gs <= 5 or _gs % 100 == 0):
+                try:
+                    with torch.no_grad():
+                        stacked_hs = torch.stack(latent_hs)  # (num_latent, dim)
+                        hs_norms = stacked_hs.norm(dim=-1)  # (num_latent,)
+                        # Word embedding norms for the same latent token positions
+                        latent_ids = sample_ids[latent_pos]  # (num_latent,)
+                        word_embs = embed_fn(latent_ids)  # (num_latent, dim)
+                        emb_norms = word_embs.norm(dim=-1)  # (num_latent,)
+                        # Prefix last hidden state norm
+                        prefix_h_norm = prefix_last_h.norm().item() if prefix_last_h is not None else 0.0
+                        # Normed input norms (what actually goes into the model)
+                        if latent_norm is not None:
+                            normed_prefix = latent_norm(prefix_last_h.unsqueeze(0)).squeeze(0) if prefix_last_h is not None else None
+                            normed_prefix_norm = normed_prefix.norm().item() if normed_prefix is not None else 0.0
+                            normed_hs = latent_norm(stacked_hs)
+                            normed_hs_norms = normed_hs.norm(dim=-1)
+                        else:
+                            normed_prefix_norm = prefix_h_norm
+                            normed_hs_norms = hs_norms
+                        logger.info_rank0(
+                            f"[latent_chain] step={_gs}\n"
+                            f"  raw hidden_states L2 norms:  {[f'{n:.4f}' for n in hs_norms.tolist()]}\n"
+                            f"  normed hidden_states L2 norms (input to next): {[f'{n:.4f}' for n in normed_hs_norms.tolist()]}\n"
+                            f"  word embedding L2 norms:     {[f'{n:.4f}' for n in emb_norms.tolist()]}\n"
+                            f"  prefix_last_h raw L2 norm:   {prefix_h_norm:.4f}\n"
+                            f"  prefix_last_h normed L2 (input to latent_0): {normed_prefix_norm:.4f}"
+                        )
+                except Exception as e:
+                    logger.warning_rank0(f"[latent_chain] norm logging failed: {e}")
 
-                # ---- Phase 3: Forward suffix (answer portion) ----
-                suffix_start = last_pos + 1
-                suffix_end = valid_len
-                suffix_len = suffix_end - suffix_start
+            # ---- Phase 3: Forward suffix (answer portion) — WITH gradients ----
+            suffix_start = last_pos + 1
+            suffix_end = valid_len
+            suffix_len = suffix_end - suffix_start
 
-                if suffix_len > 1:
-                    full_ctx_len = first_pos + num_latent + suffix_len
-                    suffix_out = model(
-                        input_ids=sample_ids[suffix_start:suffix_end].unsqueeze(0),
-                        attention_mask=torch.ones(
-                            1, full_ctx_len, device=device, dtype=sample_attn.dtype
-                        ),
-                        past_key_values=past_kv,
-                    )
-                    # CE loss: logits[j] predicts token at suffix_start + j + 1
-                    logits = suffix_out.logits[0]  # (suffix_len, vocab)
-                    shift_logits = logits[:-1, :]  # (suffix_len-1, vocab)
-                    shift_labels = sample_labels[suffix_start + 1 : suffix_end]
-                    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-                    sample_loss = loss_fn(
-                        shift_logits.contiguous().view(-1, shift_logits.size(-1)),
-                        shift_labels.contiguous().view(-1),
-                    )
-                    total_loss = total_loss + sample_loss
-                    valid_count += 1
-                    suffix_preds_list.append((suffix_start, logits.argmax(dim=-1).detach()))
-                    del suffix_out
-                else:
-                    suffix_preds_list.append(None)
+            if suffix_len > 1:
+                full_ctx_len = first_pos + num_latent + suffix_len
+                suffix_out = model(
+                    input_ids=sample_ids[suffix_start:suffix_end].unsqueeze(0),
+                    attention_mask=torch.ones(
+                        1, full_ctx_len, device=device, dtype=sample_attn.dtype
+                    ),
+                    past_key_values=past_kv,
+                )
+                # CE loss: logits[j] predicts token at suffix_start + j + 1
+                logits = suffix_out.logits[0]  # (suffix_len, vocab)
+                shift_logits = logits[:-1, :]  # (suffix_len-1, vocab)
+                shift_labels = sample_labels[suffix_start + 1 : suffix_end]
+                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+                sample_loss = loss_fn(
+                    shift_logits.contiguous().view(-1, shift_logits.size(-1)),
+                    shift_labels.contiguous().view(-1),
+                )
+                total_loss = total_loss + sample_loss
+                valid_count += 1
+                suffix_preds_list.append((suffix_start, logits.argmax(dim=-1).detach()))
+                del suffix_out
+            else:
+                suffix_preds_list.append(None)
 
-                del past_kv
-        finally:
-            # Always restore gradient checkpointing state
-            if _gc_was_enabled:
-                _base_model.gradient_checkpointing = True
+            del past_kv
 
         avg_loss = total_loss / max(valid_count, 1)
         return avg_loss, latent_hs_list, suffix_preds_list
@@ -504,7 +500,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # ---- Forward 2: Reasoning (only when w > 0) ----
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             if do_reasoning_forward:
-                # Apply latent_hidden_norm to latent hidden states for reasoning forward
+                # Apply latent_hidden_norm to latent hidden states for reasoning forward.
+                # latent_hs are detached (computed under no_grad in Phase 2), so
+                # latent_norm gets gradient from reasoning loss but backward does
+                # NOT flow through Phase 2's model calls → no DeepSpeed conflict.
                 unwrapped = model
                 while hasattr(unwrapped, "module"):
                     unwrapped = unwrapped.module
