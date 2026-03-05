@@ -478,14 +478,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         special_token_mask = inputs.pop("special_token_mask", None)
 
         w = self.finetuning_args.reasoning_loss_weight
-        do_reasoning = (
-            w > 0
-            and reasoning_input_ids is not None
-            and special_token_mask is not None
+        # do_latent_chain: data has latent tokens → must use sequential forward for answer loss
+        do_latent_chain = (
+            special_token_mask is not None
             and special_token_mask.sum() > 0
         )
+        # do_reasoning_forward: additionally need w > 0 to run Forward 2 (reasoning loss)
+        do_reasoning_forward = (
+            do_latent_chain
+            and w > 0
+            and reasoning_input_ids is not None
+        )
 
-        if do_reasoning:
+        if do_latent_chain:
             # ---- Forward 1: Sequential latent chain + answer CE ----
             with self.compute_loss_context_manager():
                 loss_answer, latent_hs_list, _ = self._forward_with_latent_chain(
@@ -496,52 +501,53 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     special_token_mask,
                 )
 
-            # Apply latent_hidden_norm to latent hidden states for reasoning forward
-            unwrapped = model
-            while hasattr(unwrapped, "module"):
-                unwrapped = unwrapped.module
-            latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
-
-            normed_hs_list: list[torch.Tensor | None] = []
-            for hs in latent_hs_list:
-                if hs is not None and latent_norm is not None:
-                    if getattr(self, "_log_latent_norm_once", True):
-                        with torch.no_grad():
-                            pre_mean = hs.norm(dim=-1).mean().item()
-                        logger.info_rank0(
-                            f"[reasoning] latent hidden_states L2 mean before latent_hidden_norm: {pre_mean:.4f}"
-                        )
-                    normed = latent_norm(hs)
-                    if getattr(self, "_log_latent_norm_once", True):
-                        with torch.no_grad():
-                            post_mean = normed.norm(dim=-1).mean().item()
-                        logger.info_rank0(
-                            f"[reasoning] latent_hidden_norm L2 mean after: {post_mean:.4f}"
-                        )
-                        self._log_latent_norm_once = False
-                    normed_hs_list.append(normed)
-                else:
-                    normed_hs_list.append(hs)
-
-            # ---- Forward 2: Reasoning (gradient flows through latent chain!) ----
+            # ---- Forward 2: Reasoning (only when w > 0) ----
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
-            reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
-                model, normed_hs_list, reasoning_input_ids, reasoning_labels
-            )
-            if reasoning_inputs is not None:
-                input_embeds, attn_mask, labels_padded = reasoning_inputs
-                with self.compute_loss_context_manager():
-                    outputs_r = model(
-                        inputs_embeds=input_embeds,
-                        attention_mask=attn_mask,
-                        labels=labels_padded,
-                    )
-                    loss_reasoning = outputs_r.loss
-                del outputs_r
+            if do_reasoning_forward:
+                # Apply latent_hidden_norm to latent hidden states for reasoning forward
+                unwrapped = model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
+
+                normed_hs_list: list[torch.Tensor | None] = []
+                for hs in latent_hs_list:
+                    if hs is not None and latent_norm is not None:
+                        if getattr(self, "_log_latent_norm_once", True):
+                            with torch.no_grad():
+                                pre_mean = hs.norm(dim=-1).mean().item()
+                            logger.info_rank0(
+                                f"[reasoning] latent hidden_states L2 mean before latent_hidden_norm: {pre_mean:.4f}"
+                            )
+                        normed = latent_norm(hs)
+                        if getattr(self, "_log_latent_norm_once", True):
+                            with torch.no_grad():
+                                post_mean = normed.norm(dim=-1).mean().item()
+                            logger.info_rank0(
+                                f"[reasoning] latent_hidden_norm L2 mean after: {post_mean:.4f}"
+                            )
+                            self._log_latent_norm_once = False
+                        normed_hs_list.append(normed)
+                    else:
+                        normed_hs_list.append(hs)
+
+                reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
+                    model, normed_hs_list, reasoning_input_ids, reasoning_labels
+                )
+                if reasoning_inputs is not None:
+                    input_embeds, attn_mask, labels_padded = reasoning_inputs
+                    with self.compute_loss_context_manager():
+                        outputs_r = model(
+                            inputs_embeds=input_embeds,
+                            attention_mask=attn_mask,
+                            labels=labels_padded,
+                        )
+                        loss_reasoning = outputs_r.loss
+                    del outputs_r
 
             total_loss = loss_answer + w * loss_reasoning
         else:
-            # ---- Standard SFT forward (no latent tokens) ----
+            # ---- Standard SFT forward (no latent tokens in data) ----
             with self.compute_loss_context_manager():
                 loss_answer, outputs = super().compute_loss(
                     model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
@@ -637,15 +643,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         labels = inputs.get("labels")
 
         w = self.finetuning_args.reasoning_loss_weight
-        do_reasoning = (
-            w > 0
-            and reasoning_input_ids is not None
-            and special_token_mask is not None
+        do_latent_chain = (
+            special_token_mask is not None
             and special_token_mask.sum() > 0
+        )
+        do_reasoning_forward = (
+            do_latent_chain
+            and w > 0
+            and reasoning_input_ids is not None
         )
 
         with torch.no_grad():
-            if do_reasoning:
+            if do_latent_chain:
                 # Sequential latent chain + answer CE
                 loss_answer, latent_hs_list, suffix_preds_list = self._forward_with_latent_chain(
                     model,
@@ -655,33 +664,34 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     special_token_mask,
                 )
 
-                # Apply latent_hidden_norm for reasoning
-                unwrapped = model
-                while hasattr(unwrapped, "module"):
-                    unwrapped = unwrapped.module
-                latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
-
-                normed_hs_list: list[torch.Tensor | None] = []
-                for hs in latent_hs_list:
-                    if hs is not None and latent_norm is not None:
-                        normed_hs_list.append(latent_norm(hs))
-                    else:
-                        normed_hs_list.append(hs)
-
-                reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
-                    model, normed_hs_list, reasoning_input_ids, reasoning_labels
-                )
+                # Reasoning forward (only when w > 0)
                 loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
-                if reasoning_inputs is not None:
-                    input_embeds, attn_mask, labels_padded = reasoning_inputs
-                    outputs_r = model(
-                        inputs_embeds=input_embeds,
-                        attention_mask=attn_mask,
-                        labels=labels_padded,
-                    )
-                    loss_reasoning = outputs_r.loss
+                if do_reasoning_forward:
+                    unwrapped = model
+                    while hasattr(unwrapped, "module"):
+                        unwrapped = unwrapped.module
+                    latent_norm = getattr(unwrapped, "latent_hidden_norm", None)
 
-                total_loss = loss_answer + loss_reasoning
+                    normed_hs_list: list[torch.Tensor | None] = []
+                    for hs in latent_hs_list:
+                        if hs is not None and latent_norm is not None:
+                            normed_hs_list.append(latent_norm(hs))
+                        else:
+                            normed_hs_list.append(hs)
+
+                    reasoning_inputs = self._build_reasoning_inputs_from_latent_hs(
+                        model, normed_hs_list, reasoning_input_ids, reasoning_labels
+                    )
+                    if reasoning_inputs is not None:
+                        input_embeds, attn_mask, labels_padded = reasoning_inputs
+                        outputs_r = model(
+                            inputs_embeds=input_embeds,
+                            attention_mask=attn_mask,
+                            labels=labels_padded,
+                        )
+                        loss_reasoning = outputs_r.loss
+
+                total_loss = loss_answer + w * loss_reasoning
 
                 # Construct full-sequence argmax preds for metric computation (exact_match)
                 batch_size_eval, seq_len_eval = inputs["input_ids"].shape
