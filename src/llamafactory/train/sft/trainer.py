@@ -218,6 +218,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         embed_fn = unwrapped.get_input_embeddings()
         latent_norm = getattr(unwrapped, "latent_hidden_norm", None)  # dedicated LayerNorm
 
+        # Disable gradient checkpointing: Phase 3 uses KV cache (past_key_values),
+        # but gradient checkpointing forces use_cache=False in transformers,
+        # causing attention mask / KV length mismatch.
+        _base_model = unwrapped
+        while hasattr(_base_model, "model"):
+            _base_model = _base_model.model
+        _gc_was_enabled = getattr(_base_model, "gradient_checkpointing", False)
+        if _gc_was_enabled:
+            _base_model.gradient_checkpointing_disable()
+
         total_loss = torch.tensor(0.0, device=device)
         latent_hs_list: list[torch.Tensor | None] = []
         suffix_preds_list: list[tuple[int, torch.Tensor] | None] = []  # (suffix_start, argmax_ids) per sample
@@ -372,6 +382,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             del past_kv
 
         avg_loss = total_loss / max(valid_count, 1)
+
+        # Re-enable gradient checkpointing if it was disabled
+        if _gc_was_enabled:
+            _base_model.gradient_checkpointing_enable({"use_reentrant": False})
+
         return avg_loss, latent_hs_list, suffix_preds_list
 
     def _build_reasoning_inputs_from_latent_hs(
