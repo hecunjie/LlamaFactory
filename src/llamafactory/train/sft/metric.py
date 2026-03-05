@@ -140,32 +140,79 @@ class ComputeExactMatch:
 
         return False
 
+    @staticmethod
+    def _extract_after_delimiter(text: str, delimiter: str = "####") -> str:
+        """Extract the part after the last occurrence of the delimiter.
+
+        For GSM8K-style answers like '...reasoning...#### 42', returns '42'.
+        If delimiter is not found, returns the full text stripped.
+        """
+        if delimiter in text:
+            return text.split(delimiter)[-1].strip()
+        return text.strip()
+
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
 
-        for i in range(len(preds)):
-            # Handle autoregressive shift: preds[j] predicts labels[j+1]
-            pred = preds[i, :-1]
-            label = labels[i, 1:]
+        # Detect generate mode: in generate mode, preds are full generated
+        # sequences (including prompt padding) and labels are separately stored.
+        # In non-generate mode, preds are argmax logits with same shape as labels.
+        is_generate_mode = (preds.shape != labels.shape)
 
-            # Only keep answer positions where labels are valid (not IGNORE_INDEX).
-            # In the reasoning SFT setup, labels only have real token IDs at the
-            # answer portion; prompt and think-block positions are IGNORE_INDEX.
-            label_mask = label != IGNORE_INDEX
-            pred_answer_ids = pred[label_mask]
-            label_answer_ids = label[label_mask]
+        if is_generate_mode:
+            # ---- Generate mode: decode full text, split by #### ----
+            # Replace IGNORE_INDEX and pad tokens for clean decoding
+            preds_clean = np.where(
+                preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id
+            )
+            labels_clean = np.where(
+                labels != IGNORE_INDEX, labels, self.tokenizer.pad_token_id
+            )
 
-            if len(label_answer_ids) == 0:
-                self.score_dict["exact_match"].append(0.0)
-                continue
+            for i in range(len(preds_clean)):
+                decoded_pred = self.tokenizer.decode(
+                    preds_clean[i], skip_special_tokens=True
+                ).strip()
+                decoded_label = self.tokenizer.decode(
+                    labels_clean[i], skip_special_tokens=True
+                ).strip()
 
-            # Decode to strings
-            decoded_pred = self.tokenizer.decode(pred_answer_ids, skip_special_tokens=True).strip()
-            decoded_label = self.tokenizer.decode(label_answer_ids, skip_special_tokens=True).strip()
+                # Extract answer after #### delimiter
+                pred_answer = self._extract_after_delimiter(decoded_pred)
+                label_answer = self._extract_after_delimiter(decoded_label)
 
-            # Compare (exact string match + numerical fallback for math)
-            match = self._compare_answers(decoded_pred, decoded_label)
-            self.score_dict["exact_match"].append(1.0 if match else 0.0)
+                match = self._compare_answers(pred_answer, label_answer)
+                self.score_dict["exact_match"].append(1.0 if match else 0.0)
+        else:
+            # ---- Non-generate mode: logits argmax comparison ----
+            for i in range(len(preds)):
+                # Handle autoregressive shift: preds[j] predicts labels[j+1]
+                pred = preds[i, :-1]
+                label = labels[i, 1:]
+
+                # Only keep answer positions where labels are valid (not IGNORE_INDEX).
+                label_mask = label != IGNORE_INDEX
+                pred_answer_ids = pred[label_mask]
+                label_answer_ids = label[label_mask]
+
+                if len(label_answer_ids) == 0:
+                    self.score_dict["exact_match"].append(0.0)
+                    continue
+
+                # Decode to strings
+                decoded_pred = self.tokenizer.decode(
+                    pred_answer_ids, skip_special_tokens=True
+                ).strip()
+                decoded_label = self.tokenizer.decode(
+                    label_answer_ids, skip_special_tokens=True
+                ).strip()
+
+                # Extract answer after #### delimiter (works for both with/without delimiter)
+                pred_answer = self._extract_after_delimiter(decoded_pred)
+                label_answer = self._extract_after_delimiter(decoded_label)
+
+                match = self._compare_answers(pred_answer, label_answer)
+                self.score_dict["exact_match"].append(1.0 if match else 0.0)
 
         if compute_result:
             return self._dump()

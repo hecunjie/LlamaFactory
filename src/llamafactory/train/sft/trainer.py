@@ -185,13 +185,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return input_embeds, attn_mask, labels_padded
 
     def _forward_with_latent_chain(self, model, input_ids, attention_mask, labels, special_token_mask):
-        r"""Sequential forward: each latent token uses the previous latent's
+        r"""Sequential forward: each latent token uses the previous token's
         output hidden state as its input (instead of its word embedding).
 
         Process (per sample):
-          1. Forward prefix (before first latent) → KV cache
-          2. latent_0: input = embed(<latent_0>)              → forward → h_0
+          1. Forward prefix (before first latent) → KV cache + last hidden state
+          2. latent_0: input = latent_hidden_norm(h_prefix_last) → forward → h_0
              latent_i (i>0): input = latent_hidden_norm(h_{i-1}) → forward → h_i
+             ALL latent tokens use previous token's hidden state as input.
              (dedicated LayerNorm maps hidden states to embedding scale)
           3. Forward suffix (after last latent) → logits → CE loss on answer
 
@@ -256,22 +257,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         input_ids=sample_ids[:first_pos].unsqueeze(0),
                         attention_mask=torch.ones(1, first_pos, device=device, dtype=sample_attn.dtype),
                         use_cache=True,
+                        output_hidden_states=True,
                     )
                     past_kv = prefix_out.past_key_values
+                    prefix_last_h = prefix_out.hidden_states[-1][0, -1, :]  # (dim,)
                     del prefix_out
                 else:
                     past_kv = None
+                    prefix_last_h = None
 
                 # ---- Phase 2: Sequential latent tokens ----
                 latent_hs: list[torch.Tensor] = []
                 for i in range(num_latent):
                     pos = latent_pos[i].item()
                     if i == 0:
-                        # First latent: use word embedding
-                        inp = embed_fn(sample_ids[pos : pos + 1]).unsqueeze(0)  # (1,1,dim)
+                        # First latent: use prefix last hidden state
+                        if prefix_last_h is not None:
+                            prev_h = prefix_last_h  # (dim,)
+                            if latent_norm is not None:
+                                prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
+                            inp = prev_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
+                        else:
+                            # No prefix (edge case) → fallback to word embedding
+                            inp = embed_fn(sample_ids[pos : pos + 1]).unsqueeze(0)  # (1,1,dim)
                     else:
-                        # Subsequent: apply latent_hidden_norm to h_{i-1} so its
-                        # scale matches word embeddings, then use as input
+                        # Subsequent: apply latent_hidden_norm to h_{i-1}
                         prev_h = latent_hs[-1]  # (dim,)
                         if latent_norm is not None:
                             prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
@@ -293,6 +303,36 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     del lat_out
 
                 latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
+
+                # ---- Debug: log L2 norms of hidden states vs word embeddings ----
+                if getattr(self, "_log_norm_steps", 0) < 5 and b == 0:
+                    with torch.no_grad():
+                        stacked_hs = torch.stack(latent_hs)  # (num_latent, dim)
+                        hs_norms = stacked_hs.norm(dim=-1)  # (num_latent,)
+                        # Word embedding norms for the same latent token positions
+                        latent_ids = sample_ids[latent_pos]  # (num_latent,)
+                        word_embs = embed_fn(latent_ids)  # (num_latent, dim)
+                        emb_norms = word_embs.norm(dim=-1)  # (num_latent,)
+                        # Prefix last hidden state norm
+                        prefix_h_norm = prefix_last_h.norm().item() if prefix_last_h is not None else 0.0
+                        # Normed input norms (what actually goes into the model)
+                        if latent_norm is not None:
+                            normed_prefix = latent_norm(prefix_last_h.unsqueeze(0)).squeeze(0) if prefix_last_h is not None else None
+                            normed_prefix_norm = normed_prefix.norm().item() if normed_prefix is not None else 0.0
+                            normed_hs = latent_norm(stacked_hs)
+                            normed_hs_norms = normed_hs.norm(dim=-1)
+                        else:
+                            normed_prefix_norm = prefix_h_norm
+                            normed_hs_norms = hs_norms
+                        logger.info_rank0(
+                            f"[latent_chain] step={getattr(self, 'state', None) and self.state.global_step}\n"
+                            f"  raw hidden_states L2 norms:  {[f'{n:.4f}' for n in hs_norms.tolist()]}\n"
+                            f"  normed hidden_states L2 norms (input to next): {[f'{n:.4f}' for n in normed_hs_norms.tolist()]}\n"
+                            f"  word embedding L2 norms:     {[f'{n:.4f}' for n in emb_norms.tolist()]}\n"
+                            f"  prefix_last_h raw L2 norm:   {prefix_h_norm:.4f}\n"
+                            f"  prefix_last_h normed L2 (input to latent_0): {normed_prefix_norm:.4f}"
+                        )
+                    self._log_norm_steps = getattr(self, "_log_norm_steps", 0) + 1
 
                 # ---- Phase 3: Forward suffix (answer portion) ----
                 suffix_start = last_pos + 1
@@ -410,9 +450,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         r"""Combined training step: Sequential latent chain → Reasoning → SINGLE backward.
 
         Latent tokens are processed SEQUENTIALLY: each latent token uses the
-        previous latent's output hidden state as its input embedding (not its
+        previous token's output hidden state as its input embedding (not its
         word embedding). This creates a recurrent chain:
-          latent_0: input = embed(<latent_0>)  →  h_0
+          latent_0: input = h_prefix_last      →  h_0   (prefix's last hidden state)
           latent_i: input = h_{i-1}            →  h_i   (for i > 0)
 
         The suffix (answer) is forwarded with KV cache from the latent chain.
@@ -429,8 +469,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         reasoning_labels = inputs.pop("reasoning_labels", None)
         special_token_mask = inputs.pop("special_token_mask", None)
 
+        w = self.finetuning_args.reasoning_loss_weight
         do_reasoning = (
-            reasoning_input_ids is not None
+            w > 0
+            and reasoning_input_ids is not None
             and special_token_mask is not None
             and special_token_mask.sum() > 0
         )
@@ -489,7 +531,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     loss_reasoning = outputs_r.loss
                 del outputs_r
 
-            w = self.finetuning_args.reasoning_loss_weight
             total_loss = loss_answer + w * loss_reasoning
         else:
             # ---- Standard SFT forward (no latent tokens) ----
@@ -587,8 +628,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         special_token_mask = inputs.pop("special_token_mask", None)
         labels = inputs.get("labels")
 
+        w = self.finetuning_args.reasoning_loss_weight
         do_reasoning = (
-            reasoning_input_ids is not None
+            w > 0
+            and reasoning_input_ids is not None
             and special_token_mask is not None
             and special_token_mask.sum() > 0
         )
@@ -718,18 +761,28 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # ---- Phase 1: Forward prefix (before first latent) ----
             if first_pos > 0:
                 prefix_ids = full_ids[:first_pos].unsqueeze(0).to(device)
-                prefix_out = model(input_ids=prefix_ids, use_cache=True)
+                prefix_out = model(input_ids=prefix_ids, use_cache=True, output_hidden_states=True)
                 past_kv = prefix_out.past_key_values
+                prefix_last_h = prefix_out.hidden_states[-1][0, -1, :]  # (dim,)
                 del prefix_out
             else:
                 past_kv = None
+                prefix_last_h = None
 
             # ---- Phase 2: Sequential latent tokens ----
             latent_hs = []
             for i in range(num_latent):
                 pos = abs_positions[i]
                 if i == 0:
-                    inp = embed_fn(full_ids[pos : pos + 1].to(device)).unsqueeze(0)
+                    # First latent: use prefix last hidden state
+                    if prefix_last_h is not None:
+                        prev_h = prefix_last_h
+                        if latent_norm is not None:
+                            prev_h = latent_norm(prev_h.unsqueeze(0)).squeeze(0)
+                        inp = prev_h.unsqueeze(0).unsqueeze(0)
+                    else:
+                        # No prefix (edge case) → fallback to word embedding
+                        inp = embed_fn(full_ids[pos : pos + 1].to(device)).unsqueeze(0)
                 else:
                     prev_h = latent_hs[-1]
                     if latent_norm is not None:
