@@ -136,6 +136,17 @@ class DataArguments:
             )
         },
     )
+    skip_reasoning_data: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, insert the latent thinking block even if the sample has no _reasoning field. "
+                "The latent chain will still be constructed (answer loss computed through latent KV), "
+                "but reasoning_input_ids will be empty so reasoning forward is skipped (no reasoning loss). "
+                "Useful for training answer quality with latent bottleneck on data without reasoning annotations."
+            )
+        },
+    )
     tokenized_path: str | None = field(
         default=None,
         metadata={

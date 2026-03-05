@@ -100,8 +100,9 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             has_reasoning = "_reasoning" in examples and examples["_reasoning"][i]
             has_special_tokens = "_special_tokens" in examples and examples["_special_tokens"][i]
             num_latent = self.data_args.num_latent_thinking_token
+            skip_reasoning = getattr(self.data_args, "skip_reasoning_data", False)
 
-            if has_reasoning and num_latent > 0:
+            if (has_reasoning or skip_reasoning) and num_latent > 0:
                 # ---- Latent thinking: think block as prompt context ----
                 # Response = <think>\n<latent_0>...<latent_N-1>\n</think>\n\n{answer}
                 # But labels for the <think>...</think>\n\n block = IGNORE_INDEX (prompt-like).
@@ -112,7 +113,7 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 # and the model only generates the answer.
                 # special_token_mask marks <latent_*> positions → reasoning loss.
                 # Loss = loss_answer + w * loss_reasoning.
-                reasoning = examples["_reasoning"][i]
+                reasoning = examples["_reasoning"][i] if has_reasoning else ""
                 original_response = examples["_response"][i][0]["content"]
 
                 latent_names = [f"<latent_{j}>" for j in range(num_latent)]
@@ -160,8 +161,11 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                         special_token_mask[j] = 1
 
                 # Tokenize reasoning text (separate sequence for second forward)
-                reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
-                reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
+                if reasoning:
+                    reasoning_ids = self.tokenizer.encode(reasoning, add_special_tokens=False)
+                    reasoning_ids = reasoning_ids + [self.tokenizer.eos_token_id]
+                else:
+                    reasoning_ids = []  # skip_reasoning_data=True and no _reasoning → no reasoning loss
 
                 model_inputs["input_ids"].append(input_ids)
                 model_inputs["attention_mask"].append([1] * len(input_ids))
