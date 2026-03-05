@@ -222,6 +222,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         total_loss = torch.tensor(0.0, device=device)
         latent_hs_list: list[torch.Tensor | None] = []
+        suffix_preds_list: list[tuple[int, torch.Tensor] | None] = []  # (suffix_start, argmax_ids) per sample
         valid_count = 0
 
         try:
@@ -244,6 +245,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     total_loss = total_loss + out.loss
                     valid_count += 1
                     latent_hs_list.append(None)
+                    suffix_preds_list.append((0, out.logits[0].argmax(dim=-1).detach()))
                     del out
                     continue
 
@@ -305,34 +307,37 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 latent_hs_list.append(torch.stack(latent_hs))  # (num_latent, dim)
 
                 # ---- Debug: log L2 norms of hidden states vs word embeddings ----
-                if getattr(self, "_log_norm_steps", 0) < 5 and b == 0:
-                    with torch.no_grad():
-                        stacked_hs = torch.stack(latent_hs)  # (num_latent, dim)
-                        hs_norms = stacked_hs.norm(dim=-1)  # (num_latent,)
-                        # Word embedding norms for the same latent token positions
-                        latent_ids = sample_ids[latent_pos]  # (num_latent,)
-                        word_embs = embed_fn(latent_ids)  # (num_latent, dim)
-                        emb_norms = word_embs.norm(dim=-1)  # (num_latent,)
-                        # Prefix last hidden state norm
-                        prefix_h_norm = prefix_last_h.norm().item() if prefix_last_h is not None else 0.0
-                        # Normed input norms (what actually goes into the model)
-                        if latent_norm is not None:
-                            normed_prefix = latent_norm(prefix_last_h.unsqueeze(0)).squeeze(0) if prefix_last_h is not None else None
-                            normed_prefix_norm = normed_prefix.norm().item() if normed_prefix is not None else 0.0
-                            normed_hs = latent_norm(stacked_hs)
-                            normed_hs_norms = normed_hs.norm(dim=-1)
-                        else:
-                            normed_prefix_norm = prefix_h_norm
-                            normed_hs_norms = hs_norms
-                        logger.info_rank0(
-                            f"[latent_chain] step={getattr(self, 'state', None) and self.state.global_step}\n"
-                            f"  raw hidden_states L2 norms:  {[f'{n:.4f}' for n in hs_norms.tolist()]}\n"
-                            f"  normed hidden_states L2 norms (input to next): {[f'{n:.4f}' for n in normed_hs_norms.tolist()]}\n"
-                            f"  word embedding L2 norms:     {[f'{n:.4f}' for n in emb_norms.tolist()]}\n"
-                            f"  prefix_last_h raw L2 norm:   {prefix_h_norm:.4f}\n"
-                            f"  prefix_last_h normed L2 (input to latent_0): {normed_prefix_norm:.4f}"
-                        )
-                    self._log_norm_steps = getattr(self, "_log_norm_steps", 0) + 1
+                _gs = self.state.global_step if hasattr(self, "state") and self.state is not None else 0
+                if b == 0 and (_gs <= 5 or _gs % 100 == 0):
+                    try:
+                        with torch.no_grad():
+                            stacked_hs = torch.stack(latent_hs)  # (num_latent, dim)
+                            hs_norms = stacked_hs.norm(dim=-1)  # (num_latent,)
+                            # Word embedding norms for the same latent token positions
+                            latent_ids = sample_ids[latent_pos]  # (num_latent,)
+                            word_embs = embed_fn(latent_ids)  # (num_latent, dim)
+                            emb_norms = word_embs.norm(dim=-1)  # (num_latent,)
+                            # Prefix last hidden state norm
+                            prefix_h_norm = prefix_last_h.norm().item() if prefix_last_h is not None else 0.0
+                            # Normed input norms (what actually goes into the model)
+                            if latent_norm is not None:
+                                normed_prefix = latent_norm(prefix_last_h.unsqueeze(0)).squeeze(0) if prefix_last_h is not None else None
+                                normed_prefix_norm = normed_prefix.norm().item() if normed_prefix is not None else 0.0
+                                normed_hs = latent_norm(stacked_hs)
+                                normed_hs_norms = normed_hs.norm(dim=-1)
+                            else:
+                                normed_prefix_norm = prefix_h_norm
+                                normed_hs_norms = hs_norms
+                            logger.info_rank0(
+                                f"[latent_chain] step={_gs}\n"
+                                f"  raw hidden_states L2 norms:  {[f'{n:.4f}' for n in hs_norms.tolist()]}\n"
+                                f"  normed hidden_states L2 norms (input to next): {[f'{n:.4f}' for n in normed_hs_norms.tolist()]}\n"
+                                f"  word embedding L2 norms:     {[f'{n:.4f}' for n in emb_norms.tolist()]}\n"
+                                f"  prefix_last_h raw L2 norm:   {prefix_h_norm:.4f}\n"
+                                f"  prefix_last_h normed L2 (input to latent_0): {normed_prefix_norm:.4f}"
+                            )
+                    except Exception as e:
+                        logger.warning_rank0(f"[latent_chain] norm logging failed: {e}")
 
                 # ---- Phase 3: Forward suffix (answer portion) ----
                 suffix_start = last_pos + 1
@@ -359,7 +364,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     total_loss = total_loss + sample_loss
                     valid_count += 1
+                    suffix_preds_list.append((suffix_start, logits.argmax(dim=-1).detach()))
                     del suffix_out
+                else:
+                    suffix_preds_list.append(None)
 
                 del past_kv
         finally:
@@ -368,7 +376,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 _base_model.gradient_checkpointing = True
 
         avg_loss = total_loss / max(valid_count, 1)
-        return avg_loss, latent_hs_list
+        return avg_loss, latent_hs_list, suffix_preds_list
 
     def _build_reasoning_inputs_from_latent_hs(
         self, model, latent_hs_list, reasoning_input_ids, reasoning_labels
@@ -480,7 +488,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if do_reasoning:
             # ---- Forward 1: Sequential latent chain + answer CE ----
             with self.compute_loss_context_manager():
-                loss_answer, latent_hs_list = self._forward_with_latent_chain(
+                loss_answer, latent_hs_list, _ = self._forward_with_latent_chain(
                     model,
                     inputs["input_ids"],
                     inputs["attention_mask"],
@@ -639,7 +647,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with torch.no_grad():
             if do_reasoning:
                 # Sequential latent chain + answer CE
-                loss_answer, latent_hs_list = self._forward_with_latent_chain(
+                loss_answer, latent_hs_list, suffix_preds_list = self._forward_with_latent_chain(
                     model,
                     inputs["input_ids"],
                     inputs["attention_mask"],
@@ -674,18 +682,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     loss_reasoning = outputs_r.loss
 
                 total_loss = loss_answer + loss_reasoning
+
+                # Construct full-sequence argmax preds for metric computation (exact_match)
+                batch_size_eval, seq_len_eval = inputs["input_ids"].shape
+                full_preds = torch.full(
+                    (batch_size_eval, seq_len_eval),
+                    self.processing_class.pad_token_id,
+                    dtype=torch.long,
+                    device=inputs["input_ids"].device,
+                )
+                for b_idx, sp in enumerate(suffix_preds_list):
+                    if sp is not None:
+                        s_start, s_argmax = sp
+                        end = min(s_start + len(s_argmax), seq_len_eval)
+                        full_preds[b_idx, s_start:end] = s_argmax[: end - s_start]
+                logits = full_preds  # 2D argmax tensor, handled by eval_logit_processor
             else:
                 loss_answer, outputs = super().compute_loss(model, inputs, return_outputs=True)
                 loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
                 total_loss = loss_answer
+                logits = outputs.logits
 
         if not hasattr(self, "_eval_loss_buffer"):
             self._eval_loss_buffer = {"sft": [], "reasoning": []}
         self._eval_loss_buffer["sft"].append(loss_answer.detach().float().cpu())
         self._eval_loss_buffer["reasoning"].append(loss_reasoning.detach().float().cpu())
-
-        # logits not available from sequential chain; set to None
-        logits = None
 
         return total_loss.detach(), logits, labels
 

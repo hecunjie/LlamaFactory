@@ -53,6 +53,9 @@ def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "tor
         else:  # moe models have aux loss
             logits = logits[1]
 
+    if logits.dim() == 2:
+        return logits  # already argmaxed (e.g. from latent chain eval)
+
     if logits.dim() != 3:
         raise ValueError("Cannot process the logits.")
 
