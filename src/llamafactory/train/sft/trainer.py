@@ -570,36 +570,58 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             total_loss = loss_answer
 
-        # ---- SINGLE backward ----
+        # ---- GA scaling + backward ----
+        # Replicate HF Trainer's exact logic: divide loss by gradient_accumulation_steps
+        # BEFORE backward (so gradients are correctly scaled) and BEFORE return (so
+        # HF's _tr_loss accumulation gives the correct mean when divided by num_steps).
+        # Condition matches HF: only scale when model doesn't handle num_items_in_batch
+        # internally and no custom compute_loss_func is used.
+        if self.args.n_gpu > 1:
+            total_loss = total_loss.mean()  # DataParallel multi-GPU averaging
+
+        if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
+            total_loss = total_loss / self.args.gradient_accumulation_steps
+
         kwargs = {}
         if hasattr(self, "_grad_norm_kwargs"):
             kwargs = self._grad_norm_kwargs
         self.accelerator.backward(total_loss, **kwargs)
 
-        # Log split losses
+        # Log split losses — store GA-scaled values to match HF Trainer's _tr_loss
+        # accumulation logic exactly. HF stores `loss/GA` per micro-batch, sums them,
+        # then divides by num_global_steps. We do the same so loss_sft + w*loss_reasoning
+        # == train/loss at every logging point, even at epoch-boundary partial steps.
+        ga = self.args.gradient_accumulation_steps
         if not hasattr(self, "_custom_loss_buffer"):
             self._custom_loss_buffer = {"sft": [], "reasoning": []}
-        self._custom_loss_buffer["sft"].append(loss_answer.detach().float())
-        self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float())
+        self._custom_loss_buffer["sft"].append(loss_answer.detach().float() / ga)
+        self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float() / ga)
 
         return total_loss.detach()
 
     @override
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Inject train-time split losses
+        # Use the EXACT same formula as HF Trainer's train/loss:
+        #   sum(loss_i / GA) / num_global_steps_since_last_log
+        # This ensures loss_sft + w * loss_reasoning == train/loss at every point,
+        # including epoch-boundary partial accumulation steps.
         if hasattr(self, "_custom_loss_buffer") and self._custom_loss_buffer:
-            for k, v in self._custom_loss_buffer.items():
-                if v:
-                    # 1. Compute local mean for this buffer flush (e.g. logging_steps=10)
-                    local_loss = torch.stack(v).mean()
-                    
-                    # 2. Sync across GPUs (All-Reduce Mean) to match main 'loss'
-                    if self.args.world_size > 1:
-                        import torch.distributed as dist
-                        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
-                        local_loss = local_loss / self.args.world_size
-                    
-                    logs[f"loss_{k}"] = round(local_loss.item(), 4)
+            num_steps = self.state.global_step - getattr(self, "_custom_loss_last_logged_step", 0)
+            if num_steps > 0:
+                for k, v in self._custom_loss_buffer.items():
+                    if v:
+                        # Sum of GA-scaled values, then divide by num_global_steps
+                        local_loss = torch.stack(v).sum() / num_steps
+
+                        # Sync across GPUs (All-Reduce Mean) to match HF's nested_gather().mean()
+                        if self.args.world_size > 1:
+                            import torch.distributed as dist
+                            dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+                            local_loss = local_loss / self.args.world_size
+
+                        logs[f"loss_{k}"] = round(local_loss.item(), 4)
+            self._custom_loss_last_logged_step = self.state.global_step
             self._custom_loss_buffer = {"sft": [], "reasoning": []}
 
         # Inject eval-time split losses
