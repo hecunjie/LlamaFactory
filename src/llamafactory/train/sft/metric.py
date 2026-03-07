@@ -186,6 +186,20 @@ class ComputeExactMatch:
 
                 match = self._compare_answers(pred_answer, label_answer)
                 self.score_dict["exact_match"].append(1.0 if match else 0.0)
+
+                # Debug: log first 3 samples per eval call to diagnose
+                if i < 3:
+                    import logging as _logging
+                    _logger = _logging.getLogger(__name__)
+                    _has_delim_pred = "####" in decoded_pred
+                    _has_delim_label = "####" in decoded_label
+                    _logger.info(
+                        f"[exact_match generate] sample={i} match={match}\n"
+                        f"  pred_answer='{pred_answer}' (has_####={_has_delim_pred})\n"
+                        f"  label_answer='{label_answer}' (has_####={_has_delim_label})\n"
+                        f"  decoded_pred[:200]='{decoded_pred[:200]}'\n"
+                        f"  decoded_label[:200]='{decoded_label[:200]}'"
+                    )
         else:
             # ---- Non-generate mode: logits argmax comparison ----
             for i in range(len(preds)):
