@@ -1326,96 +1326,141 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             # ==================================================================
             # Step 3: Three-strategy probing at high-entropy positions
+            #
+            # For each high-entropy position `pos`:
+            #   gen[pos] was predicted with high entropy.
+            #   We want to predict gen[pos+1] — the NEXT token — using 3 strategies.
+            #
+            # All strategies share KV cache = [prompt + gen[:pos]] and feed ONE
+            # token embedding to predict gen[pos+1]:
+            #   A (hidden_norm): normalised hidden state from processing gen[pos]
+            #   B (logit_weighted_embed): weighted embedding from gen[pos]'s output logits
+            #   C (standard_embed): embed(gen[pos]) — baseline, should exactly
+            #     reproduce greedy decoding → argmax == gen[pos+1]
+            #
+            # To get the hidden state / logits "from processing gen[pos]", we
+            # first do a standard forward of gen[pos] (Strategy C), then extract
+            # its output hidden state and logits for use in Strategies A and B.
             # ==================================================================
             for pos in topk_positions:
-                ctx_len = prompt_len + pos  # tokens before current position
+                # Need gen[pos+1] to exist for comparison
+                if pos + 1 >= gen_len:
+                    continue
 
-                # Build context string for this position
-                context_ids = generated_ids[:pos] if pos > 0 else []
+                actual_next_id = generated_ids[pos + 1]
+                actual_next_text = self.processing_class.decode(
+                    [actual_next_id], skip_special_tokens=False
+                )
+
+                # Build context string: prompt + generated tokens up to & including gen[pos]
+                context_ids = generated_ids[: pos + 1]
                 context_text = prompt_text + self.processing_class.decode(
                     context_ids, skip_special_tokens=False
                 )
 
-                # Re-build context KV cache
                 with torch.no_grad():
-                    if pos == 0:
-                        ctx_out = unwrapped(
-                            input_ids=prompt_ids.unsqueeze(0),
-                            use_cache=True,
-                            output_hidden_states=True,
-                        )
+                    # ---- Build base KV cache: [prompt + gen[:pos]] ----
+                    if pos > 0:
+                        base_prefix = torch.cat([
+                            prompt_ids,
+                            torch.tensor(generated_ids[:pos], dtype=torch.long, device=device),
+                        ], dim=0)
                     else:
-                        gen_prefix = torch.tensor(
-                            generated_ids[:pos], dtype=torch.long, device=device
-                        )
-                        full_ctx = torch.cat([prompt_ids, gen_prefix], dim=0)
-                        ctx_out = unwrapped(
-                            input_ids=full_ctx.unsqueeze(0),
-                            use_cache=True,
-                            output_hidden_states=True,
-                        )
+                        base_prefix = prompt_ids
 
-                    ctx_kv = ctx_out.past_key_values
-                    prev_hidden_gpu = ctx_out.hidden_states[-1][0, -1, :].clone()  # (dim,)
-                    prev_logits_gpu = ctx_out.logits[0, -1, :].clone()  # (vocab,)
-                    del ctx_out
+                    base_ctx_len = base_prefix.shape[0]  # number of tokens in KV cache
 
-                    attn_mask = torch.ones(1, ctx_len + 1, device=device, dtype=torch.long)
+                    # ---- Strategy C (standard): embed(gen[pos]) ----
+                    # Forward base prefix to get KV cache, then feed embed(gen[pos]).
+                    # The output logits predict gen[pos+1].
+                    # This also gives us the hidden state and logits OF gen[pos]
+                    # that Strategies A and B will use.
+                    ctx_out_c = unwrapped(
+                        input_ids=base_prefix.unsqueeze(0),
+                        use_cache=True,
+                    )
+                    ctx_kv_c = ctx_out_c.past_key_values
+                    del ctx_out_c
 
-                    # ---- Strategy A: standard normalisation (zero-mean, unit-variance) ----
-                    h_float = prev_hidden_gpu.float()  # (dim,)
+                    gen_pos_embed = embed_fn(
+                        torch.tensor([[generated_ids[pos]]], device=device)
+                    )
+                    attn_mask_c = torch.ones(
+                        1, base_ctx_len + 1, device=device, dtype=torch.long
+                    )
+                    out_c = unwrapped(
+                        inputs_embeds=gen_pos_embed,
+                        attention_mask=attn_mask_c,
+                        past_key_values=ctx_kv_c,
+                        output_hidden_states=True,
+                    )
+                    logits_c = out_c.logits[0, -1, :].clone()        # predicts gen[pos+1]
+                    pos_hidden = out_c.hidden_states[-1][0, -1, :].clone()  # hidden of gen[pos]
+                    pos_logits = out_c.logits[0, -1, :].clone()      # logits of gen[pos]
+                    del out_c, ctx_kv_c
+
+                    # L2 norm of Strategy C input embedding
+                    l2_norm_c = gen_pos_embed.float().squeeze().norm().item()
+
+                    # ---- Strategy A: normalised hidden state of gen[pos] ----
+                    # Re-create a fresh KV cache (avoids in-place DynamicCache issues)
+                    ctx_out_a = unwrapped(
+                        input_ids=base_prefix.unsqueeze(0),
+                        use_cache=True,
+                    )
+                    ctx_kv_a = ctx_out_a.past_key_values
+                    del ctx_out_a
+
+                    h_float = pos_hidden.float()
                     h_mean = h_float.mean()
                     h_std = h_float.std()
-                    normed_h = ((h_float - h_mean) / (h_std + 1e-6)).to(prev_hidden_gpu.dtype)
+                    normed_h = ((h_float - h_mean) / (h_std + 1e-6)).to(pos_hidden.dtype)
+                    l2_norm_a = normed_h.float().norm().item()  # L2 norm before unsqueeze
                     normed_h = normed_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
                     out_a = unwrapped(
                         inputs_embeds=normed_h,
-                        attention_mask=attn_mask,
-                        past_key_values=ctx_kv,
+                        attention_mask=attn_mask_c,
+                        past_key_values=ctx_kv_a,
                     )
-                    logits_a = out_a.logits[0, -1, :]
-                    del out_a
+                    logits_a = out_a.logits[0, -1, :].clone()
+                    del out_a, ctx_kv_a
 
-                    # ---- Strategy B: logit-weighted embedding (filtered & re-normalised) ----
-                    prev_probs = torch.softmax(prev_logits_gpu.float(), dim=-1)  # (vocab,)
-                    # Filter: keep only tokens with prob > threshold
-                    mask = prev_probs > logit_weight_threshold
-                    filtered_probs = prev_probs * mask.float()  # zero out below threshold
+                    # ---- Strategy B: logit-weighted embedding from gen[pos]'s logits ----
+                    ctx_out_b = unwrapped(
+                        input_ids=base_prefix.unsqueeze(0),
+                        use_cache=True,
+                    )
+                    ctx_kv_b = ctx_out_b.past_key_values
+                    del ctx_out_b
+
+                    pos_probs = torch.softmax(pos_logits.float(), dim=-1)  # (vocab,)
+                    prob_mask = pos_probs > logit_weight_threshold
+                    filtered_probs = pos_probs * prob_mask.float()
                     prob_sum = filtered_probs.sum()
                     if prob_sum > 0:
                         filtered_probs = filtered_probs / prob_sum  # re-normalise
                     else:
-                        # Fallback: if no token exceeds threshold, use original probs
-                        filtered_probs = prev_probs
+                        filtered_probs = pos_probs
                     weight_matrix = embed_fn.weight.float()  # (vocab, dim)
-                    weighted_embed = (filtered_probs.unsqueeze(-1) * weight_matrix).sum(dim=0)  # (dim,)
+                    weighted_embed = (filtered_probs.unsqueeze(-1) * weight_matrix).sum(dim=0)
+                    l2_norm_b = weighted_embed.norm().item()  # L2 norm before dtype cast
                     weighted_embed = weighted_embed.to(embed_fn.weight.dtype)
                     out_b = unwrapped(
                         inputs_embeds=weighted_embed.unsqueeze(0).unsqueeze(0),
-                        attention_mask=attn_mask,
-                        past_key_values=ctx_kv,
+                        attention_mask=attn_mask_c,
+                        past_key_values=ctx_kv_b,
                     )
-                    logits_b = out_b.logits[0, -1, :]
-                    del out_b
-
-                    # ---- Strategy C: standard word embedding ----
-                    token_id_at_pos = generated_ids[pos]
-                    std_embed = embed_fn(torch.tensor([[token_id_at_pos]], device=device))
-                    out_c = unwrapped(
-                        inputs_embeds=std_embed,
-                        attention_mask=attn_mask,
-                        past_key_values=ctx_kv,
-                    )
-                    logits_c = out_c.logits[0, -1, :]
-                    del out_c
-
-                    del ctx_kv
+                    logits_b = out_b.logits[0, -1, :].clone()
+                    del out_b, ctx_kv_b
 
                 # ---- Collect distributions for each strategy ----
                 strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed"]
                 strategy_logits = [logits_a, logits_b, logits_c]
+                strategy_l2_norms = [l2_norm_a, l2_norm_b, l2_norm_c]
 
-                for strat_name, strat_logits in zip(strategy_names, strategy_logits):
+                for strat_name, strat_logits, strat_l2 in zip(
+                    strategy_names, strategy_logits, strategy_l2_norms
+                ):
                     probs = torch.softmax(strat_logits.float(), dim=-1)
                     log_probs = torch.log(probs + 1e-12)
                     entropy_val = -(probs * log_probs).sum().item()
@@ -1434,7 +1479,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         "sample_idx": sample_idx,
                         "gen_position": pos,
                         "original_entropy": round(step_entropies[pos], 6),
+                        "high_entropy_token": self.processing_class.decode(
+                            [generated_ids[pos]], skip_special_tokens=False
+                        ),
+                        "actual_next_token": actual_next_text,
+                        "actual_next_token_id": actual_next_id,
                         "strategy": strat_name,
+                        "input_embed_l2_norm": round(strat_l2, 6),
                         "strategy_entropy": round(entropy_val, 6),
                         "topk_tokens": json.dumps(topk_dict, ensure_ascii=False),
                         "context": context_text,
