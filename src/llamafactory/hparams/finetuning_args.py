@@ -522,6 +522,34 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute exact match at evaluation. Checks if generated response matches label."},
     )
+    do_entropy_analysis: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to run entropy-strategy analysis after prediction. "
+                "Performs autoregressive generation, identifies the top-20 highest-entropy "
+                "positions per sample, then probes with three input strategies "
+                "(hidden_norm, logit_weighted_embed, standard_embed) and saves "
+                "distribution comparisons to CSV."
+            )
+        },
+    )
+    entropy_top_k_positions: int = field(
+        default=20,
+        metadata={"help": "Percentage (0-100) of highest-entropy positions to probe per sample. E.g. 20 means top 20%%."},
+    )
+    entropy_top_k_tokens: int = field(
+        default=10,
+        metadata={"help": "Number of top tokens (with probabilities) to record per strategy during entropy analysis."},
+    )
+    entropy_max_new_tokens: int = field(
+        default=512,
+        metadata={"help": "Maximum number of new tokens to generate per sample during entropy analysis."},
+    )
+    entropy_logit_weight_threshold: float = field(
+        default=0.01,
+        metadata={"help": "Probability threshold for Strategy B (logit_weighted_embed). Only tokens with prob > threshold are used."},
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},

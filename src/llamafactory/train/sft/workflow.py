@@ -195,5 +195,31 @@ def run_sft(
         trainer.save_metrics("predict", predict_results.metrics)
         trainer.save_predictions(dataset_module["eval_dataset"], predict_results, generating_args.skip_special_tokens)
 
+    # Entropy-strategy analysis
+    if finetuning_args.do_entropy_analysis:
+        eval_dataset = dataset_module.get("eval_dataset")
+        if eval_dataset is None:
+            logger.warning_rank0("No eval_dataset found. Skipping entropy analysis.")
+        else:
+            # If eval_dataset is a dict (multi-dataset), analyse each split
+            if isinstance(eval_dataset, dict):
+                for split_name, split_ds in eval_dataset.items():
+                    logger.info_rank0(f"Running entropy analysis on split: {split_name}")
+                    trainer.analyze_entropy_strategies(
+                        dataset=split_ds,
+                        top_k_entropy_pct=finetuning_args.entropy_top_k_positions,
+                        top_k_tokens=finetuning_args.entropy_top_k_tokens,
+                        max_new_tokens=finetuning_args.entropy_max_new_tokens,
+                        logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
+                    )
+            else:
+                trainer.analyze_entropy_strategies(
+                    dataset=eval_dataset,
+                    top_k_entropy_pct=finetuning_args.entropy_top_k_positions,
+                    top_k_tokens=finetuning_args.entropy_top_k_tokens,
+                    max_new_tokens=finetuning_args.entropy_max_new_tokens,
+                    logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
+                )
+
     # Create model card
     create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)

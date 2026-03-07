@@ -1,0 +1,42 @@
+### GSM8K Entropy-Strategy Analysis Config
+### Run autoregressive generation on eval data, find high-entropy positions,
+### probe with 3 input strategies (hidden_norm, logit_weighted_embed, standard_embed),
+### and save per-sample distribution comparisons to CSV.
+###
+### Usage:
+###   llamafactory-cli train examples/train_full/qwen2.5_gsm8k_entropy_analysis.yaml
+
+### model
+model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-7B-Instruct
+# model_name_or_path: /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen2.5-32B-Instruct
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: false
+finetuning_type: full
+
+### dataset
+dataset: gsm8k_sft_train
+eval_dataset: gsm8k_sft_train
+template: qwen
+cutoff_len: 1024
+preprocessing_num_workers: 64
+dataloader_num_workers: 64
+
+### output
+output_dir: /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/gsm8k_entropy_analysis_7B
+overwrite_output_dir: true
+report_to: none
+
+### inference
+per_device_eval_batch_size: 1
+bf16: true
+ddp_timeout: 180000000
+
+### entropy-strategy analysis
+do_entropy_analysis: true
+entropy_top_k_positions: 20
+entropy_top_k_tokens: 10
+entropy_max_new_tokens: 512
+entropy_logit_weight_threshold: 0.01

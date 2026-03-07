@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
 import json
 import os
 from types import MethodType
@@ -1145,3 +1146,308 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     "predict_reasoning": rea,
                     "label": label
                 }, ensure_ascii=False) + "\n")
+
+    def analyze_entropy_strategies(
+        self,
+        dataset: "Dataset",
+        top_k_entropy_pct: int = 20,
+        top_k_tokens: int = 10,
+        max_new_tokens: int = 512,
+        logit_weight_threshold: float = 0.01,
+    ) -> None:
+        r"""Analyze token-level entropy during autoregressive generation and compare
+        three input strategies at the highest-entropy positions.
+
+        For each sample in *dataset*:
+        1. **Autoregressive generation** – greedy-decode from the prompt while
+           recording the output distribution (entropy) at every generated step.
+        2. **Identify top-k% entropy positions** – pick the top ``top_k_entropy_pct``
+           percent of positions where the model was most uncertain.
+        3. **Three-strategy probing** – at each high-entropy position, re-run a
+           single forward step with three different input embeddings:
+             - **Strategy A (hidden_norm)**: previous token's output hidden state,
+               standardised to zero-mean unit-variance (no learnable parameters).
+             - **Strategy B (logit_weighted_embed)**: a weighted combination of word
+               embeddings using only tokens whose probability exceeds
+               ``logit_weight_threshold``, re-normalised after filtering.
+             - **Strategy C (standard_embed)**: the previous token's word embedding
+               (the standard autoregressive input).
+        4. **Record** entropy, top-k token IDs and their probabilities for every
+           strategy and save as per-sample folders in ``self.args.output_dir``.
+
+        Output structure (in ``output_dir/entropy_analysis/``):
+          - ``sample_<idx>/entropy_positions.csv``
+          - ``sample_<idx>/strategy_distributions.csv``
+
+        Args:
+            top_k_entropy_pct: Percentage (0–100) of generated positions to probe.
+                E.g. 20 means the top 20% highest-entropy positions.
+            logit_weight_threshold: Minimum probability for a token to participate
+                in the Strategy B weighted embedding. Tokens below this are
+                discarded and remaining probabilities are re-normalised.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        logger.info_rank0("[entropy_analysis] Starting entropy-strategy analysis …")
+
+        # ---- Unwrap model ----
+        unwrapped = self.model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        unwrapped.eval()
+        device = next(unwrapped.parameters()).device
+
+        embed_fn = unwrapped.get_input_embeddings()
+
+        # ---- Prepare output root ----
+        analysis_root = os.path.join(self.args.output_dir, "entropy_analysis")
+        os.makedirs(analysis_root, exist_ok=True)
+
+        num_samples = len(dataset)
+        logger.info_rank0(
+            f"[entropy_analysis] Processing {num_samples} samples, "
+            f"top {top_k_entropy_pct}% entropy positions, "
+            f"logit_weight_threshold={logit_weight_threshold} …"
+        )
+
+        for sample_idx in range(num_samples):
+            input_ids_list = dataset[sample_idx]["input_ids"]
+            prompt_ids = torch.tensor(input_ids_list, dtype=torch.long, device=device)
+            prompt_len = prompt_ids.shape[0]
+
+            # Decode prompt text once (for context field)
+            prompt_text = self.processing_class.decode(input_ids_list, skip_special_tokens=False)
+
+            # ==================================================================
+            # Step 1: Autoregressive generation with entropy recording
+            # ==================================================================
+            generated_ids: list[int] = []
+            step_entropies: list[float] = []
+            step_hidden_states: list[torch.Tensor] = []   # last-layer hidden state at each step
+            step_logits_list: list[torch.Tensor] = []      # logits at each step
+
+            with torch.no_grad():
+                # Forward the prompt
+                prompt_out = unwrapped(
+                    input_ids=prompt_ids.unsqueeze(0),
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                past_kv = prompt_out.past_key_values
+                last_logits = prompt_out.logits[0, -1, :]       # (vocab,)
+                last_hidden = prompt_out.hidden_states[-1][0, -1, :]  # (dim,)
+                del prompt_out
+
+                for step in range(max_new_tokens):
+                    # Compute entropy of current logits
+                    probs = torch.softmax(last_logits.float(), dim=-1)
+                    log_probs = torch.log(probs + 1e-12)
+                    entropy = -(probs * log_probs).sum().item()
+
+                    next_id = last_logits.argmax(dim=-1).item()
+
+                    step_entropies.append(entropy)
+                    step_hidden_states.append(last_hidden.cpu())
+                    step_logits_list.append(last_logits.cpu())
+                    generated_ids.append(next_id)
+
+                    if next_id == self.processing_class.eos_token_id:
+                        break
+
+                    # Next step
+                    next_embed = embed_fn(torch.tensor([[next_id]], device=device))
+                    step_out = unwrapped(
+                        inputs_embeds=next_embed,
+                        past_key_values=past_kv,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    past_kv = step_out.past_key_values
+                    last_logits = step_out.logits[0, -1, :]
+                    last_hidden = step_out.hidden_states[-1][0, -1, :]
+                    del step_out
+
+                del past_kv
+
+            gen_len = len(generated_ids)
+            if gen_len == 0:
+                continue
+
+            # ==================================================================
+            # Step 2: Find top-k% highest-entropy positions
+            # ==================================================================
+            k = max(1, int(gen_len * top_k_entropy_pct / 100.0))
+            k = min(k, gen_len)
+            entropy_tensor = torch.tensor(step_entropies)
+            topk_vals, topk_indices = entropy_tensor.topk(k)
+            topk_positions = topk_indices.sort().values.tolist()  # sorted by position
+
+            # ---- Per-sample output folder ----
+            sample_dir = os.path.join(analysis_root, f"sample_{sample_idx}")
+            os.makedirs(sample_dir, exist_ok=True)
+
+            positions_rows: list[dict] = []
+            strategy_rows: list[dict] = []
+
+            for rank, pos in enumerate(topk_positions):
+                # Build context string: prompt + generated tokens up to this position
+                context_ids = generated_ids[:pos] if pos > 0 else []
+                context_text = prompt_text + self.processing_class.decode(
+                    context_ids, skip_special_tokens=False
+                )
+
+                positions_rows.append({
+                    "sample_idx": sample_idx,
+                    "gen_position": pos,
+                    "entropy": round(step_entropies[pos], 6),
+                    "rank": rank,
+                    "token_id": generated_ids[pos],
+                    "token_text": self.processing_class.decode(
+                        [generated_ids[pos]], skip_special_tokens=False
+                    ),
+                    "context": context_text,
+                })
+
+            # ==================================================================
+            # Step 3: Three-strategy probing at high-entropy positions
+            # ==================================================================
+            for pos in topk_positions:
+                ctx_len = prompt_len + pos  # tokens before current position
+
+                # Build context string for this position
+                context_ids = generated_ids[:pos] if pos > 0 else []
+                context_text = prompt_text + self.processing_class.decode(
+                    context_ids, skip_special_tokens=False
+                )
+
+                # Re-build context KV cache
+                with torch.no_grad():
+                    if pos == 0:
+                        ctx_out = unwrapped(
+                            input_ids=prompt_ids.unsqueeze(0),
+                            use_cache=True,
+                            output_hidden_states=True,
+                        )
+                    else:
+                        gen_prefix = torch.tensor(
+                            generated_ids[:pos], dtype=torch.long, device=device
+                        )
+                        full_ctx = torch.cat([prompt_ids, gen_prefix], dim=0)
+                        ctx_out = unwrapped(
+                            input_ids=full_ctx.unsqueeze(0),
+                            use_cache=True,
+                            output_hidden_states=True,
+                        )
+
+                    ctx_kv = ctx_out.past_key_values
+                    prev_hidden_gpu = ctx_out.hidden_states[-1][0, -1, :].clone()  # (dim,)
+                    prev_logits_gpu = ctx_out.logits[0, -1, :].clone()  # (vocab,)
+                    del ctx_out
+
+                    attn_mask = torch.ones(1, ctx_len + 1, device=device, dtype=torch.long)
+
+                    # ---- Strategy A: standard normalisation (zero-mean, unit-variance) ----
+                    h_float = prev_hidden_gpu.float()  # (dim,)
+                    h_mean = h_float.mean()
+                    h_std = h_float.std()
+                    normed_h = ((h_float - h_mean) / (h_std + 1e-6)).to(prev_hidden_gpu.dtype)
+                    normed_h = normed_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
+                    out_a = unwrapped(
+                        inputs_embeds=normed_h,
+                        attention_mask=attn_mask,
+                        past_key_values=ctx_kv,
+                    )
+                    logits_a = out_a.logits[0, -1, :]
+                    del out_a
+
+                    # ---- Strategy B: logit-weighted embedding (filtered & re-normalised) ----
+                    prev_probs = torch.softmax(prev_logits_gpu.float(), dim=-1)  # (vocab,)
+                    # Filter: keep only tokens with prob > threshold
+                    mask = prev_probs > logit_weight_threshold
+                    filtered_probs = prev_probs * mask.float()  # zero out below threshold
+                    prob_sum = filtered_probs.sum()
+                    if prob_sum > 0:
+                        filtered_probs = filtered_probs / prob_sum  # re-normalise
+                    else:
+                        # Fallback: if no token exceeds threshold, use original probs
+                        filtered_probs = prev_probs
+                    weight_matrix = embed_fn.weight.float()  # (vocab, dim)
+                    weighted_embed = (filtered_probs.unsqueeze(-1) * weight_matrix).sum(dim=0)  # (dim,)
+                    weighted_embed = weighted_embed.to(embed_fn.weight.dtype)
+                    out_b = unwrapped(
+                        inputs_embeds=weighted_embed.unsqueeze(0).unsqueeze(0),
+                        attention_mask=attn_mask,
+                        past_key_values=ctx_kv,
+                    )
+                    logits_b = out_b.logits[0, -1, :]
+                    del out_b
+
+                    # ---- Strategy C: standard word embedding ----
+                    token_id_at_pos = generated_ids[pos]
+                    std_embed = embed_fn(torch.tensor([[token_id_at_pos]], device=device))
+                    out_c = unwrapped(
+                        inputs_embeds=std_embed,
+                        attention_mask=attn_mask,
+                        past_key_values=ctx_kv,
+                    )
+                    logits_c = out_c.logits[0, -1, :]
+                    del out_c
+
+                    del ctx_kv
+
+                # ---- Collect distributions for each strategy ----
+                strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed"]
+                strategy_logits = [logits_a, logits_b, logits_c]
+
+                for strat_name, strat_logits in zip(strategy_names, strategy_logits):
+                    probs = torch.softmax(strat_logits.float(), dim=-1)
+                    log_probs = torch.log(probs + 1e-12)
+                    entropy_val = -(probs * log_probs).sum().item()
+
+                    topk_probs_val, topk_ids_val = probs.topk(top_k_tokens)
+
+                    # Build top-k dict: {token_text: prob}
+                    topk_dict = {}
+                    for tk in range(top_k_tokens):
+                        tid = topk_ids_val[tk].item()
+                        tprob = topk_probs_val[tk].item()
+                        ttext = self.processing_class.decode([tid], skip_special_tokens=False)
+                        topk_dict[ttext] = round(tprob, 6)
+
+                    strategy_rows.append({
+                        "sample_idx": sample_idx,
+                        "gen_position": pos,
+                        "original_entropy": round(step_entropies[pos], 6),
+                        "strategy": strat_name,
+                        "strategy_entropy": round(entropy_val, 6),
+                        "topk_tokens": json.dumps(topk_dict, ensure_ascii=False),
+                        "context": context_text,
+                    })
+
+            # ---- Write per-sample CSV files ----
+            if positions_rows:
+                pos_csv = os.path.join(sample_dir, "entropy_positions.csv")
+                fieldnames_pos = list(positions_rows[0].keys())
+                with open(pos_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames_pos)
+                    writer.writeheader()
+                    writer.writerows(positions_rows)
+
+            if strategy_rows:
+                strat_csv = os.path.join(sample_dir, "strategy_distributions.csv")
+                fieldnames_strat = list(strategy_rows[0].keys())
+                with open(strat_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames_strat)
+                    writer.writeheader()
+                    writer.writerows(strategy_rows)
+
+            if (sample_idx + 1) % 10 == 0 or sample_idx == num_samples - 1:
+                logger.info_rank0(
+                    f"[entropy_analysis] Processed {sample_idx + 1}/{num_samples} samples"
+                )
+
+        logger.info_rank0(
+            f"[entropy_analysis] Done. Results saved under {analysis_root} "
+            f"({num_samples} sample folders)."
+        )
