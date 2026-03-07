@@ -1213,11 +1213,26 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         for sample_idx in range(num_samples):
             input_ids_list = dataset[sample_idx]["input_ids"]
-            prompt_ids = torch.tensor(input_ids_list, dtype=torch.long, device=device)
+            labels_list = dataset[sample_idx]["labels"]
+
+            # Strip the response: only keep the prompt portion (labels == IGNORE_INDEX).
+            # In SFT data, labels is -100 for prompt tokens and real IDs for response tokens.
+            prompt_end = len(input_ids_list)  # fallback: use all if no response found
+            for _j, _lbl in enumerate(labels_list):
+                if _lbl != IGNORE_INDEX:
+                    prompt_end = _j
+                    break
+
+            prompt_only_ids = input_ids_list[:prompt_end]
+            if len(prompt_only_ids) == 0:
+                logger.warning_rank0(f"[entropy_analysis] Sample {sample_idx}: empty prompt, skipping.")
+                continue
+
+            prompt_ids = torch.tensor(prompt_only_ids, dtype=torch.long, device=device)
             prompt_len = prompt_ids.shape[0]
 
             # Decode prompt text once (for context field)
-            prompt_text = self.processing_class.decode(input_ids_list, skip_special_tokens=False)
+            prompt_text = self.processing_class.decode(prompt_only_ids, skip_special_tokens=False)
 
             # ==================================================================
             # Step 1: Autoregressive generation with entropy recording
