@@ -1252,6 +1252,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 past_kv = prompt_out.past_key_values
                 last_logits = prompt_out.logits[0, -1, :]       # (vocab,)
                 last_hidden = prompt_out.hidden_states[-1][0, -1, :]  # (dim,)
+                # Save logits at prompt position -2 for Strategy B when pos=0.
+                # These logits predict prompt[-1], so weighted_embed ≈ embed(prompt[-1]).
+                prompt_prev_logits = (
+                    prompt_out.logits[0, -2, :].cpu() if prompt_len >= 2 else None
+                )
                 del prompt_out
 
                 for step in range(max_new_tokens):
@@ -1336,18 +1341,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             #   input = embed(gen[pos-1])           (the previous token's embedding)
             #   output logits → argmax = gen[pos]
             #
-            # The "hidden state of gen[pos]" = the output hidden state that the
-            # LM head uses to produce logits predicting gen[pos]. This is the
-            # hidden state at the LAST position after forwarding
-            # [prompt + gen[:pos]], i.e. after processing gen[pos-1].
-            #
             # Strategies:
-            #   A (hidden_norm): normalize(hidden of gen[pos]) → predict gen[pos]
-            #   B (logit_weighted_embed): weighted_embed(logits of gen[pos]) → predict gen[pos]
+            #   A (hidden_norm): standardise then L2-normalise the hidden state
+            #       that predicted gen[pos] → feed as input → predict gen[pos]
+            #   B (logit_weighted_embed): weighted_embed from the logits that
+            #       predicted gen[pos-1] (peaks at gen[pos-1]), so the embed
+            #       ≈ embed(gen[pos-1]) → feed at the same position as C
+            #       → predict gen[pos]
             #   C (standard_embed): embed(gen[pos-1]) — baseline, argmax == gen[pos]
             #
-            # step_hidden_states[pos] and step_logits_list[pos] from Step 1
-            # are exactly the hidden/logits that predict gen[pos].
+            # step_hidden_states[pos] / step_logits_list[pos] from Step 1 are
+            # the hidden/logits that predict gen[pos].
+            # step_logits_list[pos-1] are the logits that predict gen[pos-1]
+            # (used by Strategy B).
             # ==================================================================
             for pos in topk_positions:
                 greedy_token_id = generated_ids[pos]
@@ -1421,8 +1427,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     h_float = pos_hidden.float()
                     h_mean = h_float.mean()
                     h_std = h_float.std()
-                    normed_h = ((h_float - h_mean) / (h_std + 1e-6)).to(pos_hidden.dtype)
-                    l2_norm_a = normed_h.float().norm().item()
+                    normed_h = (h_float - h_mean) / (h_std + 1e-6)
+                    normed_h = normed_h / (normed_h.norm() + 1e-6)  # L2 normalise → unit norm
+                    normed_h = normed_h.to(pos_hidden.dtype)
+                    l2_norm_a = normed_h.float().norm().item()  # ≈ 1.0
                     normed_h = normed_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
                     out_a = unwrapped(
                         inputs_embeds=normed_h,
@@ -1432,21 +1440,32 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits_a = out_a.logits[0, -1, :].clone()
                     del out_a, ctx_kv_a
 
-                    # ---- Strategy B: weighted_embed(logits of gen[pos]) ----
+                    # ---- Strategy B: weighted_embed from PREVIOUS step's logits ----
+                    # step_logits_list[pos] predicts gen[pos] → softmax peaks at
+                    # gen[pos] → weighted_embed ≈ embed(gen[pos]) → model predicts
+                    # gen[pos+1].  To predict gen[pos] we need the logits that
+                    # predicted gen[pos-1]: their softmax peaks at gen[pos-1], so
+                    # weighted_embed ≈ embed(gen[pos-1]), same position as C.
                     ctx_out_b = unwrapped(
                         input_ids=base_prefix.unsqueeze(0), use_cache=True,
                     )
                     ctx_kv_b = ctx_out_b.past_key_values
                     del ctx_out_b
 
-                    pos_probs = torch.softmax(pos_logits.float(), dim=-1)  # (vocab,)
-                    prob_mask = pos_probs > logit_weight_threshold
-                    filtered_probs = pos_probs * prob_mask.float()
+                    if pos > 0:
+                        b_logits = step_logits_list[pos - 1].to(device)
+                    elif prompt_prev_logits is not None:
+                        b_logits = prompt_prev_logits.to(device)
+                    else:
+                        b_logits = pos_logits  # fallback (pos=0, prompt_len<2)
+                    b_probs = torch.softmax(b_logits.float(), dim=-1)  # (vocab,)
+                    prob_mask = b_probs > logit_weight_threshold
+                    filtered_probs = b_probs * prob_mask.float()
                     prob_sum = filtered_probs.sum()
                     if prob_sum > 0:
                         filtered_probs = filtered_probs / prob_sum
                     else:
-                        filtered_probs = pos_probs
+                        filtered_probs = b_probs
                     weight_matrix = embed_fn.weight.float()  # (vocab, dim)
                     weighted_embed = (filtered_probs.unsqueeze(-1) * weight_matrix).sum(dim=0)
                     l2_norm_b = weighted_embed.norm().item()
