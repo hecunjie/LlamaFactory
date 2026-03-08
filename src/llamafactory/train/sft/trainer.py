@@ -1444,10 +1444,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     del ctx_out_a
 
                     h_float = pos_hidden.float()
-                    h_mean = h_float.mean()
-                    h_std = h_float.std()
-                    normed_h = (h_float - h_mean) / (h_std + 1e-6)
-                    normed_h = normed_h / (normed_h.norm() + 1e-6)  # L2 normalise → unit norm
+                    normed_h = h_float / (h_float.norm() + 1e-6)  # L2 normalise → unit norm
                     normed_h = normed_h.to(pos_hidden.dtype)
                     l2_norm_a = normed_h.float().norm().item()  # ≈ 1.0
                     normed_h = normed_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
