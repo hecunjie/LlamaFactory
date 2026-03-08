@@ -1154,6 +1154,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         top_k_tokens: int = 10,
         max_new_tokens: int = 512,
         logit_weight_threshold: float = 0.01,
+        blend_alpha: float = 0.6,
     ) -> None:
         r"""Analyze token-level entropy during autoregressive generation and compare
         three input strategies at the highest-entropy positions.
@@ -1489,10 +1490,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits_b = out_b.logits[0, -1, :].clone()
                     del out_b, ctx_kv_b
 
+                    # ---- Strategy D: alpha * A_embed + (1-alpha) * B_embed ----
+                    # Blend the normalised hidden (A) and weighted embed (B).
+                    # normed_h is (1,1,dim), weighted_embed is (dim,)
+                    a_vec = normed_h.squeeze(0).squeeze(0).float()  # (dim,)
+                    b_vec = weighted_embed.float()                  # (dim,)
+                    blended = blend_alpha * a_vec + (1 - blend_alpha) * b_vec
+                    l2_norm_d = blended.norm().item()
+                    blended = blended.to(pos_hidden.dtype)
+
+                    ctx_out_d = unwrapped(
+                        input_ids=base_prefix.unsqueeze(0), use_cache=True,
+                    )
+                    ctx_kv_d = ctx_out_d.past_key_values
+                    del ctx_out_d
+
+                    out_d = unwrapped(
+                        inputs_embeds=blended.unsqueeze(0).unsqueeze(0),
+                        attention_mask=attn_mask,
+                        past_key_values=ctx_kv_d,
+                    )
+                    logits_d = out_d.logits[0, -1, :].clone()
+                    del out_d, ctx_kv_d
+
                 # ---- Collect distributions for each strategy ----
-                strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed"]
-                strategy_logits_list = [logits_a, logits_b, logits_c]
-                strategy_l2_norms = [l2_norm_a, l2_norm_b, l2_norm_c]
+                strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed", "blend_AB"]
+                strategy_logits_list = [logits_a, logits_b, logits_c, logits_d]
+                strategy_l2_norms = [l2_norm_a, l2_norm_b, l2_norm_c, l2_norm_d]
 
                 for strat_name, strat_logits, strat_l2 in zip(
                     strategy_names, strategy_logits_list, strategy_l2_norms

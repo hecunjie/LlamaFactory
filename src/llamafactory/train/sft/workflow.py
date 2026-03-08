@@ -211,6 +211,7 @@ def run_sft(
                         top_k_tokens=finetuning_args.entropy_top_k_tokens,
                         max_new_tokens=finetuning_args.entropy_max_new_tokens,
                         logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
+                        blend_alpha=finetuning_args.entropy_blend_alpha,
                     )
             else:
                 trainer.analyze_entropy_strategies(
@@ -219,6 +220,7 @@ def run_sft(
                     top_k_tokens=finetuning_args.entropy_top_k_tokens,
                     max_new_tokens=finetuning_args.entropy_max_new_tokens,
                     logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
+                    blend_alpha=finetuning_args.entropy_blend_alpha,
                 )
 
     # Create model card

@@ -550,6 +550,10 @@ class FinetuningArguments(
         default=0.01,
         metadata={"help": "Probability threshold for Strategy B (logit_weighted_embed). Only tokens with prob > threshold are used."},
     )
+    entropy_blend_alpha: float = field(
+        default=0.6,
+        metadata={"help": "Weight of Strategy A in the blended Strategy D: D = alpha * A_embed + (1-alpha) * B_embed. Default 0.6."},
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
