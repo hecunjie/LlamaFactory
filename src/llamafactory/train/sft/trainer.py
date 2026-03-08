@@ -1200,6 +1200,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         embed_fn = unwrapped.get_input_embeddings()
 
+        # Build stop token ID set: eos_token_id + additional special tokens
+        # + model's generation_config EOS (covers cases where LlamaFactory's
+        # template system reassigns eos_token_id, leaving the original one out).
+        stop_token_ids: set[int] = set()
+        if self.processing_class.eos_token_id is not None:
+            stop_token_ids.add(self.processing_class.eos_token_id)
+        extra_ids = getattr(self.processing_class, "additional_special_tokens_ids", [])
+        if not isinstance(extra_ids, list):
+            extra_special_tokens = getattr(self.processing_class, "_extra_special_tokens", [])
+            string_tokens = [str(t) for t in extra_special_tokens]
+            extra_ids = self.processing_class.convert_tokens_to_ids(string_tokens)
+        for eid in extra_ids:
+            if eid is not None and eid != -1:
+                stop_token_ids.add(eid)
+        # Also pull from model.generation_config (may contain original eos_token_id
+        # that the template system replaced, e.g. <|endoftext|> for Qwen2.5)
+        gen_cfg = getattr(unwrapped, "generation_config", None)
+        if gen_cfg is not None:
+            gc_eos = getattr(gen_cfg, "eos_token_id", None)
+            if isinstance(gc_eos, list):
+                stop_token_ids.update(e for e in gc_eos if e is not None)
+            elif gc_eos is not None:
+                stop_token_ids.add(gc_eos)
+        logger.info_rank0(f"[entropy_analysis] Stop token IDs: {stop_token_ids}")
+
         # ---- Prepare output root ----
         analysis_root = os.path.join(self.args.output_dir, "entropy_analysis")
         os.makedirs(analysis_root, exist_ok=True)
@@ -1267,7 +1292,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     step_logits_list.append(last_logits.cpu())
                     generated_ids.append(next_id)
 
-                    if next_id == self.processing_class.eos_token_id:
+                    if next_id in stop_token_ids:
                         break
 
                     # Next step
