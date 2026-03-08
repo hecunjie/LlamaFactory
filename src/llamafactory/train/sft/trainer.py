@@ -1252,11 +1252,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 past_kv = prompt_out.past_key_values
                 last_logits = prompt_out.logits[0, -1, :]       # (vocab,)
                 last_hidden = prompt_out.hidden_states[-1][0, -1, :]  # (dim,)
-                # Save logits at prompt position -2 for Strategy B when pos=0.
-                # These logits predict prompt[-1], so weighted_embed ≈ embed(prompt[-1]).
-                prompt_prev_logits = (
-                    prompt_out.logits[0, -2, :].cpu() if prompt_len >= 2 else None
-                )
                 del prompt_out
 
                 for step in range(max_new_tokens):
@@ -1333,27 +1328,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # Step 3: Three-strategy probing at high-entropy positions
             #
             # For each high-entropy position `pos`:
-            #   gen[pos] was predicted with high entropy.
-            #   All 3 strategies PREDICT gen[pos] — the high-entropy token itself.
-            #
-            # In standard auto-regression, gen[pos] is predicted by:
-            #   KV cache = [prompt + gen[:pos-1]]  (context before the prev token)
-            #   input = embed(gen[pos-1])           (the previous token's embedding)
-            #   output logits → argmax = gen[pos]
+            #   gen[pos] was predicted with HIGH entropy (uncertain).
+            #   All 3 strategies share KV cache = [prompt + gen[:pos]].
+            #   Each feeds a DIFFERENT embedding of gen[pos] and the model
+            #   predicts gen[pos+1].
             #
             # Strategies:
-            #   A (hidden_norm): standardise then L2-normalise the hidden state
-            #       that predicted gen[pos] → feed as input → predict gen[pos]
+            #   C (standard_embed): embed(gen[pos]) — baseline word embedding.
+            #   A (hidden_norm): standardise + L2-normalise the hidden state
+            #       that PREDICTED gen[pos] (high entropy, before LM head).
             #   B (logit_weighted_embed): weighted_embed from the logits that
-            #       predicted gen[pos-1] (peaks at gen[pos-1]), so the embed
-            #       ≈ embed(gen[pos-1]) → feed at the same position as C
-            #       → predict gen[pos]
-            #   C (standard_embed): embed(gen[pos-1]) — baseline, argmax == gen[pos]
+            #       PREDICTED gen[pos] (high entropy, after LM head).
+            #       Softmax is spread → blend of many token embeddings.
             #
-            # step_hidden_states[pos] / step_logits_list[pos] from Step 1 are
-            # the hidden/logits that predict gen[pos].
-            # step_logits_list[pos-1] are the logits that predict gen[pos-1]
-            # (used by Strategy B).
+            # All three represent "gen[pos]" differently:
+            #   C = the discrete word embedding lookup
+            #   A = the model's internal uncertain representation (pre-LM-head)
+            #   B = the model's output distribution mapped back to embed space
+            # Comparing their predictions of gen[pos+1] reveals how the
+            # model propagates uncertainty through different representations.
             # ==================================================================
             for pos in topk_positions:
                 greedy_token_id = generated_ids[pos]
@@ -1361,35 +1354,35 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     [greedy_token_id], skip_special_tokens=False
                 )
 
-                # Context text: everything the model knew when predicting gen[pos]
-                context_ids = generated_ids[:pos] if pos > 0 else []
+                # Context text: prompt + generated tokens up to gen[pos]
+                context_ids = generated_ids[: pos + 1] if pos >= 0 else []
                 context_text = prompt_text + self.processing_class.decode(
                     context_ids, skip_special_tokens=False
                 )
 
-                # Hidden state & logits that PREDICT gen[pos] (recorded in Step 1)
+                # Need gen[pos+1] to exist for meaningful comparison
+                if pos + 1 >= gen_len:
+                    continue
+                actual_next_id = generated_ids[pos + 1]
+                actual_next_text = self.processing_class.decode(
+                    [actual_next_id], skip_special_tokens=False
+                )
+
+                # Hidden state & logits that PREDICTED gen[pos] (recorded in Step 1).
+                # This is the HIGH-ENTROPY position — the distribution is spread out.
+                # Strategy A uses hidden (before LM head), Strategy B uses logits
+                # (after LM head).  Both capture the model's uncertain representation.
                 pos_hidden = step_hidden_states[pos].to(device)   # (dim,)
                 pos_logits = step_logits_list[pos].to(device)     # (vocab,)
 
-                # Previous token: whose embedding Strategy C will feed
-                if pos > 0:
-                    prev_token_id = generated_ids[pos - 1]
-                else:
-                    prev_token_id = prompt_ids[-1].item()
-
-                # Base KV cache: everything BEFORE the previous token
-                #   pos=0 → prev=last_prompt_token → KV = prompt[:-1]
-                #   pos=1 → prev=gen[0]            → KV = prompt
-                #   pos≥2 → prev=gen[pos-1]        → KV = [prompt + gen[:pos-1]]
+                # Base KV cache: [prompt + gen[:pos]]  (everything BEFORE gen[pos])
+                #   pos=0 → KV = prompt
+                #   pos≥1 → KV = [prompt + gen[:pos]]
                 if pos == 0:
-                    if prompt_len <= 1:
-                        continue  # can't build context without the prev token
-                    base_prefix = prompt_ids[:-1]
-                elif pos == 1:
                     base_prefix = prompt_ids
                 else:
                     gen_prefix = torch.tensor(
-                        generated_ids[: pos - 1], dtype=torch.long, device=device
+                        generated_ids[:pos], dtype=torch.long, device=device
                     )
                     base_prefix = torch.cat([prompt_ids, gen_prefix], dim=0)
 
@@ -1397,27 +1390,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 attn_mask = torch.ones(1, base_ctx_len + 1, device=device, dtype=torch.long)
 
                 with torch.no_grad():
-                    # ---- Strategy C: embed(prev_token) → predict gen[pos] ----
-                    # This is the standard autoregressive input; argmax must = gen[pos].
+                    # ---- Strategy C: embed(gen[pos]) → predict gen[pos+1] ----
+                    # Standard word embedding of the high-entropy token.
                     ctx_out_c = unwrapped(
                         input_ids=base_prefix.unsqueeze(0), use_cache=True,
                     )
                     ctx_kv_c = ctx_out_c.past_key_values
                     del ctx_out_c
 
-                    prev_embed = embed_fn(
-                        torch.tensor([[prev_token_id]], device=device)
+                    pos_embed = embed_fn(
+                        torch.tensor([[greedy_token_id]], device=device)
                     )
                     out_c = unwrapped(
-                        inputs_embeds=prev_embed,
+                        inputs_embeds=pos_embed,
                         attention_mask=attn_mask,
                         past_key_values=ctx_kv_c,
                     )
                     logits_c = out_c.logits[0, -1, :].clone()
                     del out_c, ctx_kv_c
-                    l2_norm_c = prev_embed.float().squeeze().norm().item()
+                    l2_norm_c = pos_embed.float().squeeze().norm().item()
 
-                    # ---- Strategy A: normalize(hidden of gen[pos]) ----
+                    # ---- Strategy A: normalize(hidden that predicted gen[pos]) ----
                     ctx_out_a = unwrapped(
                         input_ids=base_prefix.unsqueeze(0), use_cache=True,
                     )
@@ -1440,25 +1433,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits_a = out_a.logits[0, -1, :].clone()
                     del out_a, ctx_kv_a
 
-                    # ---- Strategy B: weighted_embed from PREVIOUS step's logits ----
-                    # step_logits_list[pos] predicts gen[pos] → softmax peaks at
-                    # gen[pos] → weighted_embed ≈ embed(gen[pos]) → model predicts
-                    # gen[pos+1].  To predict gen[pos] we need the logits that
-                    # predicted gen[pos-1]: their softmax peaks at gen[pos-1], so
-                    # weighted_embed ≈ embed(gen[pos-1]), same position as C.
+                    # ---- Strategy B: weighted_embed from HIGH-ENTROPY logits ----
+                    # pos_logits = step_logits_list[pos] predicted gen[pos] with
+                    # high entropy → softmax is spread out → weighted_embed is a
+                    # blend of many token embeddings, genuinely different from C's
+                    # single-token embed(gen[pos]).
                     ctx_out_b = unwrapped(
                         input_ids=base_prefix.unsqueeze(0), use_cache=True,
                     )
                     ctx_kv_b = ctx_out_b.past_key_values
                     del ctx_out_b
 
-                    if pos > 0:
-                        b_logits = step_logits_list[pos - 1].to(device)
-                    elif prompt_prev_logits is not None:
-                        b_logits = prompt_prev_logits.to(device)
-                    else:
-                        b_logits = pos_logits  # fallback (pos=0, prompt_len<2)
-                    b_probs = torch.softmax(b_logits.float(), dim=-1)  # (vocab,)
+                    b_probs = torch.softmax(pos_logits.float(), dim=-1)  # (vocab,)
                     prob_mask = b_probs > logit_weight_threshold
                     filtered_probs = b_probs * prob_mask.float()
                     prob_sum = filtered_probs.sum()
@@ -1506,6 +1492,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         "original_entropy": round(step_entropies[pos], 6),
                         "greedy_token": greedy_token_text,
                         "greedy_token_id": greedy_token_id,
+                        "actual_next_token": actual_next_text,
+                        "actual_next_token_id": actual_next_id,
                         "strategy": strat_name,
                         "input_embed_l2_norm": round(strat_l2, 6),
                         "strategy_entropy": round(entropy_val, 6),
