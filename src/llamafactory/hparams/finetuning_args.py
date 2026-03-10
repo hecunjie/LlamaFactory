@@ -554,6 +554,28 @@ class FinetuningArguments(
         default=0.6,
         metadata={"help": "Weight of Strategy A in the blended Strategy D: D = alpha * A_embed + (1-alpha) * B_embed. Default 0.6."},
     )
+    do_mark_low_confidence: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to run low-confidence position marking. "
+                "Performs teacher-forcing forward on the eval dataset, identifies "
+                "positions where the model's probability for the correct next token "
+                "is below `low_confidence_prob_threshold`, inserts <add_think> tokens "
+                "after those positions, and saves the augmented dataset as JSONL."
+            )
+        },
+    )
+    low_confidence_prob_threshold: float = field(
+        default=0.3,
+        metadata={
+            "help": (
+                "Probability threshold for marking low-confidence positions. "
+                "Positions where the model assigns less than this probability to the "
+                "correct next token (within the response portion) are marked with <add_think>."
+            )
+        },
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},

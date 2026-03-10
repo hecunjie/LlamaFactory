@@ -1573,3 +1573,195 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             f"[entropy_analysis] Done. Results saved under {analysis_root} "
             f"({num_samples} sample folders)."
         )
+
+    def mark_low_confidence_positions(
+        self,
+        dataset: "Dataset",
+        prob_threshold: float = 0.3,
+        max_seq_len: int = 4096,
+    ) -> None:
+        r"""Identify low-confidence positions via teacher-forcing and insert ``<add_think>`` markers.
+
+        For every sample in *dataset*:
+        1. **Teacher-forcing forward** – feed the full ``input_ids`` to the model
+           (single forward, no generation) and collect the softmax probability
+           assigned to each ground-truth next token.
+        2. **Mark low-confidence positions** – positions (within the *response*
+           portion only, i.e. where ``labels != IGNORE_INDEX``) whose probability
+           falls below ``prob_threshold`` are flagged.
+        3. **Insert ``<add_think>``** – a new ``<add_think>`` token is inserted
+           *after* every flagged position in both ``input_ids`` and ``labels``
+           (the inserted label is set to ``IGNORE_INDEX`` so it does not
+           contribute to the training loss).
+        4. **Save** – the augmented dataset is written as a JSONL file under
+           ``output_dir/low_confidence_marked/marked_dataset.jsonl``.
+
+        The JSONL includes fields: ``input_ids``, ``labels``, ``marked_positions``
+        (list of original indices where ``<add_think>`` was inserted), and
+        ``marked_tokens`` (the tokens at those positions for readability).
+
+        Args:
+            dataset: Evaluation / train dataset with ``input_ids`` and ``labels``.
+            prob_threshold: Probability ceiling – positions where the model
+                assigns less than this to the correct next token are marked.
+            max_seq_len: Maximum sequence length after insertion.  If the
+                augmented sequence would exceed this, it is truncated.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        logger.info_rank0(
+            f"[mark_low_conf] Starting low-confidence marking "
+            f"(threshold={prob_threshold}) …"
+        )
+
+        # ---- Unwrap model ----
+        unwrapped = self.model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        unwrapped.eval()
+        device = next(unwrapped.parameters()).device
+
+        # ---- Ensure <add_think> is in the tokenizer ----
+        add_think_token = "<add_think>"
+        num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
+        if num_added > 0:
+            unwrapped.resize_token_embeddings(len(self.processing_class))
+            logger.info_rank0(
+                f"[mark_low_conf] Added '{add_think_token}' to tokenizer "
+                f"(new vocab size={len(self.processing_class)})"
+            )
+        add_think_id = self.processing_class.convert_tokens_to_ids(add_think_token)
+        logger.info_rank0(f"[mark_low_conf] <add_think> token id = {add_think_id}")
+
+        # ---- Output directory ----
+        out_dir = os.path.join(self.args.output_dir, "low_confidence_marked")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "marked_dataset.jsonl")
+
+        num_samples = len(dataset)
+        total_marked = 0
+
+        with open(out_path, "w", encoding="utf-8") as fout:
+            for sample_idx in range(num_samples):
+                input_ids_list: list[int] = list(dataset[sample_idx]["input_ids"])
+                labels_list: list[int] = list(dataset[sample_idx]["labels"])
+                seq_len = len(input_ids_list)
+
+                # Find prompt / response boundary
+                prompt_end = seq_len  # fallback: all prompt
+                for _j, _lbl in enumerate(labels_list):
+                    if _lbl != IGNORE_INDEX:
+                        prompt_end = _j
+                        break
+
+                prompt_text = self.processing_class.decode(
+                    input_ids_list[:prompt_end], skip_special_tokens=False
+                )
+
+                if seq_len < 2:
+                    # Nothing to predict
+                    response_text = self.processing_class.decode(
+                        input_ids_list[prompt_end:], skip_special_tokens=False
+                    )
+                    fout.write(json.dumps({
+                        "prompt": prompt_text,
+                        "marked_response": response_text,
+                        "input_ids": input_ids_list,
+                        "labels": labels_list,
+                        "marked_positions": [],
+                        "marked_tokens": [],
+                        "marked_probs": [],
+                    }, ensure_ascii=False) + "\n")
+                    continue
+
+                # ---- Teacher-forcing forward ----
+                input_tensor = torch.tensor(
+                    [input_ids_list], dtype=torch.long, device=device
+                )  # (1, seq_len)
+
+                with torch.no_grad():
+                    outputs = unwrapped(
+                        input_ids=input_tensor,
+                        use_cache=False,
+                    )
+                    logits = outputs.logits[0]  # (seq_len, vocab)
+                    del outputs
+
+                # logits[t] predicts token at position t+1
+                # So for position t+1, the probability is softmax(logits[t])[input_ids[t+1]]
+                probs = torch.softmax(logits.float(), dim=-1)  # (seq_len, vocab)
+
+                # Compute probability of the actual next token at each position
+                # next_token_probs[t] = P(input_ids[t+1] | input_ids[:t+1])
+                next_ids = torch.tensor(
+                    input_ids_list[1:], dtype=torch.long, device=device
+                )  # (seq_len-1,)
+                next_token_probs = probs[:-1].gather(
+                    1, next_ids.unsqueeze(1)
+                ).squeeze(1)  # (seq_len-1,)
+
+                # ---- Identify low-confidence positions (response only) ----
+                # labels[t] != IGNORE_INDEX means position t is in the response.
+                # We want to mark position t if the model's prediction OF t
+                # (i.e. logits[t-1] → token t) has low probability.
+                # next_token_probs[t-1] corresponds to predicting position t.
+                marked_positions: list[int] = []  # original positions (0-indexed)
+                marked_tokens: list[str] = []
+                marked_probs: list[float] = []
+
+                for t in range(1, seq_len):
+                    if labels_list[t] == IGNORE_INDEX:
+                        continue  # skip prompt positions
+                    p = next_token_probs[t - 1].item()
+                    if p < prob_threshold:
+                        marked_positions.append(t)
+                        marked_tokens.append(
+                            self.processing_class.decode(
+                                [input_ids_list[t]], skip_special_tokens=False
+                            )
+                        )
+                        marked_probs.append(round(p, 6))
+
+                total_marked += len(marked_positions)
+
+                # ---- Insert <add_think> after each marked position ----
+                # We iterate in reverse so earlier indices stay valid.
+                new_input_ids = list(input_ids_list)
+                new_labels = list(labels_list)
+
+                for ins_pos in reversed(marked_positions):
+                    # Insert AFTER position ins_pos → at index ins_pos + 1
+                    new_input_ids.insert(ins_pos + 1, add_think_id)
+                    new_labels.insert(ins_pos + 1, IGNORE_INDEX)
+
+                # Truncate if too long
+                if len(new_input_ids) > max_seq_len:
+                    new_input_ids = new_input_ids[:max_seq_len]
+                    new_labels = new_labels[:max_seq_len]
+
+                # Decode the marked response: response portion of the new sequence
+                # The prompt part is unchanged; response starts at prompt_end but
+                # insertion shifts indices, so count how many <add_think> were
+                # inserted before prompt_end (should be 0 since we only mark
+                # response positions) — just use prompt_end directly.
+                marked_response_text = self.processing_class.decode(
+                    new_input_ids[prompt_end:], skip_special_tokens=False
+                )
+
+                # ---- Write JSONL ----
+                fout.write(json.dumps({
+                    "prompt": prompt_text,
+                    "response": marked_response_text,
+                }, ensure_ascii=False) + "\n")
+
+                if (sample_idx + 1) % 50 == 0 or sample_idx == num_samples - 1:
+                    logger.info_rank0(
+                        f"[mark_low_conf] Processed {sample_idx + 1}/{num_samples} samples, "
+                        f"total marked positions so far: {total_marked}"
+                    )
+
+        logger.info_rank0(
+            f"[mark_low_conf] Done. {total_marked} positions marked across "
+            f"{num_samples} samples. Saved to {out_path}"
+        )

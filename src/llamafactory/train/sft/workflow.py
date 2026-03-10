@@ -223,5 +223,24 @@ def run_sft(
                     blend_alpha=finetuning_args.entropy_blend_alpha,
                 )
 
+    # Mark low-confidence positions with <add_think>
+    if finetuning_args.do_mark_low_confidence:
+        eval_dataset = dataset_module.get("eval_dataset")
+        if eval_dataset is None:
+            logger.warning_rank0("No eval_dataset found. Skipping low-confidence marking.")
+        else:
+            if isinstance(eval_dataset, dict):
+                for split_name, split_ds in eval_dataset.items():
+                    logger.info_rank0(f"Running low-confidence marking on split: {split_name}")
+                    trainer.mark_low_confidence_positions(
+                        dataset=split_ds,
+                        prob_threshold=finetuning_args.low_confidence_prob_threshold,
+                    )
+            else:
+                trainer.mark_low_confidence_positions(
+                    dataset=eval_dataset,
+                    prob_threshold=finetuning_args.low_confidence_prob_threshold,
+                )
+
     # Create model card
     create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
