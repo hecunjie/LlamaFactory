@@ -1155,13 +1155,23 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         max_new_tokens: int = 512,
         logit_weight_threshold: float = 0.01,
         blend_alpha: float = 0.6,
+        use_answer_tokens: bool = False,
     ) -> None:
-        r"""Analyze token-level entropy during autoregressive generation and compare
-        three input strategies at the highest-entropy positions.
+        r"""Analyze token-level entropy and compare three input strategies at the
+        highest-entropy positions.
+
+        Two modes are available, controlled by ``use_answer_tokens``:
+
+        - **Generation mode** (``use_answer_tokens=False``, default):
+          greedy-decode from the prompt and analyse the model's own trajectory.
+        - **Answer mode** (``use_answer_tokens=True``):
+          use the ground-truth answer tokens from the dataset and run a single
+          teacher-forcing forward pass to obtain the entropy landscape on the
+          reference answer.  ``max_new_tokens`` is ignored in this mode.
 
         For each sample in *dataset*:
-        1. **Autoregressive generation** – greedy-decode from the prompt while
-           recording the output distribution (entropy) at every generated step.
+        1. **Obtain trajectory** – either autoregressive generation or
+           teacher-forcing on the answer (see above).
         2. **Identify top-k% entropy positions** – pick the top ``top_k_entropy_pct``
            percent of positions where the model was most uncertain.
         3. **Three-strategy probing** – at each high-entropy position, re-run a
@@ -1186,11 +1196,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             logit_weight_threshold: Minimum probability for a token to participate
                 in the Strategy B weighted embedding. Tokens below this are
                 discarded and remaining probabilities are re-normalised.
+            use_answer_tokens: If True, analyse entropy on the ground-truth answer
+                tokens via teacher-forcing instead of autoregressive generation.
         """
         if not self.is_world_process_zero():
             return
 
-        logger.info_rank0("[entropy_analysis] Starting entropy-strategy analysis …")
+        mode_label = "answer (teacher-forcing)" if use_answer_tokens else "generation (autoregressive)"
+        logger.info_rank0(f"[entropy_analysis] Starting entropy-strategy analysis (mode: {mode_label}) …")
 
         # ---- Unwrap model ----
         unwrapped = self.model
@@ -1261,55 +1274,94 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             prompt_text = self.processing_class.decode(prompt_only_ids, skip_special_tokens=False)
 
             # ==================================================================
-            # Step 1: Autoregressive generation with entropy recording
+            # Step 1: Obtain trajectory with entropy recording
             # ==================================================================
             generated_ids: list[int] = []
             step_entropies: list[float] = []
             step_hidden_states: list[torch.Tensor] = []   # last-layer hidden state at each step
             step_logits_list: list[torch.Tensor] = []      # logits at each step
 
-            with torch.no_grad():
-                # Forward the prompt
-                prompt_out = unwrapped(
-                    input_ids=prompt_ids.unsqueeze(0),
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                past_kv = prompt_out.past_key_values
-                last_logits = prompt_out.logits[0, -1, :]       # (vocab,)
-                last_hidden = prompt_out.hidden_states[-1][0, -1, :]  # (dim,)
-                del prompt_out
+            if use_answer_tokens:
+                # -- Answer mode: teacher-forcing on ground-truth answer tokens --
+                answer_ids = input_ids_list[prompt_end:]
+                if len(answer_ids) == 0:
+                    logger.warning_rank0(
+                        f"[entropy_analysis] Sample {sample_idx}: empty answer, skipping."
+                    )
+                    continue
 
-                for step in range(max_new_tokens):
-                    # Compute entropy of current logits
-                    probs = torch.softmax(last_logits.float(), dim=-1)
+                full_ids = torch.tensor(
+                    [input_ids_list], dtype=torch.long, device=device
+                )  # (1, seq_len)
+                with torch.no_grad():
+                    outputs = unwrapped(
+                        input_ids=full_ids,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+                    all_logits = outputs.logits[0]              # (seq_len, vocab)
+                    all_hidden = outputs.hidden_states[-1][0]   # (seq_len, dim)
+                    del outputs
+
+                generated_ids = list(answer_ids)
+                # logits[t] predicts token at t+1.
+                # Answer token at index prompt_end+pos is predicted by logits[prompt_end+pos-1].
+                for pos in range(len(answer_ids)):
+                    logit_idx = prompt_end + pos - 1
+                    logits_at_pos = all_logits[logit_idx]   # (vocab,)
+                    hidden_at_pos = all_hidden[logit_idx]    # (dim,)
+
+                    probs = torch.softmax(logits_at_pos.float(), dim=-1)
                     log_probs = torch.log(probs + 1e-12)
                     entropy = -(probs * log_probs).sum().item()
 
-                    next_id = last_logits.argmax(dim=-1).item()
-
                     step_entropies.append(entropy)
-                    step_hidden_states.append(last_hidden.cpu())
-                    step_logits_list.append(last_logits.cpu())
-                    generated_ids.append(next_id)
+                    step_hidden_states.append(hidden_at_pos.cpu())
+                    step_logits_list.append(logits_at_pos.cpu())
 
-                    if next_id in stop_token_ids:
-                        break
+                del all_logits, all_hidden
 
-                    # Next step
-                    next_embed = embed_fn(torch.tensor([[next_id]], device=device))
-                    step_out = unwrapped(
-                        inputs_embeds=next_embed,
-                        past_key_values=past_kv,
+            else:
+                # -- Generation mode: autoregressive greedy decoding --
+                with torch.no_grad():
+                    prompt_out = unwrapped(
+                        input_ids=prompt_ids.unsqueeze(0),
                         use_cache=True,
                         output_hidden_states=True,
                     )
-                    past_kv = step_out.past_key_values
-                    last_logits = step_out.logits[0, -1, :]
-                    last_hidden = step_out.hidden_states[-1][0, -1, :]
-                    del step_out
+                    past_kv = prompt_out.past_key_values
+                    last_logits = prompt_out.logits[0, -1, :]       # (vocab,)
+                    last_hidden = prompt_out.hidden_states[-1][0, -1, :]  # (dim,)
+                    del prompt_out
 
-                del past_kv
+                    for step in range(max_new_tokens):
+                        probs = torch.softmax(last_logits.float(), dim=-1)
+                        log_probs = torch.log(probs + 1e-12)
+                        entropy = -(probs * log_probs).sum().item()
+
+                        next_id = last_logits.argmax(dim=-1).item()
+
+                        step_entropies.append(entropy)
+                        step_hidden_states.append(last_hidden.cpu())
+                        step_logits_list.append(last_logits.cpu())
+                        generated_ids.append(next_id)
+
+                        if next_id in stop_token_ids:
+                            break
+
+                        next_embed = embed_fn(torch.tensor([[next_id]], device=device))
+                        step_out = unwrapped(
+                            inputs_embeds=next_embed,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                            output_hidden_states=True,
+                        )
+                        past_kv = step_out.past_key_values
+                        last_logits = step_out.logits[0, -1, :]
+                        last_hidden = step_out.hidden_states[-1][0, -1, :]
+                        del step_out
+
+                    del past_kv
 
             gen_len = len(generated_ids)
             if gen_len == 0:
