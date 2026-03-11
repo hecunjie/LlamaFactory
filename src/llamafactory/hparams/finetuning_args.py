@@ -554,6 +554,15 @@ class FinetuningArguments(
         default=0.6,
         metadata={"help": "Weight of Strategy A in the blended Strategy D: D = alpha * A_embed + (1-alpha) * B_embed. Default 0.6."},
     )
+    entropy_use_answer_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, entropy analysis uses ground-truth answer tokens via teacher-forcing "
+                "instead of autoregressive generation. entropy_max_new_tokens is ignored in this mode."
+            )
+        },
+    )
     do_mark_low_confidence: bool = field(
         default=False,
         metadata={
