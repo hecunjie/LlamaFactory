@@ -563,6 +563,16 @@ class FinetuningArguments(
             )
         },
     )
+    entropy_hidden_drop_last_kv: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, Strategy A (hidden_norm) uses a KV cache that is one token shorter "
+                "than the other strategies: gen[pos-1] is excluded from the attention context. "
+                "Has no effect when pos==0. B / C / D are unaffected."
+            )
+        },
+    )
     do_mark_low_confidence: bool = field(
         default=False,
         metadata={

@@ -1156,6 +1156,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         logit_weight_threshold: float = 0.01,
         blend_alpha: float = 0.6,
         use_answer_tokens: bool = False,
+        hidden_drop_last_kv: bool = False,
     ) -> None:
         r"""Analyze token-level entropy and compare three input strategies at the
         highest-entropy positions.
@@ -1198,6 +1199,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 discarded and remaining probabilities are re-normalised.
             use_answer_tokens: If True, analyse entropy on the ground-truth answer
                 tokens via teacher-forcing instead of autoregressive generation.
+            hidden_drop_last_kv: If True, Strategy A (hidden_norm) uses a KV cache
+                that is one token shorter than the other strategies: instead of
+                ``[prompt + gen[:pos]]`` it uses ``[prompt + gen[:pos-1]]``, i.e.
+                the last token before the high-entropy position is excluded from the
+                attention context.  When ``pos == 0`` there is no preceding generated
+                token to drop, so Strategy A falls back to the prompt-only KV cache
+                (same as the other strategies).  B / C / D are unaffected.
         """
         if not self.is_world_process_zero():
             return
@@ -1489,8 +1497,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     l2_norm_c = pos_embed.float().squeeze().norm().item()
 
                     # ---- Strategy A: normalize(hidden that predicted gen[pos]) ----
+                    # When hidden_drop_last_kv=True, use a KV cache that excludes
+                    # the last token before pos (i.e. [prompt + gen[:pos-1]]).
+                    # At pos==0 there is no token to drop, so fall back to base_prefix.
+                    if hidden_drop_last_kv and pos > 0:
+                        if pos == 1:
+                            a_prefix = prompt_ids
+                        else:
+                            a_prefix = torch.cat(
+                                [prompt_ids,
+                                 torch.tensor(generated_ids[:pos - 1], dtype=torch.long, device=device)],
+                                dim=0,
+                            )
+                        a_ctx_len = a_prefix.shape[0]
+                        a_attn_mask = torch.ones(1, a_ctx_len + 1, device=device, dtype=torch.long)
+                    else:
+                        a_prefix = base_prefix
+                        a_ctx_len = base_ctx_len
+                        a_attn_mask = attn_mask
+
                     ctx_out_a = unwrapped(
-                        input_ids=base_prefix.unsqueeze(0), use_cache=True,
+                        input_ids=a_prefix.unsqueeze(0), use_cache=True,
                     )
                     ctx_kv_a = ctx_out_a.past_key_values
                     del ctx_out_a
@@ -1502,7 +1529,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     normed_h = normed_h.unsqueeze(0).unsqueeze(0)  # (1,1,dim)
                     out_a = unwrapped(
                         inputs_embeds=normed_h,
-                        attention_mask=attn_mask,
+                        attention_mask=a_attn_mask,
                         past_key_values=ctx_kv_a,
                     )
                     logits_a = out_a.logits[0, -1, :].clone()

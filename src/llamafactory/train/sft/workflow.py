@@ -213,6 +213,7 @@ def run_sft(
                         logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
                         blend_alpha=finetuning_args.entropy_blend_alpha,
                         use_answer_tokens=finetuning_args.entropy_use_answer_tokens,
+                        hidden_drop_last_kv=finetuning_args.entropy_hidden_drop_last_kv,
                     )
             else:
                 trainer.analyze_entropy_strategies(
@@ -223,6 +224,7 @@ def run_sft(
                     logit_weight_threshold=finetuning_args.entropy_logit_weight_threshold,
                     blend_alpha=finetuning_args.entropy_blend_alpha,
                     use_answer_tokens=finetuning_args.entropy_use_answer_tokens,
+                    hidden_drop_last_kv=finetuning_args.entropy_hidden_drop_last_kv,
                 )
 
     # Mark low-confidence positions with <add_think>
