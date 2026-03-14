@@ -408,6 +408,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         def _past_length(past_kv):
             if past_kv is None:
                 return 0
+            # DynamicCache (transformers 4.36+) has get_seq_length(); older caches are tuple
+            if hasattr(past_kv, "get_seq_length"):
+                return past_kv.get_seq_length()
             return past_kv[0][0].size(2)
 
         batch_size, max_len = input_ids.shape
