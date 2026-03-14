@@ -573,6 +573,17 @@ class FinetuningArguments(
             )
         },
     )
+    recurrent_add_think_training: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use recurrent forward for <add_think>: at <add_think> and the next "
+                "token, input is the previous position's hidden state (through a learnable "
+                "LayerNorm) instead of token embeddings. Loss ignores <add_think> targets; "
+                "whole batch uses this branch when enabled."
+            )
+        },
+    )
     do_mark_low_confidence: bool = field(
         default=False,
         metadata={

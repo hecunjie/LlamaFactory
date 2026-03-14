@@ -390,6 +390,181 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return avg_loss, latent_hs_list, suffix_preds_list
 
+    def _forward_recurrent_add_think(
+        self,
+        model: "torch.nn.Module",
+        input_ids: "torch.Tensor",
+        attention_mask: "torch.Tensor",
+        labels: "torch.Tensor",
+        add_think_id: int,
+    ) -> "torch.Tensor":
+        r"""Forward with recurrent <add_think>: at <add_think> and the next token,
+        input is the previous position's hidden state (through a learnable LayerNorm)
+        instead of token embeddings. Loss ignores <add_think> targets.
+
+        Segment-based: forward normal spans in one go, then two single-step forwards
+        (hidden -> logits at <add_think>, hidden -> logits at next token) between spans.
+        """
+        def _past_length(past_kv):
+            if past_kv is None:
+                return 0
+            return past_kv[0][0].size(2)
+
+        batch_size, max_len = input_ids.shape
+        device = input_ids.device
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        embed_fn = unwrapped.get_input_embeddings()
+        hidden_size = embed_fn.weight.shape[1]
+        vocab_size = embed_fn.weight.shape[0]
+
+        # Ensure learnable LayerNorm for hidden-as-input (registered on model so it is trained)
+        if not hasattr(unwrapped, "add_think_hidden_norm"):
+            add_think_norm = torch.nn.LayerNorm(hidden_size, device=device, dtype=next(unwrapped.parameters()).dtype)
+            setattr(unwrapped, "add_think_hidden_norm", add_think_norm)
+        norm_fn = unwrapped.add_think_hidden_norm
+
+        # Disable gradient checkpointing to avoid use_cache / mask mismatch
+        _base_model = unwrapped
+        while hasattr(_base_model, "model"):
+            _base_model = _base_model.model
+        _gc_was_enabled = getattr(_base_model, "gradient_checkpointing", False)
+        if _gc_was_enabled:
+            _base_model.gradient_checkpointing_disable()
+
+        total_loss = torch.tensor(0.0, device=device)
+        valid_count = 0
+
+        for b in range(batch_size):
+            valid_len = int(attention_mask[b].sum().item())
+            if valid_len < 2:
+                continue
+            sample_ids = input_ids[b, :valid_len]
+            sample_labels = labels[b, :valid_len]
+
+            add_think_positions = (sample_ids == add_think_id).nonzero(as_tuple=True)[0]
+            if add_think_positions.dim() == 0:
+                add_think_positions = add_think_positions.unsqueeze(0)
+            add_think_positions = add_think_positions.cpu().tolist()
+
+            logits_dtype = next(unwrapped.parameters()).dtype
+            logits = torch.zeros(valid_len, vocab_size, device=device, dtype=logits_dtype)
+
+            past_kv = None
+            segment_last_h = None
+
+            if not add_think_positions:
+                # No <add_think>: one forward
+                out = model(
+                    input_ids=sample_ids.unsqueeze(0),
+                    attention_mask=attention_mask[b : b + 1, :valid_len],
+                    use_cache=False,
+                )
+                logits[:] = out.logits[0]
+                del out
+            else:
+                # Segment-based: [0, p0), then two steps at p0, p0+1; [p0+2, p1), two steps; ...
+                for i, p in enumerate(add_think_positions):
+                    start = add_think_positions[i - 1] + 2 if i > 0 else 0
+                    end = p
+
+                    # Forward segment [start, end)
+                    if start < end:
+                        seg_ids = sample_ids[start:end].unsqueeze(0)
+                        seg_len = end - start
+                        if past_kv is None:
+                            seg_attn = torch.ones(1, seg_len, device=device, dtype=attention_mask.dtype)
+                            out = model(
+                                input_ids=seg_ids,
+                                attention_mask=seg_attn,
+                                use_cache=True,
+                                output_hidden_states=True,
+                            )
+                        else:
+                            past_len = _past_length(past_kv)
+                            seg_attn = torch.ones(1, past_len + seg_len, device=device, dtype=attention_mask.dtype)
+                            seg_emb = embed_fn(sample_ids[start:end]).unsqueeze(0)
+                            out = model(
+                                inputs_embeds=seg_emb,
+                                attention_mask=seg_attn,
+                                past_key_values=past_kv,
+                                use_cache=True,
+                                output_hidden_states=True,
+                            )
+                        past_kv = out.past_key_values
+                        logits[start:end] = out.logits[0]
+                        segment_last_h = out.hidden_states[-1][0, -1, :]
+                        del out
+                    else:
+                        # Empty segment before first <add_think>: use embed as fallback for "previous hidden"
+                        if segment_last_h is None:
+                            segment_last_h = embed_fn(sample_ids[0:1]).squeeze(0)
+
+                    # Two steps: at p (input = norm(segment_last_h)), at p+1 (input = norm(h_p))
+                    if segment_last_h is None:
+                        segment_last_h = embed_fn(sample_ids[max(0, p - 1) : p + 1].narrow(0, 0, 1)).squeeze(0)
+                    h_in = norm_fn(segment_last_h.unsqueeze(0)).squeeze(0).unsqueeze(0).unsqueeze(0)
+                    step_len = _past_length(past_kv) + 1 if past_kv is not None else 1
+                    step_attn = torch.ones(1, step_len, device=device, dtype=attention_mask.dtype)
+                    out_p = model(
+                        inputs_embeds=h_in,
+                        attention_mask=step_attn,
+                        past_key_values=past_kv,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    past_kv = out_p.past_key_values
+                    logits[p] = out_p.logits[0, -1, :]
+                    h_p = out_p.hidden_states[-1][0, -1, :]
+                    del out_p
+
+                    if p + 1 < valid_len:
+                        h_in2 = norm_fn(h_p.unsqueeze(0)).squeeze(0).unsqueeze(0).unsqueeze(0)
+                        step_len2 = _past_length(past_kv) + 1
+                        step_attn2 = torch.ones(1, step_len2, device=device, dtype=attention_mask.dtype)
+                        out_p1 = model(
+                            inputs_embeds=h_in2,
+                            attention_mask=step_attn2,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                            output_hidden_states=True,
+                        )
+                        past_kv = out_p1.past_key_values
+                        logits[p + 1] = out_p1.logits[0, -1, :]
+                        segment_last_h = out_p1.hidden_states[-1][0, -1, :]
+                        del out_p1
+                    else:
+                        segment_last_h = h_p
+
+                # Last segment: [last_add_think+2, valid_len)
+                last_p = add_think_positions[-1]
+                start = last_p + 2
+                end = valid_len
+                if start < end and past_kv is not None:
+                    seg_emb = embed_fn(sample_ids[start:end]).unsqueeze(0)
+                    past_len = _past_length(past_kv)
+                    seg_len = end - start
+                    seg_attn = torch.ones(1, past_len + seg_len, device=device, dtype=attention_mask.dtype)
+                    out = model(
+                        inputs_embeds=seg_emb,
+                        attention_mask=seg_attn,
+                        past_key_values=past_kv,
+                        use_cache=False,
+                    )
+                    logits[start:end] = out.logits[0]
+                    del out
+
+            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+            sample_loss = loss_fn(logits.view(-1, vocab_size), sample_labels.view(-1))
+            total_loss = total_loss + sample_loss
+            valid_count += 1
+
+        if _gc_was_enabled:
+            _base_model.gradient_checkpointing_enable({"use_reentrant": False})
+
+        return total_loss / max(valid_count, 1)
+
     def _build_reasoning_inputs_from_latent_hs(
         self, model, latent_hs_list, reasoning_input_ids, reasoning_labels
     ):
@@ -561,6 +736,35 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     del outputs_r
 
             total_loss = loss_answer + w * loss_reasoning
+        elif self.finetuning_args.recurrent_add_think_training:
+            # ---- Recurrent <add_think> training: hidden as input at <add_think> and next token ----
+            # Ensure <add_think> is in the tokenizer so it is tokenized as one token
+            add_think_token = "<add_think>"
+            num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
+            if num_added > 0:
+                unwrapped = model
+                while hasattr(unwrapped, "module"):
+                    unwrapped = unwrapped.module
+                unwrapped.resize_token_embeddings(len(self.processing_class))
+                logger.info_rank0(
+                    f"[recurrent_add_think] Added '{add_think_token}' to tokenizer "
+                    f"(new vocab size={len(self.processing_class)})"
+                )
+            add_think_id = self.processing_class.convert_tokens_to_ids(add_think_token)
+            if isinstance(add_think_id, list):
+                add_think_id = add_think_id[0] if add_think_id else 0
+            if add_think_id is None or (isinstance(add_think_id, int) and add_think_id < 0):
+                add_think_id = getattr(self.processing_class, "unk_token_id", 0)
+            with self.compute_loss_context_manager():
+                total_loss = self._forward_recurrent_add_think(
+                    model,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    inputs["labels"],
+                    add_think_id,
+                )
+            loss_answer = total_loss
+            loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
             with self.compute_loss_context_manager():

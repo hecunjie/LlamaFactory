@@ -56,9 +56,24 @@ def run_sft(
         if num_added > 0:
             logger.info(f"Added {num_added} latent thinking tokens to vocabulary: {latent_tokens}")
 
+    # Add <add_think> to tokenizer before dataset is built so it is tokenized as one token
+    add_think_added = 0
+    if getattr(finetuning_args, "recurrent_add_think_training", False):
+        add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
+        if add_think_added > 0:
+            logger.info(f"Added '<add_think>' to tokenizer for recurrent_add_think_training (new vocab size={len(tokenizer)})")
+
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+
+    # Resize embeddings if we added <add_think> (model was loaded with previous vocab size)
+    if add_think_added > 0:
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        unwrapped.resize_token_embeddings(len(tokenizer))
+        logger.info(f"Resized model token embeddings to {len(tokenizer)} for '<add_think>'.")
 
     # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.
     # The model's final_norm (RMSNorm) is trained for the LM head and does NOT produce
