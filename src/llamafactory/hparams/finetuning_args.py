@@ -573,6 +573,15 @@ class FinetuningArguments(
             )
         },
     )
+    entropy_fit_hidden_to_topk: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, during entropy-strategy analysis fit normed_h with top-k word embeddings "
+                "at each high-entropy position and save results to sample_<idx>_hidden_topk_fit.csv."
+            )
+        },
+    )
     recurrent_add_think_training: bool = field(
         default=False,
         metadata={

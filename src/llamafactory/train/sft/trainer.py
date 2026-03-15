@@ -1366,6 +1366,50 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     "label": label
                 }, ensure_ascii=False) + "\n")
 
+    @staticmethod
+    def _fit_hidden_to_topk_embeddings(
+        hidden: "torch.Tensor",
+        topk_embedding: "torch.Tensor",
+        max_steps: int = 100,
+        lr: float = 0.1,
+    ) -> tuple["torch.Tensor", float]:
+        r"""Learn a probability distribution over top-k tokens so that the weighted
+        combination of their embeddings is maximally similar (cosine) to hidden.
+
+        Runs on CPU to avoid GPU memory/stream conflicts with the rest of the
+        analysis (model forward is on GPU under no_grad).
+
+        Args:
+            hidden: (dim,) L2-normalized hidden state.
+            topk_embedding: (top_k, dim) word embeddings of the top-k tokens.
+            max_steps: number of gradient steps.
+            lr: learning rate for the softmax logits.
+
+        Returns:
+            learned_p: (top_k,) probability distribution (sum=1), on CPU.
+            similarity_after: cosine similarity between (learned_p @ topk_embedding) and hidden.
+        """
+        hidden = hidden.detach().float().cpu()
+        topk_embedding = topk_embedding.detach().float().cpu()
+        k = topk_embedding.shape[0]
+        z = torch.zeros(k, dtype=torch.float32, requires_grad=True)
+        optimizer = torch.optim.Adam([z], lr=lr)
+        for _ in range(max_steps):
+            optimizer.zero_grad()
+            p = torch.softmax(z, dim=-1)
+            h_hat = (p.unsqueeze(0) @ topk_embedding).squeeze(0)
+            h_hat_norm = h_hat / (h_hat.norm() + 1e-8)
+            cos_sim = (h_hat_norm * hidden).sum()
+            loss = -cos_sim
+            loss.backward()
+            optimizer.step()
+        with torch.no_grad():
+            p = torch.softmax(z, dim=-1)
+            h_hat = (p.unsqueeze(0) @ topk_embedding).squeeze(0)
+            h_hat_norm = h_hat / (h_hat.norm() + 1e-8)
+            similarity_after = (h_hat_norm * hidden).sum().item()
+        return p.detach(), similarity_after
+
     def analyze_entropy_strategies(
         self,
         dataset: "Dataset",
@@ -1376,6 +1420,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         blend_alpha: float = 0.6,
         use_answer_tokens: bool = False,
         hidden_drop_last_kv: bool = False,
+        fit_hidden_to_topk: bool = False,
     ) -> None:
         r"""Analyze token-level entropy and compare three input strategies at the
         highest-entropy positions.
@@ -1409,6 +1454,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         Output structure (in ``output_dir/entropy_analysis/``):
           - ``sample_<idx>/entropy_positions.csv``
           - ``sample_<idx>/strategy_distributions.csv``
+          - ``sample_<idx>_hidden_topk_fit.csv`` (one separate CSV per sample: top-k tokens/probs,
+            learned distribution, similarity before/after fitting weighted embedding to hidden)
 
         Args:
             top_k_entropy_pct: Percentage (0–100) of generated positions to probe.
@@ -1425,6 +1472,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 attention context.  When ``pos == 0`` there is no preceding generated
                 token to drop, so Strategy A falls back to the prompt-only KV cache
                 (same as the other strategies).  B / C / D are unaffected.
+            fit_hidden_to_topk: If True, at each high-entropy position fit normed_h
+                with top-k word embeddings (learn a distribution over top-k so that
+                the weighted embedding matches the hidden) and save to
+                ``sample_<idx>_hidden_topk_fit.csv``.
         """
         if not self.is_world_process_zero():
             return
@@ -1609,6 +1660,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             positions_rows: list[dict] = []
             strategy_rows: list[dict] = []
+            hidden_fit_rows: list[dict] = []
 
             for rank, pos in enumerate(topk_positions):
                 # Build context string: prompt + generated tokens up to this position
@@ -1808,6 +1860,42 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits_d = out_d.logits[0, -1, :].clone()
                     del out_d, ctx_kv_d
 
+                if fit_hidden_to_topk:
+                    # ---- Fit normed_h with top-k word embeddings; write to hidden_topk_fit.csv ----
+                    hidden_vec = normed_h.squeeze(0).squeeze(0).detach().float()
+                    pos_probs = torch.softmax(pos_logits.float(), dim=-1)
+                    topk_probs_val, topk_ids_val = pos_probs.topk(top_k_tokens, dim=-1)
+                    topk_ids_val = topk_ids_val.squeeze(0)
+                    topk_probs_val = topk_probs_val.squeeze(0)
+                    topk_emb = embed_fn(topk_ids_val.unsqueeze(0)).squeeze(0).detach().float()
+                    weighted_before = (topk_probs_val.unsqueeze(0) @ topk_emb).squeeze(0)
+                    weighted_before_norm = weighted_before / (weighted_before.norm().item() + 1e-8)
+                    similarity_before = (weighted_before_norm * hidden_vec).sum().item()
+
+                    learned_p, similarity_after = self._fit_hidden_to_topk_embeddings(
+                        hidden_vec, topk_emb, max_steps=100, lr=0.1
+                    )
+
+                    topk_token_list_fit: list[str] = []
+                    topk_original_probs_dict: dict[str, float] = {}
+                    topk_learned_dict: dict[str, float] = {}
+                    for tk in range(top_k_tokens):
+                        tid = topk_ids_val[tk].item()
+                        ttext = self.processing_class.decode([tid], skip_special_tokens=False)
+                        topk_token_list_fit.append(ttext)
+                        topk_original_probs_dict[ttext] = round(topk_probs_val[tk].item(), 6)
+                        topk_learned_dict[ttext] = round(learned_p[tk].item(), 6)
+
+                    hidden_fit_rows.append({
+                        "sample_idx": sample_idx,
+                        "gen_position": pos,
+                        "topk_tokens": json.dumps(topk_token_list_fit, ensure_ascii=False),
+                        "topk_original_probs": json.dumps(topk_original_probs_dict, ensure_ascii=False),
+                        "topk_learned_probs": json.dumps(topk_learned_dict, ensure_ascii=False),
+                        "similarity_before": round(similarity_before, 6),
+                        "similarity_after": round(similarity_after, 6),
+                    })
+
                 # ---- Collect distributions for each strategy ----
                 strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed", "blend_AB"]
                 strategy_logits_list = [logits_a, logits_b, logits_c, logits_d]
@@ -1861,6 +1949,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     writer = csv.DictWriter(f, fieldnames=fieldnames_strat)
                     writer.writeheader()
                     writer.writerows(strategy_rows)
+
+            if fit_hidden_to_topk and hidden_fit_rows:
+                fit_csv = os.path.join(sample_dir, "hidden_topk_fit.csv")
+                fieldnames_fit = list(hidden_fit_rows[0].keys())
+                with open(fit_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames_fit)
+                    writer.writeheader()
+                    writer.writerows(hidden_fit_rows)
 
             if (sample_idx + 1) % 10 == 0 or sample_idx == num_samples - 1:
                 logger.info_rank0(
