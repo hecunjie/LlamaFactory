@@ -398,12 +398,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         labels: "torch.Tensor",
         add_think_id: int,
     ) -> "torch.Tensor":
-        r"""Forward with recurrent <add_think>: at <add_think> and the next token,
-        input is the previous position's hidden state (through a learnable LayerNorm)
-        instead of token embeddings. Loss ignores <add_think> targets.
+        r"""Forward with recurrent <add_think>: <add_think> is a placeholder; at that
+        position the input is the previous token's hidden state (through LayerNorm), and
+        the model "generates" one token (argmax of logits). The next position's input
+        is the word embedding of that generated token (not <add_think>). Loss ignores
+        <add_think> targets.
 
         Segment-based: forward normal spans in one go, then two single-step forwards
-        (hidden -> logits at <add_think>, hidden -> logits at next token) between spans.
+        (norm(prev_hidden) -> logits at <add_think>; embed(generated_token) -> logits at next) between spans.
         """
         def _past_length(past_kv):
             if past_kv is None:
@@ -504,7 +506,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         if segment_last_h is None:
                             segment_last_h = embed_fn(sample_ids[0:1]).squeeze(0)
 
-                    # Two steps: at p (input = norm(segment_last_h)), at p+1 (input = norm(h_p))
+                    # Two steps: at p (input = norm(segment_last_h), model "generates" one token);
+                    # at p+1 input = word embedding of that generated token (not <add_think>).
                     if segment_last_h is None:
                         segment_last_h = embed_fn(sample_ids[max(0, p - 1) : p + 1].narrow(0, 0, 1)).squeeze(0)
                     h_in = norm_fn(segment_last_h.unsqueeze(0)).squeeze(0).unsqueeze(0).unsqueeze(0)
@@ -518,16 +521,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         output_hidden_states=True,
                     )
                     past_kv = out_p.past_key_values
-                    logits[p] = out_p.logits[0, -1, :]
-                    h_p = out_p.hidden_states[-1][0, -1, :]
+                    logits[p] = out_p.logits[0, -1, :].clone()
+                    # Token "generated" at <add_think> position (argmax); next position's input = its embedding
+                    generated_token_id = logits[p].argmax(dim=-1).long().unsqueeze(0).unsqueeze(0)
                     del out_p
 
                     if p + 1 < valid_len:
-                        h_in2 = norm_fn(h_p.unsqueeze(0)).squeeze(0).unsqueeze(0).unsqueeze(0)
+                        next_embed = embed_fn(generated_token_id)
                         step_len2 = _past_length(past_kv) + 1
                         step_attn2 = torch.ones(1, step_len2, device=device, dtype=attention_mask.dtype)
                         out_p1 = model(
-                            inputs_embeds=h_in2,
+                            inputs_embeds=next_embed,
                             attention_mask=step_attn2,
                             past_key_values=past_kv,
                             use_cache=True,
@@ -538,7 +542,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         segment_last_h = out_p1.hidden_states[-1][0, -1, :]
                         del out_p1
                     else:
-                        segment_last_h = h_p
+                        segment_last_h = None
 
                 # Last segment: [last_add_think+2, valid_len)
                 last_p = add_think_positions[-1]
