@@ -1421,6 +1421,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         use_answer_tokens: bool = False,
         hidden_drop_last_kv: bool = False,
         fit_hidden_to_topk: bool = False,
+        analyze_at_add_think_positions: bool = False,
     ) -> None:
         r"""Analyze token-level entropy and compare three input strategies at the
         highest-entropy positions.
@@ -1476,6 +1477,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 with top-k word embeddings (learn a distribution over top-k so that
                 the weighted embedding matches the hidden) and save to
                 ``sample_<idx>_hidden_topk_fit.csv``.
+            analyze_at_add_think_positions: If True and ``use_answer_tokens`` is True,
+                use positions where the token is ``<add_think>`` for probing instead of
+                top-k%% highest-entropy positions. If a sample has no ``<add_think>``,
+                that sample is skipped. Requires ``<add_think>`` in the tokenizer.
         """
         if not self.is_world_process_zero():
             return
@@ -1646,13 +1651,35 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 continue
 
             # ==================================================================
-            # Step 2: Find top-k% highest-entropy positions
+            # Step 2: Positions to probe — either top-k% by entropy or <add_think> positions
             # ==================================================================
-            k = max(1, int(gen_len * top_k_entropy_pct / 100.0))
-            k = min(k, gen_len)
-            entropy_tensor = torch.tensor(step_entropies)
-            topk_vals, topk_indices = entropy_tensor.topk(k)
-            topk_positions = topk_indices.sort().values.tolist()  # sorted by position
+            if use_answer_tokens and analyze_at_add_think_positions:
+                add_think_token = "<add_think>"
+                num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
+                if num_added > 0:
+                    unwrapped.resize_token_embeddings(len(self.processing_class))
+                    logger.info_rank0(
+                        f"[entropy_analysis] Added '{add_think_token}' to tokenizer "
+                        f"(analyze_at_add_think_positions, new vocab size={len(self.processing_class)})"
+                    )
+                add_think_id = self.processing_class.convert_tokens_to_ids(add_think_token)
+                if isinstance(add_think_id, list):
+                    add_think_id = add_think_id[0] if add_think_id else -1
+                if add_think_id is None or add_think_id < 0:
+                    add_think_id = getattr(self.processing_class, "unk_token_id", -1)
+                topk_positions = [p for p in range(gen_len) if generated_ids[p] == add_think_id]
+                topk_positions.sort()
+                if not topk_positions:
+                    logger.warning_rank0(
+                        f"[entropy_analysis] Sample {sample_idx}: no <add_think> in trajectory, skipping."
+                    )
+                    continue
+            else:
+                k = max(1, int(gen_len * top_k_entropy_pct / 100.0))
+                k = min(k, gen_len)
+                entropy_tensor = torch.tensor(step_entropies)
+                topk_vals, topk_indices = entropy_tensor.topk(k)
+                topk_positions = topk_indices.sort().values.tolist()
 
             # ---- Per-sample output folder ----
             sample_dir = os.path.join(analysis_root, f"sample_{sample_idx}")

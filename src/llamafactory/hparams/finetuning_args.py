@@ -582,6 +582,16 @@ class FinetuningArguments(
             )
         },
     )
+    entropy_analyze_at_add_think_positions: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True and use_answer_tokens (answer-mode entropy analysis) is enabled, "
+                "probe at <add_think> token positions instead of top-k%% highest-entropy positions. "
+                "Samples with no <add_think> are skipped."
+            )
+        },
+    )
     recurrent_add_think_training: bool = field(
         default=False,
         metadata={

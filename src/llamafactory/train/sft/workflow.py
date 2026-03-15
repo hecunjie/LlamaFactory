@@ -230,6 +230,7 @@ def run_sft(
                         use_answer_tokens=finetuning_args.entropy_use_answer_tokens,
                         hidden_drop_last_kv=finetuning_args.entropy_hidden_drop_last_kv,
                         fit_hidden_to_topk=finetuning_args.entropy_fit_hidden_to_topk,
+                        analyze_at_add_think_positions=finetuning_args.entropy_analyze_at_add_think_positions,
                     )
             else:
                 trainer.analyze_entropy_strategies(
@@ -242,6 +243,7 @@ def run_sft(
                     use_answer_tokens=finetuning_args.entropy_use_answer_tokens,
                     hidden_drop_last_kv=finetuning_args.entropy_hidden_drop_last_kv,
                     fit_hidden_to_topk=finetuning_args.entropy_fit_hidden_to_topk,
+                    analyze_at_add_think_positions=finetuning_args.entropy_analyze_at_add_think_positions,
                 )
 
     # Mark low-confidence positions with <add_think>
