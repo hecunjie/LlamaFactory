@@ -401,8 +401,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         r"""Forward with recurrent <add_think>: <add_think> is a placeholder; at that
         position the input is the previous token's hidden state (through LayerNorm), and
         the model "generates" one token (argmax of logits). The next position's input
-        is the word embedding of that generated token (not <add_think>). Loss ignores
-        <add_think> targets.
+        is the word embedding of that generated token (not <add_think>). Loss includes
+        <add_think> as a target (where the next token is <add_think>).
 
         Segment-based: forward normal spans in one go, then two single-step forwards
         (norm(prev_hidden) -> logits at <add_think>; embed(generated_token) -> logits at next) between spans.
@@ -562,8 +562,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits[start:end] = out.logits[0]
                     del out
 
+            # Build effective labels: include <add_think> as target where next token is <add_think>
+            # (dataset may use IGNORE_INDEX there; we want loss for predicting <add_think>)
+            effective_labels = sample_labels.clone()
+            for idx in range(valid_len - 1):
+                next_id = sample_ids[idx + 1]
+                if (next_id if isinstance(next_id, int) else next_id.item()) == add_think_id:
+                    effective_labels[idx] = add_think_id
+
             loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-            sample_loss = loss_fn(logits.view(-1, vocab_size), sample_labels.view(-1))
+            sample_loss = loss_fn(logits.view(-1, vocab_size), effective_labels.view(-1))
             total_loss = total_loss + sample_loss
             valid_count += 1
 
