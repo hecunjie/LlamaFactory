@@ -761,6 +761,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 while hasattr(unwrapped, "module"):
                     unwrapped = unwrapped.module
                 unwrapped.resize_token_embeddings(len(self.processing_class))
+                if getattr(unwrapped.config, "tie_word_embeddings", False):
+                    unwrapped.tie_weights()
                 logger.info_rank0(
                     f"[recurrent_add_think] Added '{add_think_token}' to tokenizer "
                     f"(new vocab size={len(self.processing_class)})"
@@ -1658,6 +1660,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
                 if num_added > 0:
                     unwrapped.resize_token_embeddings(len(self.processing_class))
+                    if getattr(unwrapped.config, "tie_word_embeddings", False):
+                        unwrapped.tie_weights()
                     logger.info_rank0(
                         f"[entropy_analysis] Added '{add_think_token}' to tokenizer "
                         f"(analyze_at_add_think_positions, new vocab size={len(self.processing_class)})"
@@ -2048,6 +2052,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
         if num_added > 0:
             unwrapped.resize_token_embeddings(len(self.processing_class))
+            if getattr(unwrapped.config, "tie_word_embeddings", False):
+                unwrapped.tie_weights()
             logger.info_rank0(
                 f"[mark_low_conf] Added '{add_think_token}' to tokenizer "
                 f"(new vocab size={len(self.processing_class)})"

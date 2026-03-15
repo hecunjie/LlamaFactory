@@ -73,6 +73,8 @@ def run_sft(
         while hasattr(unwrapped, "module"):
             unwrapped = unwrapped.module
         unwrapped.resize_token_embeddings(len(tokenizer))
+        if getattr(unwrapped.config, "tie_word_embeddings", False):
+            unwrapped.tie_weights()
         logger.info(f"Resized model token embeddings to {len(tokenizer)} for '<add_think>'.")
 
     # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.
