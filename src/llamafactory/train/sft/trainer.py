@@ -1930,10 +1930,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     # ---- Use fitted top-k embedding as a new strategy (A_fit) and compare to Strategy A ----
                     with torch.no_grad():
                         # learned_p is (top_k,), topk_emb is (top_k, dim)
-                        fitted_vec = (learned_p.unsqueeze(0) @ topk_emb).squeeze(0)  # (dim,)
+                        # learned_p 从 CPU 优化得到，需要搬到与 topk_emb 相同的 device 上再做 matmul
+                        fitted_vec = (learned_p.to(topk_emb.device).unsqueeze(0) @ topk_emb).squeeze(0)  # (dim,)
                         # Optional: L2-normalise to make it comparable to normed_h
                         fitted_vec = fitted_vec / (fitted_vec.norm() + 1e-8)
-                        fitted_vec = fitted_vec.to(pos_hidden.dtype)
+                        fitted_vec = fitted_vec.to(device=pos_hidden.device, dtype=pos_hidden.dtype)
 
                         # Rebuild KV cache for the same prefix as Strategy A (a_prefix / a_attn_mask)
                         ctx_out_fit = unwrapped(
