@@ -28,6 +28,7 @@ from ..extras.packages import is_mcore_adapter_available, is_ray_available
 from ..hparams import RayArguments, get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
 from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback
+from .distill import run_distill
 from .dpo import run_dpo
 from .kto import run_kto
 from .ppo import run_ppo
@@ -91,6 +92,8 @@ def _training_function(config: dict[str, Any]) -> None:
         run_pt(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "sft":
         run_sft(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
+    elif finetuning_args.stage == "distill":
+        run_distill(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif finetuning_args.stage == "rm":
         run_rm(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "ppo":

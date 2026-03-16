@@ -457,9 +457,39 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "distill"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
+    )
+    # Distillation (stage="distill")
+    teacher_models: list[str] | None = field(
+        default=None,
+        metadata={"help": "Paths to teacher model(s) for distillation. Comma-separated for multiple teachers."},
+    )
+    teacher_parallel: Literal["no", "pp"] = field(
+        default="no",
+        metadata={"help": "How to load teacher model: 'no' for single GPU, 'pp' for pipeline parallel."},
+    )
+    distill_loss_type: str = field(
+        default="logits-kld",
+        metadata={
+            "help": (
+                "Distillation loss type: logits-kld, logits-kld-v2, logits-reversed_kld, "
+                "hidden-states-layerwise-kld, hidden-states-layerwise-mse, logits-and-hidden-states-kld."
+            )
+        },
+    )
+    distill_temperature: float = field(
+        default=2.0,
+        metadata={"help": "Temperature for distillation (logits-based losses)."},
+    )
+    hidden_states_alpha: float = field(
+        default=0.9,
+        metadata={"help": "Weight for hidden-states distillation loss when combined with student loss."},
+    )
+    distill_alpha: float = field(
+        default=0.1,
+        metadata={"help": "Weight for student CE loss: total = distill_alpha * student_loss + (1 - distill_alpha) * distill_loss."},
     )
     finetuning_type: Literal["lora", "oft", "freeze", "full"] = field(
         default="lora",
@@ -656,11 +686,16 @@ class FinetuningArguments(
         self.additional_target: list[str] | None = split_arg(self.additional_target)
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
+        if self.teacher_models is not None and isinstance(self.teacher_models, str):
+            self.teacher_models = [p.strip() for p in self.teacher_models.split(",") if p.strip()]
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
 
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
+
+        if self.stage == "distill" and (not self.teacher_models or len(self.teacher_models) == 0):
+            raise ValueError("`teacher_models` is necessary for distillation training.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

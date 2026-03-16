@@ -18,6 +18,7 @@
 import csv
 import json
 import os
+from collections import defaultdict
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -119,6 +120,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
+
+    @override
+    def _save(self, output_dir: Optional[str] = None, state_dict: Optional[dict] = None) -> None:
+        r"""Save checkpoint after re-tying and deduplicating tied weights (e.g. embed_tokens + lm_head)."""
+        unwrapped = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        if getattr(unwrapped.config, "tie_word_embeddings", False):
+            if hasattr(unwrapped, "tie_weights"):
+                unwrapped.tie_weights()
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        if getattr(unwrapped.config, "tie_word_embeddings", False):
+            ptrs: dict[int, list[str]] = defaultdict(list)
+            for name, tensor in state_dict.items():
+                if isinstance(tensor, torch.Tensor):
+                    ptrs[id(tensor)].append(name)
+            for names in ptrs.values():
+                if len(names) > 1:
+                    names.sort()
+                    for name in names[1:]:
+                        state_dict.pop(name, None)
+        super()._save(output_dir, state_dict)
 
     def _build_reasoning_inputs(
         self, model, hidden_states, special_token_mask, reasoning_input_ids, reasoning_labels
