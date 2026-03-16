@@ -57,19 +57,18 @@ def run_sft(
             logger.info(f"Added {num_added} latent thinking tokens to vocabulary: {latent_tokens}")
 
     # Add <add_think> to tokenizer before dataset is built so it is tokenized as one token.
-    # This is required both for recurrent_add_think_training and for entropy analysis that
-    # probes specifically at <add_think> positions on the answer tokens.
+    # 仅在 recurrent_add_think_training 训练阶段需要显式添加；对于只做
+    # entropy_analyze_at_add_think_positions 的离线分析，应直接复用已保存
+    # 模型目录中的 tokenizer（其中已经包含 <add_think>），这里不再重复 add_tokens，
+    # 以避免 id 偏移或与 checkpoint 中 embedding 行号不一致。
     add_think_added = 0
-    if getattr(finetuning_args, "recurrent_add_think_training", False) or getattr(
-        finetuning_args, "entropy_analyze_at_add_think_positions", False
-    ):
+    if getattr(finetuning_args, "recurrent_add_think_training", False):
         add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
         if add_think_added > 0:
             logger.info(
                 "Added '<add_think>' to tokenizer "
                 f"(new vocab size={len(tokenizer)}; "
-                f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)}, "
-                f"entropy_analyze_at_add_think_positions={getattr(finetuning_args, 'entropy_analyze_at_add_think_positions', False)})"
+                f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)})"
             )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

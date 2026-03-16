@@ -1678,21 +1678,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # Step 2: Positions to probe — either top-k% by entropy or <add_think> positions
             # ==================================================================
             if use_answer_tokens and analyze_at_add_think_positions:
+                # 仅依赖当前 processing_class / tokenizer 中已有的 <add_think> 定义；
+                # 不再在分析阶段调用 add_tokens，以避免改变 vocab_id 与 checkpoint
+                # 中 embedding 行号的对应关系。
                 add_think_token = "<add_think>"
-                num_added = self.processing_class.add_tokens([add_think_token], special_tokens=True)
-                if num_added > 0:
-                    unwrapped.resize_token_embeddings(len(self.processing_class))
-                    if getattr(unwrapped.config, "tie_word_embeddings", False):
-                        unwrapped.tie_weights()
-                    logger.info_rank0(
-                        f"[entropy_analysis] Added '{add_think_token}' to tokenizer "
-                        f"(analyze_at_add_think_positions, new vocab size={len(self.processing_class)})"
-                    )
                 add_think_id = self.processing_class.convert_tokens_to_ids(add_think_token)
                 if isinstance(add_think_id, list):
                     add_think_id = add_think_id[0] if add_think_id else -1
                 if add_think_id is None or add_think_id < 0:
-                    add_think_id = getattr(self.processing_class, "unk_token_id", -1)
+                    logger.warning_rank0(
+                        "[entropy_analysis] analyze_at_add_think_positions=True but tokenizer "
+                        f"has no valid id for {add_think_token!r}; skipping sample {sample_idx}."
+                    )
+                    continue
                 topk_positions = [p for p in range(gen_len) if generated_ids[p] == add_think_id]
                 topk_positions.sort()
                 if not topk_positions:
