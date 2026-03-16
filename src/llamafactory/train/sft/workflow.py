@@ -56,12 +56,21 @@ def run_sft(
         if num_added > 0:
             logger.info(f"Added {num_added} latent thinking tokens to vocabulary: {latent_tokens}")
 
-    # Add <add_think> to tokenizer before dataset is built so it is tokenized as one token
+    # Add <add_think> to tokenizer before dataset is built so it is tokenized as one token.
+    # This is required both for recurrent_add_think_training and for entropy analysis that
+    # probes specifically at <add_think> positions on the answer tokens.
     add_think_added = 0
-    if getattr(finetuning_args, "recurrent_add_think_training", False):
+    if getattr(finetuning_args, "recurrent_add_think_training", False) or getattr(
+        finetuning_args, "entropy_analyze_at_add_think_positions", False
+    ):
         add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
         if add_think_added > 0:
-            logger.info(f"Added '<add_think>' to tokenizer for recurrent_add_think_training (new vocab size={len(tokenizer)})")
+            logger.info(
+                "Added '<add_think>' to tokenizer "
+                f"(new vocab size={len(tokenizer)}; "
+                f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)}, "
+                f"entropy_analyze_at_add_think_positions={getattr(finetuning_args, 'entropy_analyze_at_add_think_positions', False)})"
+            )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
