@@ -1927,6 +1927,41 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         hidden_vec, topk_emb, max_steps=100, lr=0.1
                     )
 
+                    # ---- Use fitted top-k embedding as a new strategy (A_fit) and compare to Strategy A ----
+                    with torch.no_grad():
+                        # learned_p is (top_k,), topk_emb is (top_k, dim)
+                        fitted_vec = (learned_p.unsqueeze(0) @ topk_emb).squeeze(0)  # (dim,)
+                        # Optional: L2-normalise to make it comparable to normed_h
+                        fitted_vec = fitted_vec / (fitted_vec.norm() + 1e-8)
+                        fitted_vec = fitted_vec.to(pos_hidden.dtype)
+
+                        # Rebuild KV cache for the same prefix as Strategy A (a_prefix / a_attn_mask)
+                        ctx_out_fit = unwrapped(
+                            input_ids=a_prefix.unsqueeze(0), use_cache=True,
+                        )
+                        ctx_kv_fit = ctx_out_fit.past_key_values
+                        del ctx_out_fit
+
+                        out_fit = unwrapped(
+                            inputs_embeds=fitted_vec.unsqueeze(0).unsqueeze(0),
+                            attention_mask=a_attn_mask,
+                            past_key_values=ctx_kv_fit,
+                        )
+                        logits_fit = out_fit.logits[0, -1, :].clone()
+                        del out_fit, ctx_kv_fit
+
+                        probs_a = torch.softmax(logits_a.float(), dim=-1)
+                        probs_fit = torch.softmax(logits_fit.float(), dim=-1)
+                        log_probs_a = torch.log(probs_a + 1e-12)
+                        log_probs_fit = torch.log(probs_fit + 1e-12)
+
+                        entropy_a = -(probs_a * log_probs_a).sum().item()
+                        entropy_fit = -(probs_fit * log_probs_fit).sum().item()
+
+                        # Symmetric KL between Strategy A and fitted embedding distributions
+                        kl_a_to_fit = (probs_a * (log_probs_a - log_probs_fit)).sum().item()
+                        kl_fit_to_a = (probs_fit * (log_probs_fit - log_probs_a)).sum().item()
+
                     topk_token_list_fit: list[str] = []
                     topk_original_probs_dict: dict[str, float] = {}
                     topk_learned_dict: dict[str, float] = {}
@@ -1937,6 +1972,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         topk_original_probs_dict[ttext] = round(topk_probs_val[tk].item(), 6)
                         topk_learned_dict[ttext] = round(learned_p[tk].item(), 6)
 
+                    # Top-k distributions under Strategy A and fitted embedding
+                    topk_a_probs_val, topk_a_ids_val = probs_a.topk(top_k_tokens)
+                    topk_fit_probs_val, topk_fit_ids_val = probs_fit.topk(top_k_tokens)
+                    topk_a_dict: dict[str, float] = {}
+                    topk_fit_dict: dict[str, float] = {}
+                    for tk in range(top_k_tokens):
+                        tid_a = topk_a_ids_val[tk].item()
+                        tid_fit = topk_fit_ids_val[tk].item()
+                        ttext_a = self.processing_class.decode([tid_a], skip_special_tokens=False)
+                        ttext_fit = self.processing_class.decode([tid_fit], skip_special_tokens=False)
+                        topk_a_dict[ttext_a] = round(topk_a_probs_val[tk].item(), 6)
+                        topk_fit_dict[ttext_fit] = round(topk_fit_probs_val[tk].item(), 6)
+
                     hidden_fit_rows.append({
                         "sample_idx": sample_idx,
                         "gen_position": pos,
@@ -1945,6 +1993,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         "topk_learned_probs": json.dumps(topk_learned_dict, ensure_ascii=False),
                         "similarity_before": round(similarity_before, 6),
                         "similarity_after": round(similarity_after, 6),
+                        "entropy_strategy_A": round(entropy_a, 6),
+                        "entropy_fitted_embed": round(entropy_fit, 6),
+                        "kl_A_to_fitted": round(kl_a_to_fit, 6),
+                        "kl_fitted_to_A": round(kl_fit_to_a, 6),
+                        "topk_strategy_A": json.dumps(topk_a_dict, ensure_ascii=False),
+                        "topk_fitted_embed": json.dumps(topk_fit_dict, ensure_ascii=False),
                     })
 
                 # ---- Collect distributions for each strategy ----
