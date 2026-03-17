@@ -1925,6 +1925,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     logits_d = out_d.logits[0, -1, :].clone()
                     del out_d, ctx_kv_d
 
+                    # Vector for Strategy C (standard_embed) to be used in alpha sweep (A–C blend)
+                    c_vec = pos_embed.squeeze(0).squeeze(0).float()  # (dim,)
+
                 if fit_hidden_to_topk:
                     # ---- Fit normed_h with top-k word embeddings; write to hidden_topk_fit.csv ----
                     hidden_vec = normed_h.squeeze(0).squeeze(0).detach().float()
@@ -2015,7 +2018,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         "topk_fitted_embed": json.dumps(topk_fit_dict, ensure_ascii=False),
                     })
 
-                # ---- Optional: sweep alpha in D = alpha * A + (1-alpha) * B and compare to A / B ----
+                # ---- Optional: sweep alpha in D = alpha * A + (1-alpha) * C and compare to A / C ----
                 if blend_alpha_sweep and blend_alpha_steps >= 2:
                     with torch.no_grad():
                         alphas = torch.linspace(
@@ -2032,20 +2035,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         ctx_kv_sweep = ctx_out_sweep.past_key_values
                         del ctx_out_sweep
 
-                        # Precompute A/B log-probs once
+                        # Precompute A/C log-probs once
                         probs_a = torch.softmax(logits_a.float(), dim=-1)
-                        probs_b = torch.softmax(logits_b.float(), dim=-1)
+                        probs_c = torch.softmax(logits_c.float(), dim=-1)
                         log_probs_a = torch.log(probs_a + 1e-12)
-                        log_probs_b = torch.log(probs_b + 1e-12)
+                        log_probs_c = torch.log(probs_c + 1e-12)
 
                         topk_a_probs_val, topk_a_ids_val = probs_a.topk(top_k_tokens)
-                        topk_b_probs_val, topk_b_ids_val = probs_b.topk(top_k_tokens)
+                        topk_c_probs_val, topk_c_ids_val = probs_c.topk(top_k_tokens)
                         topk_a_ids_set = set(topk_a_ids_val.tolist())
-                        topk_b_ids_set = set(topk_b_ids_val.tolist())
+                        topk_c_ids_set = set(topk_c_ids_val.tolist())
 
                         for alpha in alphas:
-                            blend_vec = (alpha * a_vec + (1 - alpha) * b_vec)
-                            blend_vec = blend_vec / (blend_vec.norm() + 1e-8)
+                            # D = alpha * A + (1-alpha) * C, without extra re-normalisation so that
+                            # alpha=1 reproduces Strategy A exactly and alpha=0 reproduces Strategy C.
+                            blend_vec = (alpha * a_vec + (1 - alpha) * c_vec)
                             blend_vec = blend_vec.to(device=pos_hidden.device, dtype=pos_hidden.dtype)
 
                             out_blend = unwrapped(
@@ -2059,17 +2063,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                             probs_blend = torch.softmax(logits_blend.float(), dim=-1)
                             log_probs_blend = torch.log(probs_blend + 1e-12)
 
-                            # KL in both directions: blend->A, A->blend, blend->B, B->blend
+                            # KL in both directions: blend->A, A->blend, blend->C, C->blend
                             kl_blend_to_a = (probs_blend * (log_probs_blend - log_probs_a)).sum().item()
                             kl_a_to_blend = (probs_a * (log_probs_a - log_probs_blend)).sum().item()
-                            kl_blend_to_b = (probs_blend * (log_probs_blend - log_probs_b)).sum().item()
-                            kl_b_to_blend = (probs_b * (log_probs_b - log_probs_blend)).sum().item()
+                            kl_blend_to_c = (probs_blend * (log_probs_blend - log_probs_c)).sum().item()
+                            kl_c_to_blend = (probs_c * (log_probs_c - log_probs_blend)).sum().item()
 
-                            # Top-k overlap counts between blend and A / B
+                            # Top-k overlap counts between blend and A / C
                             topk_blend_ids_val = probs_blend.topk(top_k_tokens).indices
                             blend_ids_set = set(topk_blend_ids_val.tolist())
                             overlap_with_a = len(blend_ids_set & topk_a_ids_set)
-                            overlap_with_b = len(blend_ids_set & topk_b_ids_set)
+                            overlap_with_c = len(blend_ids_set & topk_c_ids_set)
 
                             blend_sweep_rows.append({
                                 "sample_idx": sample_idx,
@@ -2077,10 +2081,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                                 "alpha": float(alpha.item()),
                                 "kl_blend_to_A": round(kl_blend_to_a, 6),
                                 "kl_A_to_blend": round(kl_a_to_blend, 6),
-                                "kl_blend_to_B": round(kl_blend_to_b, 6),
-                                "kl_B_to_blend": round(kl_b_to_blend, 6),
+                                "kl_blend_to_C": round(kl_blend_to_c, 6),
+                                "kl_C_to_blend": round(kl_c_to_blend, 6),
                                 "topk_overlap_with_A": overlap_with_a,
-                                "topk_overlap_with_B": overlap_with_b,
+                                "topk_overlap_with_C": overlap_with_c,
                             })
 
                         del ctx_kv_sweep

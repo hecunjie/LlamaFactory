@@ -18,28 +18,28 @@ def load_sweep_rows(path: str):
 def aggregate_by_alpha(rows):
     """Aggregate KL and overlap metrics by alpha across samples/positions."""
     stats = defaultdict(lambda: {"count": 0, "kl_blend_to_A": 0.0, "kl_A_to_blend": 0.0,
-                                 "kl_blend_to_B": 0.0, "kl_B_to_blend": 0.0,
-                                 "topk_overlap_with_A": 0.0, "topk_overlap_with_B": 0.0})
+                                 "kl_blend_to_C": 0.0, "kl_C_to_blend": 0.0,
+                                 "topk_overlap_with_A": 0.0, "topk_overlap_with_C": 0.0})
     for r in rows:
         alpha = float(r["alpha"])
         s = stats[alpha]
         s["count"] += 1
         s["kl_blend_to_A"] += float(r["kl_blend_to_A"])
         s["kl_A_to_blend"] += float(r["kl_A_to_blend"])
-        s["kl_blend_to_B"] += float(r["kl_blend_to_B"])
-        s["kl_B_to_blend"] += float(r["kl_B_to_blend"])
+        s["kl_blend_to_C"] += float(r["kl_blend_to_C"])
+        s["kl_C_to_blend"] += float(r["kl_C_to_blend"])
         s["topk_overlap_with_A"] += float(r["topk_overlap_with_A"])
-        s["topk_overlap_with_B"] += float(r["topk_overlap_with_B"])
+        s["topk_overlap_with_C"] += float(r["topk_overlap_with_C"])
 
     alphas = sorted(stats.keys())
     agg = {
         "alpha": [],
         "kl_blend_to_A": [],
         "kl_A_to_blend": [],
-        "kl_blend_to_B": [],
-        "kl_B_to_blend": [],
+        "kl_blend_to_C": [],
+        "kl_C_to_blend": [],
         "topk_overlap_with_A": [],
-        "topk_overlap_with_B": [],
+        "topk_overlap_with_C": [],
     }
     for a in alphas:
         s = stats[a]
@@ -47,10 +47,10 @@ def aggregate_by_alpha(rows):
         agg["alpha"].append(a)
         agg["kl_blend_to_A"].append(s["kl_blend_to_A"] / c)
         agg["kl_A_to_blend"].append(s["kl_A_to_blend"] / c)
-        agg["kl_blend_to_B"].append(s["kl_blend_to_B"] / c)
-        agg["kl_B_to_blend"].append(s["kl_B_to_blend"] / c)
+        agg["kl_blend_to_C"].append(s["kl_blend_to_C"] / c)
+        agg["kl_C_to_blend"].append(s["kl_C_to_blend"] / c)
         agg["topk_overlap_with_A"].append(s["topk_overlap_with_A"] / c)
-        agg["topk_overlap_with_B"].append(s["topk_overlap_with_B"] / c)
+        agg["topk_overlap_with_C"].append(s["topk_overlap_with_C"] / c)
     return agg
 
 
@@ -95,8 +95,8 @@ def main():
     ax = axes[0]
     ax.plot(agg["alpha"], agg["kl_blend_to_A"], label="KL(blend || A)")
     ax.plot(agg["alpha"], agg["kl_A_to_blend"], label="KL(A || blend)")
-    ax.plot(agg["alpha"], agg["kl_blend_to_B"], label="KL(blend || B)")
-    ax.plot(agg["alpha"], agg["kl_B_to_blend"], label="KL(B || blend)")
+    ax.plot(agg["alpha"], agg["kl_blend_to_C"], label="KL(blend || C)")
+    ax.plot(agg["alpha"], agg["kl_C_to_blend"], label="KL(C || blend)")
     ax.set_xlabel("alpha in blend = alpha * A + (1-alpha) * B")
     ax.set_ylabel("KL divergence")
     ax.legend()
@@ -105,7 +105,7 @@ def main():
     # Top-k overlap curves
     ax = axes[1]
     ax.plot(agg["alpha"], agg["topk_overlap_with_A"], label="top-k overlap with A")
-    ax.plot(agg["alpha"], agg["topk_overlap_with_B"], label="top-k overlap with B")
+    ax.plot(agg["alpha"], agg["topk_overlap_with_C"], label="top-k overlap with C")
     ax.set_xlabel("alpha in blend = alpha * A + (1-alpha) * B")
     ax.set_ylabel("Average top-k overlap count")
     ax.legend()
