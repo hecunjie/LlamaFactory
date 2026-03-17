@@ -612,6 +612,25 @@ class FinetuningArguments(
             )
         },
     )
+    entropy_blend_alpha_sweep: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, during entropy-strategy analysis sweep alpha in the blended Strategy D "
+                "between 0 and 1 and record KL divergences and top-k overlaps between the blended "
+                "distribution and Strategies A/B. Results are written to sample_<idx>_blend_alpha_sweep.csv."
+            )
+        },
+    )
+    entropy_blend_alpha_steps: int = field(
+        default=21,
+        metadata={
+            "help": (
+                "Number of alpha points in [0,1] (inclusive) for the blended Strategy D sweep when "
+                "entropy_blend_alpha_sweep is True. Must be >=2."
+            )
+        },
+    )
     entropy_analyze_at_add_think_positions: bool = field(
         default=False,
         metadata={
