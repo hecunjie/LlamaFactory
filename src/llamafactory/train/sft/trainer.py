@@ -1928,11 +1928,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 if fit_hidden_to_topk:
                     # ---- Fit normed_h with top-k word embeddings; write to hidden_topk_fit.csv ----
                     hidden_vec = normed_h.squeeze(0).squeeze(0).detach().float()
-                    pos_probs = torch.softmax(pos_logits.float(), dim=-1)
-                    topk_probs_val, topk_ids_val = pos_probs.topk(top_k_tokens, dim=-1)
-                    topk_ids_val = topk_ids_val.squeeze(0)
-                    topk_probs_val = topk_probs_val.squeeze(0)
-                    topk_emb = embed_fn(topk_ids_val.unsqueeze(0)).squeeze(0).detach().float()
+                    pos_probs = torch.softmax(pos_logits.float(), dim=-1)  # (vocab,)
+                    # topk over the 1D vocab dimension: returns (top_k,)
+                    topk_probs_val, topk_ids_val = pos_probs.topk(top_k_tokens)
+                    topk_emb = embed_fn(topk_ids_val.unsqueeze(0)).squeeze(0).detach().float()  # (top_k, dim)
                     weighted_before = (topk_probs_val.unsqueeze(0) @ topk_emb).squeeze(0)
                     weighted_before_norm = weighted_before / (weighted_before.norm().item() + 1e-8)
                     similarity_before = (weighted_before_norm * hidden_vec).sum().item()
