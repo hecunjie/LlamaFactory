@@ -1439,6 +1439,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         dataset: "Dataset",
         top_k_entropy_pct: int = 20,
         top_k_tokens: int = 10,
+        blend_alpha_sweep: bool = False,
+        blend_alpha_steps: int = 21,
         max_new_tokens: int = 512,
         logit_weight_threshold: float = 0.01,
         blend_alpha: float = 0.6,
@@ -1481,6 +1483,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
           - ``sample_<idx>/strategy_distributions.csv``
           - ``sample_<idx>_hidden_topk_fit.csv`` (one separate CSV per sample: top-k tokens/probs,
             learned distribution, similarity before/after fitting weighted embedding to hidden)
+          - ``sample_<idx>_blend_alpha_sweep.csv`` (optional, only when ``blend_alpha_sweep=True``:
+            for each probed position and each alpha in [0, 1], KL divergences and top-k overlaps
+            between the blended strategy and A/B)
 
         Args:
             top_k_entropy_pct: Percentage (0–100) of generated positions to probe.
@@ -1488,6 +1493,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             logit_weight_threshold: Minimum probability for a token to participate
                 in the Strategy B weighted embedding. Tokens below this are
                 discarded and remaining probabilities are re-normalised.
+            blend_alpha_sweep: If True, for each probed position linearly sweep
+                ``alpha`` from 0 to 1 in ``blend_alpha_steps`` points for the
+                blended strategy D = alpha * A + (1-alpha) * B, and record KL
+                divergences and top-k overlaps between the blended distribution
+                and A / B. Results are written to
+                ``sample_<idx>_blend_alpha_sweep.csv``.
+            blend_alpha_steps: Number of alpha points between 0 and 1 (inclusive)
+                used when ``blend_alpha_sweep`` is True. Must be >= 2.
             use_answer_tokens: If True, analyse entropy on the ground-truth answer
                 tokens via teacher-forcing instead of autoregressive generation.
             hidden_drop_last_kv: If True, Strategy A (hidden_norm) uses a KV cache
@@ -1712,6 +1725,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             positions_rows: list[dict] = []
             strategy_rows: list[dict] = []
             hidden_fit_rows: list[dict] = []
+            blend_sweep_rows: list[dict] = []
 
             for rank, pos in enumerate(topk_positions):
                 # Build context string: prompt + generated tokens up to this position
@@ -2002,6 +2016,76 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         "topk_fitted_embed": json.dumps(topk_fit_dict, ensure_ascii=False),
                     })
 
+                # ---- Optional: sweep alpha in D = alpha * A + (1-alpha) * B and compare to A / B ----
+                if blend_alpha_sweep and blend_alpha_steps >= 2:
+                    with torch.no_grad():
+                        alphas = torch.linspace(
+                            0.0,
+                            1.0,
+                            steps=blend_alpha_steps,
+                            device=pos_hidden.device,
+                            dtype=pos_hidden.dtype,
+                        )
+                        # Reuse a common KV cache for the base prefix
+                        ctx_out_sweep = unwrapped(
+                            input_ids=base_prefix.unsqueeze(0), use_cache=True,
+                        )
+                        ctx_kv_sweep = ctx_out_sweep.past_key_values
+                        del ctx_out_sweep
+
+                        # Precompute A/B log-probs once
+                        probs_a = torch.softmax(logits_a.float(), dim=-1)
+                        probs_b = torch.softmax(logits_b.float(), dim=-1)
+                        log_probs_a = torch.log(probs_a + 1e-12)
+                        log_probs_b = torch.log(probs_b + 1e-12)
+
+                        topk_a_probs_val, topk_a_ids_val = probs_a.topk(top_k_tokens)
+                        topk_b_probs_val, topk_b_ids_val = probs_b.topk(top_k_tokens)
+                        topk_a_ids_set = set(topk_a_ids_val.tolist())
+                        topk_b_ids_set = set(topk_b_ids_val.tolist())
+
+                        for alpha in alphas:
+                            blend_vec = (alpha * a_vec + (1 - alpha) * b_vec)
+                            blend_vec = blend_vec / (blend_vec.norm() + 1e-8)
+                            blend_vec = blend_vec.to(device=pos_hidden.device, dtype=pos_hidden.dtype)
+
+                            out_blend = unwrapped(
+                                inputs_embeds=blend_vec.unsqueeze(0).unsqueeze(0),
+                                attention_mask=attn_mask,
+                                past_key_values=ctx_kv_sweep,
+                            )
+                            logits_blend = out_blend.logits[0, -1, :].clone()
+                            del out_blend
+
+                            probs_blend = torch.softmax(logits_blend.float(), dim=-1)
+                            log_probs_blend = torch.log(probs_blend + 1e-12)
+
+                            # KL in both directions: blend->A, A->blend, blend->B, B->blend
+                            kl_blend_to_a = (probs_blend * (log_probs_blend - log_probs_a)).sum().item()
+                            kl_a_to_blend = (probs_a * (log_probs_a - log_probs_blend)).sum().item()
+                            kl_blend_to_b = (probs_blend * (log_probs_blend - log_probs_b)).sum().item()
+                            kl_b_to_blend = (probs_b * (log_probs_b - log_probs_blend)).sum().item()
+
+                            # Top-k overlap counts between blend and A / B
+                            topk_blend_ids_val = probs_blend.topk(top_k_tokens).indices
+                            blend_ids_set = set(topk_blend_ids_val.tolist())
+                            overlap_with_a = len(blend_ids_set & topk_a_ids_set)
+                            overlap_with_b = len(blend_ids_set & topk_b_ids_set)
+
+                            blend_sweep_rows.append({
+                                "sample_idx": sample_idx,
+                                "gen_position": pos,
+                                "alpha": float(alpha.item()),
+                                "kl_blend_to_A": round(kl_blend_to_a, 6),
+                                "kl_A_to_blend": round(kl_a_to_blend, 6),
+                                "kl_blend_to_B": round(kl_blend_to_b, 6),
+                                "kl_B_to_blend": round(kl_b_to_blend, 6),
+                                "topk_overlap_with_A": overlap_with_a,
+                                "topk_overlap_with_B": overlap_with_b,
+                            })
+
+                        del ctx_kv_sweep
+
                 # ---- Collect distributions for each strategy ----
                 strategy_names = ["hidden_norm", "logit_weighted_embed", "standard_embed", "blend_AB"]
                 strategy_logits_list = [logits_a, logits_b, logits_c, logits_d]
@@ -2063,6 +2147,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     writer = csv.DictWriter(f, fieldnames=fieldnames_fit)
                     writer.writeheader()
                     writer.writerows(hidden_fit_rows)
+
+            if blend_alpha_sweep and blend_sweep_rows:
+                sweep_csv = os.path.join(analysis_root, f"sample_{sample_idx}_blend_alpha_sweep.csv")
+                fieldnames_sweep = list(blend_sweep_rows[0].keys())
+                with open(sweep_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames_sweep)
+                    writer.writeheader()
+                    writer.writerows(blend_sweep_rows)
 
             if (sample_idx + 1) % 10 == 0 or sample_idx == num_samples - 1:
                 logger.info_rank0(
