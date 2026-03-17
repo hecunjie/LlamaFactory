@@ -72,11 +72,13 @@ def main():
     )
     args = parser.parse_args()
 
-    # Collect all sweep csvs
+    # Collect all sweep csvs (they may live either directly under analysis_dir
+    # or inside per-sample subfolders like sample_<idx>/).
     sweep_files = []
-    for name in os.listdir(args.analysis_dir):
-        if name.endswith("_blend_alpha_sweep.csv"):
-            sweep_files.append(os.path.join(args.analysis_dir, name))
+    for root, _dirs, files in os.walk(args.analysis_dir):
+        for name in files:
+            if name.endswith("blend_alpha_sweep.csv"):
+                sweep_files.append(os.path.join(root, name))
 
     if not sweep_files:
         raise SystemExit(f"No *_blend_alpha_sweep.csv found under {args.analysis_dir}")

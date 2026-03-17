@@ -2148,7 +2148,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     writer.writerows(hidden_fit_rows)
 
             if blend_alpha_sweep and blend_sweep_rows:
-                sweep_csv = os.path.join(analysis_root, f"sample_{sample_idx}_blend_alpha_sweep.csv")
+                sweep_csv = os.path.join(sample_dir, "blend_alpha_sweep.csv")
                 fieldnames_sweep = list(blend_sweep_rows[0].keys())
                 with open(sweep_csv, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames_sweep)
