@@ -528,8 +528,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         if segment_last_h is None:
                             segment_last_h = embed_fn(sample_ids[0:1]).squeeze(0)
 
-                    # Two steps: at p (input = norm(segment_last_h), model "generates" one token);
-                    # at p+1 input = word embedding of that generated token (not <add_think>).
+                    # Two steps: at p (input = norm(segment_last_h), i.e. hidden-as-input for <add_think>);
+                    # at p+1 use teacher-forcing: input is the word embedding of the *true* token at p+1.
                     if segment_last_h is None:
                         segment_last_h = embed_fn(sample_ids[max(0, p - 1) : p + 1].narrow(0, 0, 1)).squeeze(0)
                     h_in = norm_fn(segment_last_h.unsqueeze(0)).squeeze(0).unsqueeze(0).unsqueeze(0)
@@ -544,12 +544,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     past_kv = out_p.past_key_values
                     logits[p] = out_p.logits[0, -1, :].clone()
-                    # Token "generated" at <add_think> position (argmax); next position's input = its embedding
-                    generated_token_id = logits[p].argmax(dim=-1).long().unsqueeze(0).unsqueeze(0)
                     del out_p
 
                     if p + 1 < valid_len:
-                        next_embed = embed_fn(generated_token_id)
+                        # Teacher-forcing: feed the ground-truth next token embedding.
+                        next_token_id = sample_ids[p + 1].long().unsqueeze(0).unsqueeze(0)
+                        next_embed = embed_fn(next_token_id)
                         step_len2 = _past_length(past_kv) + 1
                         step_attn2 = torch.ones(1, step_len2, device=device, dtype=attention_mask.dtype)
                         out_p1 = model(
