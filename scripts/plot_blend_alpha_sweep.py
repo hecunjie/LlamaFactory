@@ -65,6 +65,12 @@ def main():
         help="Path to entropy_analysis directory (contains sample_*/ or sample_*_blend_alpha_sweep.csv).",
     )
     parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=-1,
+        help="Maximum number of *_blend_alpha_sweep.csv files to use. -1 means no truncation.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="blend_alpha_sweep.png",
@@ -79,6 +85,11 @@ def main():
         for name in files:
             if name.endswith("blend_alpha_sweep.csv"):
                 sweep_files.append(os.path.join(root, name))
+
+    # Make truncation deterministic across runs.
+    sweep_files = sorted(sweep_files)
+    if args.max_samples is not None and args.max_samples >= 0:
+        sweep_files = sweep_files[: args.max_samples]
 
     if not sweep_files:
         raise SystemExit(f"No *_blend_alpha_sweep.csv found under {args.analysis_dir}")
