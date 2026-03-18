@@ -652,6 +652,18 @@ class FinetuningArguments(
             )
         },
     )
+    recurrent_add_think_backprop_hidden: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, in recurrent_add_think_training allow gradients to flow through "
+                "the hidden-as-input path (i.e. loss backpropagates through the <add_think> "
+                "input embedding that is derived from previous hidden states). This increases "
+                "memory usage. When False (default), the recurrent path is computed without "
+                "backprop through the hidden replacements."
+            )
+        },
+    )
     do_mark_low_confidence: bool = field(
         default=False,
         metadata={

@@ -419,6 +419,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         attention_mask: "torch.Tensor",
         labels: "torch.Tensor",
         add_think_id: int,
+        backprop_hidden: bool = False,
     ) -> "torch.Tensor":
         r"""Forward with recurrent <add_think>: <add_think> is a placeholder; at that
         position the input is the previous token's hidden state (through LayerNorm), and
@@ -475,23 +476,49 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 add_think_positions = add_think_positions.unsqueeze(0)
             add_think_positions = add_think_positions.cpu().tolist()
 
-            logits_dtype = next(unwrapped.parameters()).dtype
-            logits = torch.zeros(valid_len, vocab_size, device=device, dtype=logits_dtype)
-
             past_kv = None
             segment_last_h = None
 
+            # Build effective labels: include <add_think> as target where next token is <add_think>
+            # (dataset may use IGNORE_INDEX there; we want loss for predicting <add_think>)
+            effective_labels = sample_labels.clone()
+            for idx in range(valid_len - 1):
+                next_id = sample_ids[idx + 1]
+                if (next_id if isinstance(next_id, int) else next_id.item()) == add_think_id:
+                    effective_labels[idx] = add_think_id
+
             if not add_think_positions:
                 # No <add_think>: one forward
-                out = model(
-                    input_ids=sample_ids.unsqueeze(0),
-                    attention_mask=attention_mask[b : b + 1, :valid_len],
-                    use_cache=False,
-                )
-                logits[:] = out.logits[0]
-                del out
+                if backprop_hidden:
+                    out = model(
+                        input_ids=sample_ids.unsqueeze(0),
+                        attention_mask=attention_mask[b : b + 1, :valid_len],
+                        use_cache=False,
+                    )
+                    shift_logits = out.logits[0, :-1, :]  # (valid_len-1, vocab)
+                    shift_labels = effective_labels[1:valid_len]
+                    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
+                    loss_sum = loss_fn(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+                    denom = (shift_labels != IGNORE_INDEX).sum().item()
+                    sample_loss = loss_sum / max(int(denom), 1)
+                    total_loss = total_loss + sample_loss
+                    valid_count += 1
+                    del out, shift_logits, shift_labels, loss_sum
+                else:
+                    logits_dtype = next(unwrapped.parameters()).dtype
+                    logits = torch.zeros(valid_len, vocab_size, device=device, dtype=logits_dtype)
+                    out = model(
+                        input_ids=sample_ids.unsqueeze(0),
+                        attention_mask=attention_mask[b : b + 1, :valid_len],
+                        use_cache=False,
+                    )
+                    logits[:] = out.logits[0]
+                    del out
             else:
                 # Segment-based: [0, p0), then two steps at p0, p0+1; [p0+2, p1), two steps; ...
+                if not backprop_hidden:
+                    logits_dtype = next(unwrapped.parameters()).dtype
+                    logits = torch.zeros(valid_len, vocab_size, device=device, dtype=logits_dtype)
                 for i, p in enumerate(add_think_positions):
                     start = add_think_positions[i - 1] + 2 if i > 0 else 0
                     end = p
@@ -520,7 +547,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                                 output_hidden_states=True,
                             )
                         past_kv = out.past_key_values
-                        logits[start:end] = out.logits[0]
+                        if backprop_hidden:
+                            if seg_len > 1:
+                                shift_logits = out.logits[0, :-1, :]
+                                shift_labels = effective_labels[start + 1 : end]
+                                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
+                                loss_sum = loss_fn(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+                                denom = (shift_labels != IGNORE_INDEX).sum().item()
+                                sample_loss = loss_sum / max(int(denom), 1)
+                                total_loss = total_loss + sample_loss
+                                valid_count += 1
+                                del shift_logits, shift_labels, loss_sum
+                        else:
+                            logits[start:end] = out.logits[0]
                         segment_last_h = out.hidden_states[-1][0, -1, :]
                         del out
                     else:
@@ -543,7 +582,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         output_hidden_states=True,
                     )
                     past_kv = out_p.past_key_values
-                    logits[p] = out_p.logits[0, -1, :].clone()
+                    if backprop_hidden:
+                        if p + 1 < valid_len:
+                            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
+                            lbl = effective_labels[p + 1 : p + 2]
+                            loss_sum = loss_fn(out_p.logits[0, -1, :].view(1, -1), lbl.view(-1))
+                            denom = (lbl != IGNORE_INDEX).sum().item()
+                            sample_loss = loss_sum / max(int(denom), 1)
+                            total_loss = total_loss + sample_loss
+                            valid_count += 1
+                            del lbl, loss_sum
+                    else:
+                        logits[p] = out_p.logits[0, -1, :].clone()
                     del out_p
 
                     if p + 1 < valid_len:
@@ -560,7 +610,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                             output_hidden_states=True,
                         )
                         past_kv = out_p1.past_key_values
-                        logits[p + 1] = out_p1.logits[0, -1, :]
+                        if backprop_hidden:
+                            if p + 2 < valid_len:
+                                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
+                                lbl = effective_labels[p + 2 : p + 3]
+                                loss_sum = loss_fn(out_p1.logits[0, -1, :].view(1, -1), lbl.view(-1))
+                                denom = (lbl != IGNORE_INDEX).sum().item()
+                                sample_loss = loss_sum / max(int(denom), 1)
+                                total_loss = total_loss + sample_loss
+                                valid_count += 1
+                                del lbl, loss_sum
+                        else:
+                            logits[p + 1] = out_p1.logits[0, -1, :]
                         segment_last_h = out_p1.hidden_states[-1][0, -1, :]
                         del out_p1
                     else:
@@ -581,21 +642,26 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         past_key_values=past_kv,
                         use_cache=False,
                     )
-                    logits[start:end] = out.logits[0]
+                    if backprop_hidden:
+                        if seg_len > 1:
+                            shift_logits = out.logits[0, :-1, :]
+                            shift_labels = effective_labels[start + 1 : end]
+                            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="sum")
+                            loss_sum = loss_fn(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+                            denom = (shift_labels != IGNORE_INDEX).sum().item()
+                            sample_loss = loss_sum / max(int(denom), 1)
+                            total_loss = total_loss + sample_loss
+                            valid_count += 1
+                            del shift_logits, shift_labels, loss_sum
+                    else:
+                        logits[start:end] = out.logits[0]
                     del out
 
-            # Build effective labels: include <add_think> as target where next token is <add_think>
-            # (dataset may use IGNORE_INDEX there; we want loss for predicting <add_think>)
-            effective_labels = sample_labels.clone()
-            for idx in range(valid_len - 1):
-                next_id = sample_ids[idx + 1]
-                if (next_id if isinstance(next_id, int) else next_id.item()) == add_think_id:
-                    effective_labels[idx] = add_think_id
-
-            loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-            sample_loss = loss_fn(logits.view(-1, vocab_size), effective_labels.view(-1))
-            total_loss = total_loss + sample_loss
-            valid_count += 1
+            if not backprop_hidden:
+                loss_fn = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+                sample_loss = loss_fn(logits.view(-1, vocab_size), effective_labels.view(-1))
+                total_loss = total_loss + sample_loss
+                valid_count += 1
 
         if _gc_was_enabled:
             _base_model.gradient_checkpointing_enable({"use_reentrant": False})
@@ -801,6 +867,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     inputs["attention_mask"],
                     inputs["labels"],
                     add_think_id,
+                    backprop_hidden=getattr(self.finetuning_args, "recurrent_add_think_backprop_hidden", False),
                 )
             loss_answer = total_loss
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)

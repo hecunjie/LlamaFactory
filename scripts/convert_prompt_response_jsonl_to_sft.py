@@ -27,6 +27,21 @@ IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
 
 
+def trim_response_after_last_im_end(response: str) -> str:
+    """Remove the last <im_end>/<|im_end|> token and anything after it."""
+    if not response:
+        return response
+    candidates = (IM_END, "<im_end>")
+    last_pos = -1
+    for tok in candidates:
+        pos = response.rfind(tok)
+        if pos > last_pos:
+            last_pos = pos
+    if last_pos == -1:
+        return response
+    return response[:last_pos].rstrip()
+
+
 def parse_chatml_prompt(prompt: str) -> tuple[str, str]:
     """Extract (system_content, user_content) from a ChatML prompt.
 
@@ -70,6 +85,7 @@ def convert_line(line: str) -> dict | None:
         return None
     prompt = str(prompt)
     response = str(response).strip()
+    response = trim_response_after_last_im_end(response)
     system_content, user_content = parse_chatml_prompt(prompt)
     out = {
         "instruction": user_content,
