@@ -114,9 +114,10 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=("json", "jsonl"),
-        default="json",
-        help="Output format: json (one JSON array) or jsonl (one JSON object per line). Default: json",
+        choices=("json", "jsonl", "sjsonl"),
+        default=None,
+        help="Output format: json (one JSON array) or jsonl/sjsonl (one JSON object per line). "
+        "If omitted, infer from output suffix (.jsonl/.sjsonl -> jsonl; otherwise json).",
     )
     args = parser.parse_args()
 
@@ -132,10 +133,19 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
 
-    if args.format == "jsonl":
-        with open(args.output, "w", encoding="utf-8") as f:
-            for ex in examples:
-                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    out_format = args.format
+    if out_format is None:
+        lower_out = str(args.output).lower()
+        out_format = "jsonl" if (lower_out.endswith(".jsonl") or lower_out.endswith(".sjsonl")) else "json"
+    if out_format == "sjsonl":
+        out_format = "jsonl"
+
+    if out_format == "jsonl":
+        with open(args.output, "w", encoding="utf-8", newline="\n") as f:
+            for i, ex in enumerate(examples):
+                f.write(json.dumps(ex, ensure_ascii=False))
+                if i < len(examples) - 1:
+                    f.write("\n")
     else:
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(examples, f, ensure_ascii=False, indent=2)
