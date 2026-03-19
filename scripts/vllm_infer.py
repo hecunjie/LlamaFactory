@@ -230,7 +230,20 @@ def vllm_infer(
             )
 
         results = llm.generate(vllm_inputs, sampling_params, lora_request=lora_request)
-        preds = [[output.text for output in result.outputs] for result in results]
+        preds = []
+        for result in results:
+            pred_list = []
+            for output in result.outputs:
+                # Decode from token ids to avoid occasional text artifacts in multi-generation outputs.
+                pred_text = tokenizer.decode(
+                    output.token_ids,
+                    skip_special_tokens=skip_special_tokens,
+                    clean_up_tokenization_spaces=True,
+                )
+                if not pred_text and output.text:
+                    pred_text = output.text
+                pred_list.append(pred_text)
+            preds.append(pred_list)
 
         # Accumulate results
         all_prompts.extend(prompts)
