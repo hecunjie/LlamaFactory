@@ -41,14 +41,14 @@ def convert_to_alpaca(examples: list[dict]) -> list[dict]:
         question = ex["question"].strip()
         answer_raw = ex["answer"].strip()
 
-        # Extract the final numerical answer after ####
+        # Extract the final numerical answer after The answer is
         match = re.search(r"####\s*(.+)$", answer_raw)
         if match:
             final_answer = match.group(1).strip()
             # Get the reasoning part (before ####)
             reasoning_part = answer_raw[:match.start()].strip()
             # Build a clean output: reasoning + clear final answer
-            output = f"{reasoning_part}\n#### {final_answer}"
+            output = f"{reasoning_part}\nThe answer is {final_answer}"
         else:
             # Fallback: use the raw answer as-is
             output = answer_raw
@@ -64,13 +64,13 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare GSM8K for SFT")
     parser.add_argument(
         "--output-dir", type=str, default="data",
-        help="Directory to save the converted JSON files"
+        help="Directory to save the converted JSONL files"
     )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for split, filename in [("train", "gsm8k_sft_train.json"), ("test", "gsm8k_sft_test.json")]:
+    for split, filename in [("train", "gsm8k_sft_train.jsonl"), ("test", "gsm8k_sft_test.jsonl")]:
         print(f"Loading GSM8K {split} split...")
         raw = load_gsm8k(split)
         print(f"  {len(raw)} examples loaded")
@@ -78,7 +78,8 @@ def main():
         converted = convert_to_alpaca(raw)
         out_path = os.path.join(args.output_dir, filename)
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(converted, f, ensure_ascii=False, indent=2)
+            for item in converted:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  Saved to {out_path}")
 
         # Show a sample
