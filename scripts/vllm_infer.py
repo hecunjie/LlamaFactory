@@ -70,13 +70,21 @@ def vllm_infer(
     video_fps: float = 2.0,
     video_maxlen: int = 128,
     batch_size: int = 1024,
+    num_generations: int = 1,
 ):
     r"""Perform batch generation using vLLM engine, which supports tensor parallelism.
 
     Usage: python vllm_infer.py --model_name_or_path meta-llama/Llama-2-7b-hf --template llama --dataset alpaca_en_demo
+
+    ``num_generations`` maps to vLLM ``SamplingParams.n``: number of independent completions per prompt.
+    When ``num_generations > 1``, use ``temperature > 0`` so samples differ; JSONL adds field ``predicts`` (list).
+    Field ``predict`` remains the first completion for backward compatibility (e.g. ``eval_bleu_rouge.py``).
     """
     if pipeline_parallel_size > get_device_count():
         raise ValueError("Pipeline parallel size should be smaller than the number of gpus.")
+
+    if num_generations < 1:
+        raise ValueError("`num_generations` must be >= 1.")
 
     model_args, data_args, _, generating_args = get_infer_args(
         dict(
@@ -98,6 +106,11 @@ def vllm_infer(
             repetition_penalty=repetition_penalty,
         )
     )
+
+    if num_generations > 1 and generating_args.temperature <= 0:
+        raise ValueError(
+            "`num_generations` > 1 requires `temperature` > 0 for stochastic sampling (set e.g. --temperature 0.7)."
+        )
 
     training_args = Seq2SeqTrainingArguments(output_dir="dummy_dir")
     tokenizer_module = load_tokenizer(model_args)
@@ -129,6 +142,7 @@ def vllm_infer(
     train_dataset = dataset_module["train_dataset"]
 
     sampling_params = SamplingParams(
+        n=num_generations,
         repetition_penalty=generating_args.repetition_penalty or 1.0,  # repetition_penalty must > 0
         temperature=generating_args.temperature,
         top_p=generating_args.top_p or 1.0,  # top_p must > 0
@@ -216,7 +230,7 @@ def vllm_infer(
             )
 
         results = llm.generate(vllm_inputs, sampling_params, lora_request=lora_request)
-        preds = [result.outputs[0].text for result in results]
+        preds = [[output.text for output in result.outputs] for result in results]
 
         # Accumulate results
         all_prompts.extend(prompts)
@@ -227,8 +241,11 @@ def vllm_infer(
     model_predict_end_time = time.time()
     # Write all results at once outside the loop
     with open(save_name, "w", encoding="utf-8") as f:
-        for text, pred, label in zip(all_prompts, all_preds, all_labels):
-            f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+        for text, pred_list, label in zip(all_prompts, all_preds, all_labels):
+            record = {"prompt": text, "predict": pred_list[0], "label": label}
+            if num_generations > 1:
+                record["predicts"] = pred_list
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     print("*" * 70)
     print(f"{len(all_prompts)} total generated results have been saved at {save_name}.")
