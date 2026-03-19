@@ -19,6 +19,7 @@ Metrics computed:
 
 import argparse
 import json
+import math
 import re
 import sys
 from collections import Counter
@@ -42,11 +43,13 @@ def _normalize_number(text: str) -> Optional[str]:
         # Normalise: remove leading zeros, keep decimals as-is
         try:
             val = float(text)
+            if not math.isfinite(val):
+                return None
             # Return int string when there is no fractional part
             if val == int(val):
                 return str(int(val))
             return str(val)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
     return None
 
