@@ -30,9 +30,9 @@ def analyze_and_plot(intervention_results_path, config, output_dir):
             if g not in res:
                 continue
             stats[g]["n"] += 1
-            stats[g]["residual"] += int(bool(res[g].get("residual", False)))
-            stats[g]["vocab"] += int(bool(res[g].get("vocab", False)))
-            stats[g]["full"] += int(bool(res[g].get("full", False)))
+            stats[g]["residual"] += int(_to_bool(res[g].get("residual", False)))
+            stats[g]["vocab"] += int(_to_bool(res[g].get("vocab", False)))
+            stats[g]["full"] += int(_to_bool(res[g].get("full", False)))
 
     xs = [float(g) for g in gamma_keys]
     ys_res, ys_voc, ys_full, ns = [], [], [], []
@@ -80,3 +80,9 @@ def _load_jsonl(path):
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def _to_bool(v):
+    if isinstance(v, dict):
+        return bool(v.get("is_correct", False))
+    return bool(v)

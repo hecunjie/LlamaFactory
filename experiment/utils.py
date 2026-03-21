@@ -71,14 +71,18 @@ def find_pre_answer_position(input_ids: torch.Tensor, tokenizer) -> Optional[int
         return None
 
     # Sliding-window by decode; robust to tokenizer boundary variations.
+    # Use the LAST matched occurrence so that system prompt mentions like
+    # "put the final answer after The answer is" do not hijack the position.
+    matched_pre_pos = None
     for start in range(seq_len):
         for end in range(start + 1, min(seq_len, start + 12) + 1):
             chunk = tokenizer.decode(input_ids[start:end], skip_special_tokens=False)
             norm = _normalize_ws(chunk.lower())
             if target in norm:
                 pre_pos = start - 1
-                return pre_pos if pre_pos >= 0 else None
-    return None
+                if pre_pos >= 0:
+                    matched_pre_pos = pre_pos
+    return matched_pre_pos
 
 
 def l2_norm(v: torch.Tensor) -> torch.Tensor:

@@ -26,6 +26,9 @@ def run_intervention(model, tokenizer, test_trajectories, delta_dict, config, sa
         for q in test_trajectories:
             qid = int(q["question_id"])
             question = q["question"]
+            system_prompt = q.get("system_prompt")
+            user_prompt = q.get("user_prompt")
+            prompt_text = q.get("prompt")
             gt = q["ground_truth"]
             if q.get("skipped", False):
                 continue
@@ -48,6 +51,9 @@ def run_intervention(model, tokenizer, test_trajectories, delta_dict, config, sa
                 h_wrong = l2_norm(h_wrong)
                 _ = l2_norm(e_wrong)  # Reserved for debugging parity with paper setup.
 
+                baseline = _run_no_injection(
+                    model, tokenizer, prefix, dummy_id, gt, config
+                )
                 results = {}
                 for gamma in config.GAMMA_VALUES:
                     gamma_f = float(gamma)
@@ -55,22 +61,31 @@ def run_intervention(model, tokenizer, test_trajectories, delta_dict, config, sa
                     h_vocab = h_wrong + gamma_f * delta_dict["delta_e"].to(h_wrong.device)
                     h_full = h_wrong + gamma_f * delta_dict["delta_h"].to(h_wrong.device)
 
-                    res_ok = _run_one_injection(
+                    res_out = _run_one_injection(
                         model, tokenizer, prefix, dummy_id, h_residual, gt, config
                     )
-                    voc_ok = _run_one_injection(
+                    voc_out = _run_one_injection(
                         model, tokenizer, prefix, dummy_id, h_vocab, gt, config
                     )
-                    full_ok = _run_one_injection(
+                    full_out = _run_one_injection(
                         model, tokenizer, prefix, dummy_id, h_full, gt, config
                     )
-                    results[str(gamma)] = {"residual": res_ok, "vocab": voc_ok, "full": full_ok}
+                    results[str(gamma)] = {
+                        "residual": res_out,
+                        "vocab": voc_out,
+                        "full": full_out,
+                    }
 
                 row = {
                     "question_id": qid,
                     "question": question,
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "prompt": prompt_text,
                     "ground_truth": gt,
                     "wrong_traj_index": wrong_idx,
+                    "original_wrong_text": traj.get("text"),
+                    "baseline": baseline,
                     "results": results,
                 }
                 fout.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -126,7 +141,31 @@ def _run_one_injection(model, tokenizer, prefix, dummy_id, h_intervene, ground_t
 
     text = tokenizer.decode(gen[0], skip_special_tokens=True)
     pred = parse_answer(text)
-    return answers_equal(pred, ground_truth)
+    return {
+        "output_text": text,
+        "pred_answer": pred,
+        "is_correct": answers_equal(pred, ground_truth),
+    }
+
+
+def _run_no_injection(model, tokenizer, prefix, dummy_id, ground_truth, config):
+    input_ids = torch.cat(
+        [prefix, torch.tensor([dummy_id], device=prefix.device, dtype=prefix.dtype)], dim=0
+    ).unsqueeze(0)
+    with torch.no_grad():
+        gen = model.generate(
+            input_ids=input_ids,
+            do_sample=False,
+            max_new_tokens=config.MAX_NEW_TOKENS_INTERVENE,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    text = tokenizer.decode(gen[0], skip_special_tokens=True)
+    pred = parse_answer(text)
+    return {
+        "output_text": text,
+        "pred_answer": pred,
+        "is_correct": answers_equal(pred, ground_truth),
+    }
 
 
 def _get_dummy_id(tokenizer):

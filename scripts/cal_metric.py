@@ -101,6 +101,69 @@ def answers_match(pred_ans: Optional[str], label_ans: Optional[str]) -> bool:
         return pred_ans.strip().lower() == label_ans.strip().lower()
 
 
+def split_system_user_from_prompt(prompt: str) -> tuple[Optional[str], Optional[str], bool]:
+    """
+    Split chat-style prompt text into system/user sections.
+
+    Expected prompt format (roughly):
+      system
+      <system content>
+      user
+      <user content>
+      assistant
+      ...
+    """
+    if not isinstance(prompt, str):
+        return None, None, False
+
+    text = prompt.strip()
+    pattern = re.compile(
+        r"^\s*system\s*\n(?P<system>.*?)\nuser\s*\n(?P<user>.*?)(?:\nassistant\b.*)?$",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    m = pattern.match(text)
+    if not m:
+        return None, None, False
+
+    system_prompt = m.group("system").strip()
+    user_prompt = m.group("user").strip()
+    if not system_prompt or not user_prompt:
+        return None, None, False
+    return system_prompt, user_prompt, True
+
+
+def normalize_record(record: dict) -> dict:
+    """
+    Normalize one JSONL record to a robust internal format.
+
+    Added keys:
+      - system_prompt
+      - user_prompt
+      - prompt_parse_ok
+    """
+    prompt = record.get("prompt", "")
+    label = record.get("label", "")
+    predicts = record.get("predicts", [])
+
+    # Keep predicts as list[str] when possible.
+    if isinstance(predicts, str):
+        predicts = [predicts]
+    elif not isinstance(predicts, list):
+        predicts = []
+    predicts = [p for p in predicts if isinstance(p, str)]
+
+    system_prompt, user_prompt, parse_ok = split_system_user_from_prompt(prompt)
+
+    normalized = dict(record)
+    normalized["prompt"] = prompt if isinstance(prompt, str) else ""
+    normalized["label"] = label if isinstance(label, str) else str(label)
+    normalized["predicts"] = predicts
+    normalized["system_prompt"] = system_prompt
+    normalized["user_prompt"] = user_prompt
+    normalized["prompt_parse_ok"] = parse_ok
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Per-sample metrics
 # ---------------------------------------------------------------------------
@@ -177,12 +240,18 @@ def evaluate_dataset(records: list[dict], k: Optional[int] = None) -> dict:
     per_sample = []
     total_pred_len = 0
     total_pred_count = 0
+    total_prompt_parse_ok = 0
 
     for rec in records:
         label = rec.get("label", "")
         predicts = rec.get("predicts", [])
         result = evaluate_sample(label, predicts, k=k)
+        result["prompt_parse_ok"] = bool(rec.get("prompt_parse_ok", False))
+        result["system_prompt"] = rec.get("system_prompt")
+        result["user_prompt"] = rec.get("user_prompt")
         per_sample.append(result)
+        if result["prompt_parse_ok"]:
+            total_prompt_parse_ok += 1
 
         # Accumulate prediction lengths (whitespace-tokenised)
         preds_used = predicts[:k] if k is not None else predicts
@@ -201,6 +270,7 @@ def evaluate_dataset(records: list[dict], k: Optional[int] = None) -> dict:
         "pass@k":      sum(s["pass@k"]      for s in per_sample) / n,
         "majority@k":  sum(s["majority@k"]  for s in per_sample) / n,
         "avg_correct": sum(s["avg_correct"] for s in per_sample) / n,
+        "prompt_parse_rate": total_prompt_parse_ok / n,
         "mean_pred_len": total_pred_len / total_pred_count if total_pred_count else 0.0,
         "per_sample": per_sample,
     }
@@ -219,7 +289,11 @@ def load_jsonl(path: str) -> list[dict]:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    print(f"[WARN] Line {lineno} is not a JSON object, skipping.", file=sys.stderr)
+                    continue
+                records.append(normalize_record(raw))
             except json.JSONDecodeError as e:
                 print(f"[WARN] Line {lineno} is not valid JSON, skipping: {e}", file=sys.stderr)
     return records
@@ -234,6 +308,7 @@ def print_report(agg: dict) -> None:
     print(f"  pass@k        : {agg['pass@k']:.4f}  ({agg['pass@k']*100:.2f}%)")
     print(f"  majority@k    : {agg['majority@k']:.4f}  ({agg['majority@k']*100:.2f}%)")
     print(f"  avg_correct   : {agg['avg_correct']:.4f}")
+    print(f"  prompt_parse  : {agg['prompt_parse_rate']:.4f}  ({agg['prompt_parse_rate']*100:.2f}%)")
     print(f"  mean_pred_len : {agg['mean_pred_len']:.1f} tokens")
     print(f"{'='*50}\n")
 

@@ -178,7 +178,7 @@ def _build_trajectories_from_sampled_jsonl(
         if not isinstance(predicts, list):
             predicts = []
 
-        _, user_prompt, ok = split_system_user_from_prompt(prompt)
+        system_prompt, user_prompt, ok = split_system_user_from_prompt(prompt)
         question = user_prompt if ok else prompt
         gold = parse_answer(label)
         correct_trajs, wrong_trajs = [], []
@@ -187,9 +187,13 @@ def _build_trajectories_from_sampled_jsonl(
             if not isinstance(pred, str):
                 continue
             pred_ans = parse_answer(pred)
-            token_ids = tokenizer(pred, add_special_tokens=False)["input_ids"]
+            # Keep model input aligned with source file:
+            # token sequence is built from original prompt + prediction text.
+            full_text = f"{prompt}{pred}"
+            token_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
             item = {
                 "text": pred,
+                "full_text": full_text,
                 "token_ids": token_ids,
                 "predicted_answer": pred_ans,
             }
@@ -202,6 +206,9 @@ def _build_trajectories_from_sampled_jsonl(
             {
                 "question_id": qid,
                 "question": question,
+                "system_prompt": system_prompt if ok else None,
+                "user_prompt": user_prompt if ok else None,
+                "prompt": prompt,
                 "ground_truth": gold,
                 "correct_trajs": correct_trajs,
                 "wrong_trajs": wrong_trajs,
