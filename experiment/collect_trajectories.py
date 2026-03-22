@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from .utils import answers_equal, parse_answer
+from .utils import answers_equal, model_input_device, parse_answer
 
 
 SYSTEM_PROMPT = (
@@ -74,7 +74,7 @@ def collect_trajectories(model, tokenizer, dataset_split, config, save_path):
 
 
 def _sample_once(model, tokenizer, prompt_text: str, config):
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model_input_device(model))
     with torch.no_grad():
         outputs = model.generate(
             **inputs,

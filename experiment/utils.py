@@ -9,6 +9,14 @@ from typing import Optional
 import torch
 
 
+def model_input_device(model: torch.nn.Module) -> torch.device:
+    """
+    Device for `input_ids` / `inputs_embeds` when using multi-GPU `device_map='auto'`.
+    `model.device` is unreliable under sharding; tie inputs to the embedding module.
+    """
+    return model.get_input_embeddings().weight.device
+
+
 def parse_answer(text: str) -> Optional[str]:
     """
     Extract answer string from:

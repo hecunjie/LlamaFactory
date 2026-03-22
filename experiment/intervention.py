@@ -7,7 +7,14 @@ from pathlib import Path
 
 import torch
 
-from .utils import answers_equal, compute_esoft, find_pre_answer_position, l2_norm, parse_answer
+from .utils import (
+    answers_equal,
+    compute_esoft,
+    find_pre_answer_position,
+    l2_norm,
+    model_input_device,
+    parse_answer,
+)
 
 
 def run_intervention(model, tokenizer, test_trajectories, delta_dict, config, save_path):
@@ -39,7 +46,7 @@ def run_intervention(model, tokenizer, test_trajectories, delta_dict, config, sa
                     continue
 
                 token_ids = traj["token_ids"]
-                ids = torch.tensor(token_ids, dtype=torch.long, device=model.device)
+                ids = torch.tensor(token_ids, dtype=torch.long, device=model_input_device(model))
                 pre_pos = find_pre_answer_position(ids, tokenizer)
                 if pre_pos is None:
                     continue

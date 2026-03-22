@@ -18,5 +18,7 @@ HIDDEN_LAYER_INDEX = -1
 DELTA_SOURCE = "train"  # "train" or "test"
 
 DEVICE = "cuda"
+# "auto" = HuggingFace/accelerate 自动切多卡； "single" = 整模 .to(cuda) 单卡
+DEVICE_MAP = "auto"
 DTYPE = "bfloat16"
 SAVE_DIR = "./results"

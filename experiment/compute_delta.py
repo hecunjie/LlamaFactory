@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .utils import compute_esoft, find_pre_answer_position, l2_norm
+from .utils import compute_esoft, find_pre_answer_position, l2_norm, model_input_device
 
 
 def compute_delta(model, tokenizer, trajectories_data, config, save_path):
@@ -58,7 +58,7 @@ def compute_delta(model, tokenizer, trajectories_data, config, save_path):
 
 
 def _extract_h_and_esoft(model, tokenizer, token_ids, embedding_matrix, config):
-    ids = torch.tensor(token_ids, dtype=torch.long, device=model.device)
+    ids = torch.tensor(token_ids, dtype=torch.long, device=model_input_device(model))
     if ids.numel() < 2:
         return None, None
     pre_pos = find_pre_answer_position(ids, tokenizer)

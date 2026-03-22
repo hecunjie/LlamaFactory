@@ -20,14 +20,24 @@ if __package__ is None or __package__ == "":
     from experiment.collect_trajectories import collect_trajectories
     from experiment.compute_delta import compute_delta
     from experiment.intervention import run_intervention
-    from experiment.utils import answers_equal, parse_answer, split_system_user_from_prompt
+    from experiment.utils import (
+        answers_equal,
+        model_input_device,
+        parse_answer,
+        split_system_user_from_prompt,
+    )
 else:
     from . import config as default_config
     from .analysis import analyze_and_plot
     from .collect_trajectories import collect_trajectories
     from .compute_delta import compute_delta
     from .intervention import run_intervention
-    from .utils import answers_equal, parse_answer, split_system_user_from_prompt
+    from .utils import (
+        answers_equal,
+        model_input_device,
+        parse_answer,
+        split_system_user_from_prompt,
+    )
 
 
 def main():
@@ -46,6 +56,13 @@ def main():
         default=None,
         help="Local test dataset path (json/jsonl) with question+answer (or instruction+output)",
     )
+    parser.add_argument(
+        "--device_map",
+        type=str,
+        default=None,
+        choices=["auto", "single"],
+        help="auto: multi-GPU via HF device_map; single: one GPU .to(cuda). Default: config DEVICE_MAP",
+    )
     args = parser.parse_args()
 
     cfg = _build_runtime_config(args)
@@ -58,15 +75,28 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = torch.bfloat16 if cfg.DTYPE == "bfloat16" else torch.float16
+    map_mode = args.device_map or getattr(cfg, "DEVICE_MAP", "auto")
+    use_auto_map = (
+        cfg.DEVICE == "cuda"
+        and torch.cuda.is_available()
+        and map_mode == "auto"
+    )
     model = AutoModelForCausalLM.from_pretrained(
         cfg.MODEL_NAME,
         torch_dtype=dtype,
         trust_remote_code=True,
+        device_map="auto" if use_auto_map else None,
+        low_cpu_mem_usage=use_auto_map,
     ).eval()
-    if cfg.DEVICE == "cuda" and torch.cuda.is_available():
-        model = model.to("cuda")
-    else:
-        model = model.to("cpu")
+    if not use_auto_map:
+        if cfg.DEVICE == "cuda" and torch.cuda.is_available():
+            model = model.to("cuda")
+        else:
+            model = model.to("cpu")
+    print(
+        f"[run] model load: device_map={'auto' if use_auto_map else 'None (single/cpu)'}, "
+        f"input_device={model_input_device(model)}"
+    )
 
     ds_train = None
     ds_test = None
@@ -129,7 +159,7 @@ def main():
             )
         else:
             test_trajectories = _load_json(test_traj_path)
-        delta_dict = torch.load(delta_path, map_location=model.device)
+        delta_dict = torch.load(delta_path, map_location=model_input_device(model))
         run_intervention(model, tokenizer, test_trajectories, delta_dict, cfg, inter_path)
 
     # Phase 4
@@ -144,6 +174,8 @@ def _build_runtime_config(args):
         data["MODEL_NAME"] = args.model
     if args.delta_source is not None:
         data["DELTA_SOURCE"] = args.delta_source
+    if args.device_map is not None:
+        data["DEVICE_MAP"] = args.device_map
     return types.SimpleNamespace(**data)
 
 
