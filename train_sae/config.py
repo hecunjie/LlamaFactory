@@ -41,3 +41,5 @@ SEED = 42
 
 # 提取进度：每处理多少道题打印一次
 EXTRACT_PROGRESS_EVERY = 20
+# 每处理多少道题再调用 torch.cuda.empty_cache（每题都调用会严重拖慢速度；0 表示仅在出错/结束时清理）
+EMPTY_CACHE_EVERY = 50

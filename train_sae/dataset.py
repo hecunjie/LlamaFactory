@@ -57,80 +57,114 @@ def _answers_equal(pred: Optional[str], gold: Optional[str]) -> bool:
     return answers_equal(pred, gold)
 
 
-def _response_entropies_and_hidden(
+def _forward_batch_entropy_hidden(
     llm_model: torch.nn.Module,
-    tokenizer: Any,
-    prompt: str,
-    predict: str,
     device: torch.device,
     layer_index: int,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+    full_id_rows: list[torch.Tensor],
+    prompt_len: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """
-    单次 forward：返回 response 段每 token 的熵 (resp_len,)、
-    指定层 response 位置上的 hidden (resp_len, hidden_dim) float32，
-    以及 prompt_len。
-    若 predict 为空或序列非法，返回空张量。
+    同一道题内多条轨迹一次 batch forward。
+
+    full_id_rows: 每条为 shape (1, L) 的 LongTensor（CPU 即可，内部一次性拷到 device）。
+    返回与 full_id_rows 等长的列表，每项为 (ent_cpu, h_resp_cpu)，无效序列为空张量。
     """
     hidden_dim = int(llm_model.config.hidden_size)
-    if not predict:
-        return (
-            torch.tensor([], dtype=torch.float32, device="cpu"),
-            torch.empty(0, hidden_dim, dtype=torch.float32),
-            0,
-        )
+    empty_ent = torch.tensor([], dtype=torch.float32)
+    empty_h = torch.empty(0, hidden_dim, dtype=torch.float32)
 
-    enc = tokenizer(
+    if not full_id_rows:
+        return []
+
+    B = len(full_id_rows)
+    lens = [int(t.shape[1]) for t in full_id_rows]
+    max_len = max(lens)
+    input_ids = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    for i, row in enumerate(full_id_rows):
+        L = int(row.shape[1])
+        input_ids[i, :L] = row.view(-1).to(device, non_blocking=True)
+        attention_mask[i, :L] = 1
+
+    with torch.inference_mode():
+        out = llm_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+    logits = out.logits
+    hs_tuple = out.hidden_states
+    if hs_tuple is None:
+        raise RuntimeError("模型未返回 hidden_states，请确认 forward 参数。")
+    layer_h = hs_tuple[layer_index]
+
+    results: list[tuple[torch.Tensor, torch.Tensor]] = []
+    P = int(prompt_len)
+    for i, L in enumerate(lens):
+        if L <= P:
+            results.append((empty_ent, empty_h))
+            continue
+        # 仅使用真实长度 L 内的 logits / hidden，忽略右侧 padding
+        resp_logits = logits[i, P - 1 : L - 1, :].float()
+        resp_len = L - P
+
+        probs = torch.softmax(resp_logits, dim=-1)
+        log_probs = torch.log(probs + 1e-10)
+        ent = -(probs * log_probs).sum(dim=-1).cpu().float()
+
+        h_resp = layer_h[i, P : P + resp_len, :].float().cpu()
+        n = min(int(ent.shape[0]), int(h_resp.shape[0]))
+        results.append((ent[:n], h_resp[:n]))
+
+    return results
+
+
+def _tokenize_prompt_and_full_rows(
+    tokenizer: Any,
+    prompt: str,
+    predicts: list[Any],
+) -> tuple[int, list[Optional[torch.Tensor]]]:
+    """
+    对同一 prompt 只 tokenize 一次；为每条 predict 构造 full_ids (1, L)（CPU LongTensor）。
+
+    返回 (prompt_len, full_rows)。full_rows 与 predicts 等长：
+      - 非 str 的 predict：占位 None（调用方应 continue，不写入 per_traj）
+      - 无法构成有效序列：None（调用方写入空轨迹）
+      - 否则：shape (1, L) 的 LongTensor
+    """
+    prompt_enc = tokenizer(
         prompt,
         add_special_tokens=False,
         return_tensors="pt",
     )
-    prompt_ids = enc["input_ids"].to(device)
-    resp_enc = tokenizer(
-        predict,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )
-    resp_ids = resp_enc["input_ids"].to(device)
-    if prompt_ids.numel() == 0 or resp_ids.numel() == 0:
-        return (
-            torch.tensor([], dtype=torch.float32, device="cpu"),
-            torch.empty(0, hidden_dim, dtype=torch.float32),
-            int(prompt_ids.shape[1]),
-        )
-
-    full_ids = torch.cat([prompt_ids, resp_ids], dim=1)
-    prompt_len = int(prompt_ids.shape[1])
-    seq_len = int(full_ids.shape[1])
-    if seq_len <= prompt_len:
-        return (
-            torch.tensor([], dtype=torch.float32, device="cpu"),
-            torch.empty(0, hidden_dim, dtype=torch.float32),
-            prompt_len,
-        )
-
-    with torch.no_grad():
-        out = llm_model(
-            input_ids=full_ids,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        logits = out.logits  # (1, seq_len, vocab)
-        hs_tuple = out.hidden_states
-        if hs_tuple is None:
-            raise RuntimeError("模型未返回 hidden_states，请确认 forward 参数。")
-        layer_h = hs_tuple[layer_index]  # (1, seq_len, hidden_dim)
-
-    # 与 causal LM 对齐：位置 prompt_len-1 .. seq_len-2 的 logits 预测 response 各 token
-    resp_logits = logits[0, prompt_len - 1 : -1, :]  # (resp_len, vocab)
-    resp_len = int(resp_logits.shape[0])
-    probs = torch.softmax(resp_logits.float(), dim=-1)
-    log_probs = torch.log(probs + 1e-10)
-    ent = -(probs * log_probs).sum(dim=-1).detach().cpu().float()
-
-    # hidden 与 response token 对齐：位置 prompt_len .. prompt_len+resp_len-1
-    h_resp = layer_h[0, prompt_len : prompt_len + resp_len, :].float().cpu()
-    n = min(int(ent.shape[0]), int(h_resp.shape[0]))
-    return ent[:n], h_resp[:n], prompt_len
+    prompt_t = prompt_enc["input_ids"].cpu()
+    if prompt_t.numel() == 0:
+        return 0, [None] * len(predicts)
+    P = int(prompt_t.shape[1])
+    rows: list[Optional[torch.Tensor]] = []
+    for pred_text in predicts:
+        if not isinstance(pred_text, str):
+            rows.append(None)
+            continue
+        if not pred_text:
+            rows.append(None)
+            continue
+        resp = tokenizer(
+            pred_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )["input_ids"].cpu()
+        if resp.numel() == 0:
+            rows.append(None)
+            continue
+        full = torch.cat([prompt_t, resp], dim=1)
+        if int(full.shape[1]) <= P:
+            rows.append(None)
+        else:
+            rows.append(full)
+    return P, rows
 
 
 class HiddenStateDataset(Dataset):
@@ -211,6 +245,9 @@ class HiddenStateDataset(Dataset):
         all_entropies: list[float] = []
         all_meta: list[dict[str, Any]] = []
 
+        hidden_dim = int(llm_model.config.hidden_size)
+        empty_every = int(getattr(self.config, "EMPTY_CACHE_EVERY", 50))
+
         for qid, row in enumerate(rows):
             if qid > 0 and qid % int(self.config.EXTRACT_PROGRESS_EVERY) == 0:
                 print(f"[dataset] 已处理题目进度: {qid}/{len(rows)}")
@@ -224,15 +261,54 @@ class HiddenStateDataset(Dataset):
                     predicts = []
                 predicts = predicts[:max_pred]
 
-                # ---------- 第一遍：收集本题所有 response token 的熵 ----------
+                prompt_len_p, full_rows = _tokenize_prompt_and_full_rows(
+                    tokenizer, prompt, predicts
+                )
+                if prompt_len_p == 0:
+                    continue
+
+                # 本题所有有效序列一次 batch forward（通常远快于逐条 forward）
+                batch_pairs: list[tuple[int, torch.Tensor]] = []
+                for tid, pred_text in enumerate(predicts):
+                    if not isinstance(pred_text, str):
+                        continue
+                    fr = full_rows[tid]
+                    if fr is not None:
+                        batch_pairs.append((tid, fr))
+
+                tid_to_eh: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+                if batch_pairs:
+                    outs = _forward_batch_entropy_hidden(
+                        llm_model,
+                        dev,
+                        layer_index,
+                        [p[1] for p in batch_pairs],
+                        prompt_len_p,
+                    )
+                    for j, (tid, _) in enumerate(batch_pairs):
+                        tid_to_eh[tid] = outs[j]
+
                 pool: list[float] = []
                 per_traj: list[dict[str, Any]] = []
                 for tid, pred_text in enumerate(predicts):
                     if not isinstance(pred_text, str):
                         continue
-                    ent, h_resp, _ = _response_entropies_and_hidden(
-                        llm_model, tokenizer, prompt, pred_text, dev, layer_index
-                    )
+                    pa = _parse_boxed(pred_text)
+                    correct = _answers_equal(pa, gold)
+                    fr = full_rows[tid]
+                    if fr is None:
+                        per_traj.append(
+                            {
+                                "tid": tid,
+                                "text": pred_text,
+                                "ent": torch.tensor([], dtype=torch.float32),
+                                "h": torch.empty(0, hidden_dim, dtype=torch.float32),
+                                "correct": correct,
+                            }
+                        )
+                        continue
+
+                    ent, h_resp = tid_to_eh[tid]
                     if ent.numel() == 0:
                         per_traj.append(
                             {
@@ -240,14 +316,12 @@ class HiddenStateDataset(Dataset):
                                 "text": pred_text,
                                 "ent": torch.tensor([], dtype=torch.float32),
                                 "h": h_resp,
-                                "correct": False,
+                                "correct": correct,
                             }
                         )
                         continue
-                    pa = _parse_boxed(pred_text)
-                    correct = _answers_equal(pa, gold)
-                    for e in ent.tolist():
-                        pool.append(float(e))
+
+                    pool.extend(ent.numpy().astype(np.float64, copy=False).ravel().tolist())
                     per_traj.append(
                         {
                             "tid": tid,
@@ -263,18 +337,22 @@ class HiddenStateDataset(Dataset):
 
                 thr = float(np.percentile(np.asarray(pool, dtype=np.float64), pctl))
 
-                # ---------- 第二遍：取高熵位置的 hidden，L2 归一化 ----------
+                # 取高熵位置的 hidden，L2 归一化（向量化筛选）
                 for info in per_traj:
                     ent = info["ent"]
                     h_resp = info["h"]
                     if ent.numel() == 0 or h_resp.numel() == 0:
                         continue
-                    n = min(ent.shape[0], h_resp.shape[0])
-                    for pos in range(n):
-                        e = float(ent[pos].item())
-                        if e < thr:
-                            continue
-                        h = h_resp[pos].clone()
+                    n = min(int(ent.shape[0]), int(h_resp.shape[0]))
+                    e_np = ent[:n].numpy()
+                    mask = e_np >= thr
+                    if not np.any(mask):
+                        continue
+                    idxs = np.flatnonzero(mask)
+                    h_slice = h_resp[:n]
+                    for pos in idxs:
+                        e = float(e_np[pos])
+                        h = h_slice[int(pos)].clone()
                         h = h / (h.norm(p=2) + 1e-8)
                         all_hs.append(h)
                         all_labels.append(1 if info["correct"] else 0)
@@ -292,7 +370,13 @@ class HiddenStateDataset(Dataset):
             except Exception as e:  # noqa: BLE001
                 warnings.warn(f"题目 {qid} 提取失败，已跳过: {e}", UserWarning, stacklevel=1)
             finally:
-                if torch.cuda.is_available() and str(dev).startswith("cuda"):
+                if (
+                    torch.cuda.is_available()
+                    and str(dev).startswith("cuda")
+                    and empty_every > 0
+                    and qid > 0
+                    and qid % empty_every == 0
+                ):
                     torch.cuda.empty_cache()
 
         if not all_hs:
