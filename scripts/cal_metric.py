@@ -51,6 +51,18 @@ def _normalize_number(text: str) -> Optional[str]:
             return str(val)
         except (ValueError, OverflowError):
             pass
+    # e.g. "540 meters" after #### or "The answer is ..."
+    m2 = re.match(r"^(-?\d+(?:\.\d+)?)", text)
+    if m2:
+        try:
+            val = float(m2.group(1))
+            if not math.isfinite(val):
+                return None
+            if val == int(val):
+                return str(int(val))
+            return str(val)
+        except (ValueError, OverflowError):
+            pass
     return None
 
 

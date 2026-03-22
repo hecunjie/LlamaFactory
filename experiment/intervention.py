@@ -112,32 +112,32 @@ def _extract_wrong_states(model, prefix_ids, emb_matrix, top_k):
 
 
 def _run_one_injection(model, tokenizer, prefix, dummy_id, h_intervene, ground_truth, config):
+    """
+    干预：与 baseline 使用相同的 input_ids 前缀 + dummy，但把 dummy 位置的
+    embedding 换成 h_intervene（不依赖 forward_hook；部分版本 generate 可能
+    不走你挂 hook 的 embedding 路径，导致 hook 形同未生效）。
+    """
     input_ids = torch.cat(
         [prefix, torch.tensor([dummy_id], device=prefix.device, dtype=prefix.dtype)], dim=0
     ).unsqueeze(0)
-    done = {"used": False}
     h_inj = h_intervene.detach()
 
-    def _hook(_module, _input, output):
-        # Inject only once at the last token embedding of first call.
-        if done["used"]:
-            return output
-        out = output.clone()
-        out[:, -1, :] = h_inj
-        done["used"] = True
-        return out
+    with torch.no_grad():
+        inputs_embeds = model.get_input_embeddings()(input_ids).clone()
+    inputs_embeds[:, -1, :] = h_inj.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
-    handle = model.get_input_embeddings().register_forward_hook(_hook)
-    try:
-        with torch.no_grad():
-            gen = model.generate(
-                input_ids=input_ids,
-                do_sample=False,
-                max_new_tokens=config.MAX_NEW_TOKENS_INTERVENE,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-    finally:
-        handle.remove()
+    attention_mask = torch.ones(
+        input_ids.shape, device=input_ids.device, dtype=torch.long
+    )
+
+    with torch.no_grad():
+        gen = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=config.MAX_NEW_TOKENS_INTERVENE,
+            pad_token_id=tokenizer.pad_token_id,
+        )
 
     text = tokenizer.decode(gen[0], skip_special_tokens=True)
     pred = parse_answer(text)

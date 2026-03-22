@@ -125,6 +125,12 @@ def split_system_user_from_prompt(prompt: str) -> tuple[Optional[str], Optional[
 
 
 def _normalize_answer_token(text: str) -> Optional[str]:
+    """
+    Normalize a single answer span to a canonical string for comparison.
+
+    Handles GSM8K-style outputs like \"540 meters\", \"$42\", \"12,345 dollars\"
+    by parsing the leading numeric literal when the whole string is not a float.
+    """
     s = text.strip().replace(",", "").replace("$", "").replace("%", "").rstrip(".")
     if not s:
         return None
@@ -136,6 +142,17 @@ def _normalize_answer_token(text: str) -> Optional[str]:
             return str(v)
     except (ValueError, OverflowError):
         pass
+    # e.g. "540 meters", "42 apples" — compare numeric part to gold "540" / "42"
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)", s)
+    if m:
+        try:
+            v = float(m.group(1))
+            if math.isfinite(v):
+                if abs(v - int(v)) <= 1e-12:
+                    return str(int(v))
+                return str(v)
+        except (ValueError, OverflowError):
+            pass
     return s
 
 
