@@ -84,13 +84,14 @@ def convert_to_alpaca(examples: list[dict]) -> tuple[list[dict], int]:
         solution = ex["solution"].strip()
         boxed = extract_last_boxed(solution)
         if boxed is not None:
-            output = f"{solution}\n#### {boxed}"
+            output = f"{solution}\nThe answer is {boxed}"
         else:
             output = solution
             missing += 1
         results.append({
             "instruction": instruction,
             "output": output,
+            "answer": boxed,
         })
     return results, missing
 
