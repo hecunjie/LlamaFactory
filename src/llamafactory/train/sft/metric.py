@@ -186,7 +186,7 @@ class ComputeExactMatch:
         return None
 
     @staticmethod
-    def _extract_answer_from_output(text: str) -> str:
+    def _extract_answer_from_output(text: str) -> Optional[str]:
         r"""Extract final answer from model output.
 
         Priority:
@@ -195,7 +195,7 @@ class ComputeExactMatch:
         3) after last "###"
         4) after last "The final answer is ..."
         5) after last "The answer is ..."
-        6) full stripped text
+        6) if no explicit marker found, return None in strict mode
         """
         text = text.strip()
 
@@ -218,7 +218,22 @@ class ComputeExactMatch:
         if answer_is_matches:
             return ComputeExactMatch._normalize_extracted_answer(answer_is_matches[-1].strip())
 
-        return ComputeExactMatch._normalize_extracted_answer(text)
+        return None
+
+    @staticmethod
+    def _compare_answers_strict(pred: Optional[str], label: Optional[str]) -> bool:
+        """Strict answer comparison for exact-match evaluation."""
+        if pred is None or label is None:
+            return False
+        if pred == label:
+            return True
+
+        # Numeric equality when both are valid numeric answers.
+        pred_num = ComputeExactMatch._extract_last_number(pred)
+        label_num = ComputeExactMatch._extract_last_number(label)
+        if pred_num is not None and label_num is not None:
+            return abs(pred_num - label_num) < 1e-6
+        return False
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
@@ -249,7 +264,7 @@ class ComputeExactMatch:
                 pred_answer = self._extract_answer_from_output(decoded_pred)
                 label_answer = self._extract_answer_from_output(decoded_label)
 
-                match = self._compare_answers(pred_answer, label_answer)
+                match = self._compare_answers_strict(pred_answer, label_answer)
                 self.score_dict["exact_match"].append(1.0 if match else 0.0)
 
                 # Debug: log first 3 samples per eval call to diagnose
@@ -294,7 +309,7 @@ class ComputeExactMatch:
                 pred_answer = self._extract_answer_from_output(decoded_pred)
                 label_answer = self._extract_answer_from_output(decoded_label)
 
-                match = self._compare_answers(pred_answer, label_answer)
+                match = self._compare_answers_strict(pred_answer, label_answer)
                 self.score_dict["exact_match"].append(1.0 if match else 0.0)
 
         if compute_result:

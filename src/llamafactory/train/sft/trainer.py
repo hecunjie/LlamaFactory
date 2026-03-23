@@ -1328,7 +1328,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             seq = preds[i]
             valid_len = (seq != self.processing_class.pad_token_id).sum()
             seq = seq[:valid_len]
-            ans_text = self.processing_class.decode(seq, skip_special_tokens=False)
+            # Keep decoding behavior consistent with online exact-match metric.
+            ans_text = self.processing_class.decode(seq, skip_special_tokens=skip_special_tokens)
             decoded_answers.append(ans_text)
 
         # Debug: log first sample
