@@ -1078,6 +1078,29 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             f"[eval] eval_loss_sft={output.metrics.get('eval_loss_sft', 'N/A')}, "
             f"eval_loss_reasoning={output.metrics.get('eval_loss_reasoning', 'N/A')}"
         )
+
+        # Persist generated predictions at every eval call for step-by-step analysis.
+        if (
+            self.args.predict_with_generate
+            and self.is_world_process_zero()
+            and getattr(output, "predictions", None) is not None
+            and getattr(output, "label_ids", None) is not None
+        ):
+            eval_dataloader = kwargs.get("dataloader", None)
+            eval_dataset = getattr(eval_dataloader, "dataset", None)
+            metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
+            if eval_dataset is not None:
+                dump_dir = os.path.join(self.args.output_dir, "eval_predictions")
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_file = os.path.join(dump_dir, f"{metric_key_prefix}_step_{self.state.global_step}.jsonl")
+                self.save_predictions(
+                    eval_dataset,
+                    output,
+                    skip_special_tokens=True,
+                    output_file=dump_file,
+                )
+                logger.info_rank0(f"[eval] Saved intermediate predictions to: {dump_file}")
+
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         return output
 
@@ -1252,7 +1275,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return self.processing_class.decode(result_ids, skip_special_tokens=False)
 
     def save_predictions(
-        self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
+        self,
+        dataset: "Dataset",
+        predict_results: "PredictionOutput",
+        skip_special_tokens: bool = True,
+        output_file: Optional[str] = None,
     ) -> None:
         r"""Save model predictions to `output_dir`.
 
@@ -1265,7 +1292,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not self.is_world_process_zero():
             return
 
-        output_prediction_file = os.path.join(self.args.output_dir, "generated_predictions.jsonl")
+        output_prediction_file = output_file or os.path.join(self.args.output_dir, "generated_predictions.jsonl")
         logger.info_rank0(f"Saving prediction results to {output_prediction_file}")
 
         labels = np.where(
