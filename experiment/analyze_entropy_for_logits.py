@@ -53,6 +53,19 @@ def classify_case(
     return CASE_AMBIGUOUS
 
 
+def classify_high_case(
+    top1_prob: float,
+    top5_mass: float,
+    max_cosine_sim: float,
+    sim_threshold: float,
+) -> str:
+    if top5_mass >= 0.6 and top1_prob < 0.4:
+        return CASE_A
+    if max_cosine_sim < sim_threshold:
+        return CASE_B
+    return CASE_AMBIGUOUS
+
+
 def _summarize(arr: np.ndarray, keys: list[float]) -> dict[float, float]:
     if arr.size == 0:
         return {k: float("nan") for k in keys}
@@ -157,6 +170,12 @@ def main() -> None:
     parser.add_argument("--model", type=str, required=True, help="Local model checkpoint path")
     parser.add_argument("--max_samples", type=int, default=200, help="Max samples to analyze")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument(
+        "--high_entropy_topk",
+        type=int,
+        default=20,
+        help="每个 batch 在错误样本路径上按熵全局选取的 top-k 数量",
+    )
     parser.add_argument("--entropy_threshold", type=float, default=2.0, help="High entropy threshold")
     parser.add_argument("--sim_threshold", type=float, default=0.3, help="Low-confidence sim threshold")
     parser.add_argument("--only_wrong", action="store_true", default=True, help="Analyze only wrong samples")
@@ -217,6 +236,7 @@ def main() -> None:
     all_entropies: list[float] = []
     all_max_sims: list[float] = []
     case_counts_global = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
+    case_counts_high = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
     all_high_rows: list[dict[str, Any]] = []
     per_sample_json_rows: list[dict[str, Any]] = []
     total_positions = 0
@@ -252,6 +272,9 @@ def main() -> None:
         bsz, seq_len, vocab_size = logits.shape
         _ = vocab_size
 
+        batch_sample_buffers: list[dict[str, Any]] = []
+        batch_wrong_candidates: list[tuple[float, int, int]] = []  # (entropy, sample_i, token_t)
+
         for i in range(bsz):
             attn_len = int(attention_mask[i].sum().item())
             prompt_len = int(prompt_lens[i])
@@ -260,17 +283,21 @@ def main() -> None:
             is_correct = pred_answer == gold_answer
 
             sample_case_counts = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
-            sample_high_positions: list[dict[str, Any]] = []
+            sample_total_positions = 0
 
             if attn_len <= 1 or prompt_len >= attn_len:
-                per_sample_json_rows.append(
+                batch_sample_buffers.append(
                     {
                         "prompt_preview": prompts[i][:80],
                         "is_correct": is_correct,
                         "total_positions": 0,
-                        "high_entropy_count": 0,
                         "case_counts": sample_case_counts,
-                        "high_entropy_positions": [],
+                        "token_metrics": [],
+                        "target_ids": None,
+                        "top5_ids": None,
+                        "top5_vals": None,
+                        "top5_cosine_sim": None,
+                        "sample_i": i,
                     }
                 )
                 continue
@@ -278,14 +305,18 @@ def main() -> None:
             pred_start = max(prompt_len - 1, 0)
             pred_end = attn_len - 1
             if pred_start >= pred_end:
-                per_sample_json_rows.append(
+                batch_sample_buffers.append(
                     {
                         "prompt_preview": prompts[i][:80],
                         "is_correct": is_correct,
                         "total_positions": 0,
-                        "high_entropy_count": 0,
                         "case_counts": sample_case_counts,
-                        "high_entropy_positions": [],
+                        "token_metrics": [],
+                        "target_ids": None,
+                        "top5_ids": None,
+                        "top5_vals": None,
+                        "top5_cosine_sim": None,
+                        "sample_i": i,
                     }
                 )
                 continue
@@ -295,14 +326,18 @@ def main() -> None:
             target_ids = input_ids[i, prompt_len:attn_len]
             npos = int(min(logits_i.shape[0], target_ids.shape[0]))
             if npos <= 0:
-                per_sample_json_rows.append(
+                batch_sample_buffers.append(
                     {
                         "prompt_preview": prompts[i][:80],
                         "is_correct": is_correct,
                         "total_positions": 0,
-                        "high_entropy_count": 0,
                         "case_counts": sample_case_counts,
-                        "high_entropy_positions": [],
+                        "token_metrics": [],
+                        "target_ids": None,
+                        "top5_ids": None,
+                        "top5_vals": None,
+                        "top5_cosine_sim": None,
+                        "sample_i": i,
                     }
                 )
                 continue
@@ -336,9 +371,7 @@ def main() -> None:
             entropy_np = entropy.float().cpu().numpy()
             top1_np = top1_prob.float().cpu().numpy()
             top5_mass_np = top5_mass.float().cpu().numpy()
-
-            sample_total_positions = 0
-            sample_high_count = 0
+            token_metrics: list[dict[str, Any]] = []
 
             for t in range(npos):
                 sample_total_positions += 1
@@ -359,17 +392,81 @@ def main() -> None:
                 case_counts_global[case] += 1
                 all_entropies.append(e)
                 all_max_sims.append(ms)
+                token_metrics.append(
+                    {
+                        "t": t,
+                        "entropy": e,
+                        "top1_prob": p1,
+                        "top5_mass": p5m,
+                        "max_cosine_sim": ms,
+                    }
+                )
+                if not is_correct:
+                    batch_wrong_candidates.append((e, i, t))
 
-                if e > args.entropy_threshold:
+            batch_sample_buffers.append(
+                {
+                    "prompt_preview": prompts[i][:80],
+                    "is_correct": is_correct,
+                    "total_positions": sample_total_positions,
+                    "case_counts": sample_case_counts,
+                    "token_metrics": token_metrics,
+                    "target_ids": target_ids.detach().cpu(),
+                    "top5_ids": top5_ids.detach().cpu(),
+                    "top5_vals": top5_vals.detach().cpu(),
+                    "top5_cosine_sim": top5_cosine_sim.detach().cpu(),
+                    "sample_i": i,
+                }
+            )
+
+        # 按 batch 在“错误路径”上全局取 top-k 高熵 token
+        k = max(0, int(args.high_entropy_topk))
+        high_key_set: set[tuple[int, int]] = set()
+        if k > 0 and batch_wrong_candidates:
+            if len(batch_wrong_candidates) <= k:
+                high_key_set = {(si, tt) for _, si, tt in batch_wrong_candidates}
+            else:
+                ent_arr = np.asarray([x[0] for x in batch_wrong_candidates], dtype=np.float64)
+                pick_idx = np.argpartition(ent_arr, -k)[-k:]
+                high_key_set = {
+                    (batch_wrong_candidates[int(j)][1], batch_wrong_candidates[int(j)][2]) for j in pick_idx
+                }
+
+        for sample_buf in batch_sample_buffers:
+            sample_i = int(sample_buf["sample_i"])
+            sample_high_positions: list[dict[str, Any]] = []
+            sample_high_count = 0
+            is_correct = bool(sample_buf["is_correct"])
+            token_metrics = sample_buf["token_metrics"]
+            target_ids = sample_buf["target_ids"]
+            top5_ids = sample_buf["top5_ids"]
+            top5_vals = sample_buf["top5_vals"]
+            top5_cosine_sim = sample_buf["top5_cosine_sim"]
+
+            if target_ids is not None and top5_ids is not None and top5_vals is not None and top5_cosine_sim is not None:
+                for m in token_metrics:
+                    t = int(m["t"])
+                    if (sample_i, t) not in high_key_set:
+                        continue
+                    e = float(m["entropy"])
+                    p1 = float(m["top1_prob"])
+                    p5m = float(m["top5_mass"])
+                    ms = float(m["max_cosine_sim"])
+                    case = classify_high_case(
+                        top1_prob=p1,
+                        top5_mass=p5m,
+                        max_cosine_sim=ms,
+                        sim_threshold=args.sim_threshold,
+                    )
                     sample_high_count += 1
                     high_entropy_count += 1
                     token_id = int(target_ids[t].item())
                     token_str = tokenizer.convert_ids_to_tokens([token_id])[0]
                     top_ids_t = top5_ids[t].tolist()
-                    top_probs_t = top5_vals[t].float().cpu().tolist()
+                    top_probs_t = top5_vals[t].float().tolist()
                     top_tokens_t = tokenizer.convert_ids_to_tokens(top_ids_t)
                     row = {
-                        "sample_idx": st + i,
+                        "sample_idx": st + sample_i,
                         "t": t,
                         "token": token_str,
                         "entropy": e,
@@ -383,14 +480,16 @@ def main() -> None:
                     }
                     sample_high_positions.append(row)
                     all_high_rows.append(row)
+                    if case in case_counts_high:
+                        case_counts_high[case] += 1
 
             per_sample_json_rows.append(
                 {
-                    "prompt_preview": prompts[i][:80],
+                    "prompt_preview": sample_buf["prompt_preview"],
                     "is_correct": is_correct,
-                    "total_positions": sample_total_positions,
+                    "total_positions": int(sample_buf["total_positions"]),
                     "high_entropy_count": sample_high_count,
-                    "case_counts": sample_case_counts,
+                    "case_counts": sample_buf["case_counts"],
                     "high_entropy_positions": sample_high_positions,
                 }
             )
@@ -411,7 +510,7 @@ def main() -> None:
     denom_high = max(high_entropy_count, 1)
     denom_total = max(total_positions, 1)
     for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
-        cnt = case_counts_global[c]
+        cnt = case_counts_high[c]
         print(
             f"  {c:<12}: {cnt:>5d}  "
             f"({100.0 * cnt / denom_high:>5.1f}% of 高熵, {100.0 * cnt / denom_total:>5.1f}% of 总数)"
