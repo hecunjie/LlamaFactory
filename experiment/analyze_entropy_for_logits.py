@@ -323,7 +323,7 @@ def main() -> None:
             if pred_start >= pred_end:
                 batch_sample_buffers.append(
                     {
-                        "prompt_preview": prompts[i][:80],
+                        "prompt_preview": prompts[i],
                         "is_correct": is_correct,
                         "total_positions": 0,
                         "case_counts": sample_case_counts,

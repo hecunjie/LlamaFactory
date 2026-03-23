@@ -3,8 +3,8 @@ python experiment/analyze_entropy_for_logits.py \
   --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/checkpoint-468 \
   --max_samples 3000 \
   --batch_size 4 \
-  --entropy_threshold 1.0 \
-  --sim_threshold 0.2 \
+  --high_entropy_topk 20 \
+  --sim_threshold 1.0 \
   --only_wrong \
   --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_analysis.png \
   --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_results.jsonl
