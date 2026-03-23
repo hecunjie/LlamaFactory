@@ -362,14 +362,17 @@ def main() -> None:
             hidden_i = hidden_i[:npos]
             target_ids = target_ids[:npos]
 
-            probs = torch.softmax(logits_i, dim=-1)
-            log_probs = torch.log(probs + 1e-12)
+            # 数值稳定：在 fp32 上计算概率与熵，避免 fp16 下出现 NaN/Inf
+            logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            probs = torch.softmax(logits_i_fp32, dim=-1)
+            log_probs = torch.log(probs.clamp_min(1e-12))
             entropy = -(probs * log_probs).sum(dim=-1)
             top1_prob = probs.max(dim=-1).values
             top5_vals, top5_ids = probs.topk(k=min(5, probs.shape[-1]), dim=-1)
             top5_mass = top5_vals.sum(dim=-1)
 
-            h_norm = F.normalize(hidden_i, dim=-1)
+            hidden_i = torch.nan_to_num(hidden_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            h_norm = F.normalize(hidden_i, dim=-1, eps=1e-12)
             h_norm = h_norm.to(embed_norm_t.device, dtype=embed_norm_t.dtype)
 
             # chunked matmul to reduce peak memory usage
@@ -406,8 +409,10 @@ def main() -> None:
                 )
                 sample_case_counts[case] += 1
                 case_counts_global[case] += 1
-                all_entropies.append(e)
-                all_max_sims.append(ms)
+                if np.isfinite(e):
+                    all_entropies.append(e)
+                if np.isfinite(ms):
+                    all_max_sims.append(ms)
                 token_metrics.append(
                     {
                         "t": t,
@@ -417,7 +422,7 @@ def main() -> None:
                         "max_cosine_sim": ms,
                     }
                 )
-                if not is_correct:
+                if (not is_correct) and np.isfinite(e):
                     batch_wrong_candidates.append((e, i, t))
 
             batch_sample_buffers.append(
@@ -468,6 +473,8 @@ def main() -> None:
                     p1 = float(m["top1_prob"])
                     p5m = float(m["top5_mass"])
                     ms = float(m["max_cosine_sim"])
+                    if not (np.isfinite(e) and np.isfinite(p1) and np.isfinite(p5m) and np.isfinite(ms)):
+                        continue
                     case = classify_high_case(
                         top1_prob=p1,
                         top5_mass=p5m,
