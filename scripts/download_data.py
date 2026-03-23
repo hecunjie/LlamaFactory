@@ -8,6 +8,7 @@
 """
 
 import os
+import json
 import re
 from datasets import Dataset, DatasetDict, load_dataset
 
@@ -114,6 +115,28 @@ def convert_dataset_to_gsm_style(ds, dataset_name: str):
 
     return ds
 
+
+def save_dataset_as_jsonl(ds, save_dir: str, dataset_name: str):
+    """按 split 保存为 JSONL，方便直接查看。"""
+    os.makedirs(save_dir, exist_ok=True)
+
+    if isinstance(ds, DatasetDict):
+        for split, split_ds in ds.items():
+            out_file = os.path.join(save_dir, f"{dataset_name}_{split}.jsonl")
+            with open(out_file, "w", encoding="utf-8") as f:
+                for ex in split_ds:
+                    f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            print(f"已保存 JSONL: {out_file} ({len(split_ds)} 条)")
+        return
+
+    if isinstance(ds, Dataset):
+        out_file = os.path.join(save_dir, f"{dataset_name}.jsonl")
+        with open(out_file, "w", encoding="utf-8") as f:
+            for ex in ds:
+                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+        print(f"已保存 JSONL: {out_file} ({len(ds)} 条)")
+        return
+
 def main():
     # 创建根目录
     os.makedirs(SAVE_ROOT, exist_ok=True)
@@ -128,14 +151,10 @@ def main():
             # 统一格式为 GSM 风格
             dataset = convert_dataset_to_gsm_style(dataset, name)
 
-            save_path = os.path.join(SAVE_ROOT, name.replace("-", "_"))
+            save_dir = os.path.join(SAVE_ROOT, name.replace("-", "_"))
 
-            if isinstance(dataset, DatasetDict):  # 有 train/test/validation 等 split
-                dataset.save_to_disk(save_path)
-                print(f"已保存 (多 split, GSM 格式): {save_path}")
-            else:  # 单个 dataset
-                dataset.save_to_disk(save_path)
-                print(f"已保存 (GSM 格式): {save_path}")
+            # 保存为 JSONL，便于直接查看
+            save_dataset_as_jsonl(dataset, save_dir=save_dir, dataset_name=name.replace("-", "_"))
 
             # 打印一些基本信息
             print(f"  splits: {list(dataset.keys() if isinstance(dataset, DatasetDict) else ['single'])}")
@@ -157,7 +176,8 @@ def main():
     print(f"文件夹结构示例：")
     print(f"{SAVE_ROOT}/")
     for name in DATASETS:
-        print(f"  ├─ {name.replace('-', '_')}/   ← Arrow 格式，可用 load_from_disk 读取")
+        print(f"  ├─ {name.replace('-', '_')}/")
+        print(f"  │   └─ {name.replace('-', '_')}_<split>.jsonl")
 
 if __name__ == "__main__":
     main()
