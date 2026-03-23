@@ -144,6 +144,22 @@ class ComputeExactMatch:
         return False
 
     @staticmethod
+    def _normalize_extracted_answer(text: str) -> str:
+        """Normalize extracted answer text for robust exact-match."""
+        ans = text.strip()
+        ans = ans.strip(" \t\r\n\"'`")
+        # Handle trailing JSON-like noise such as: ... "}" or ... }
+        ans = re.sub(r'[\"\'}\]\s]+$', "", ans).strip()
+
+        # If answer has explanatory parenthesis, prefer core value.
+        # e.g. "6 (buses)" -> "6"
+        paren_match = re.match(r"^\s*([^\(\)]+?)\s*\([^)]*\)\s*$", ans)
+        if paren_match:
+            ans = paren_match.group(1).strip()
+
+        return ans
+
+    @staticmethod
     def _extract_boxed_content(text: str) -> Optional[str]:
         r"""Extract content from the last \boxed{...} block, supports nested braces."""
         key = r"\boxed{"
@@ -183,16 +199,16 @@ class ComputeExactMatch:
 
         boxed = ComputeExactMatch._extract_boxed_content(text)
         if boxed:
-            return boxed
+            return ComputeExactMatch._normalize_extracted_answer(boxed)
 
         if "####" in text:
-            return text.split("####")[-1].strip()
+            return ComputeExactMatch._normalize_extracted_answer(text.split("####")[-1].strip())
 
         answer_is_matches = re.findall(r"The answer is\s*(.+)", text, flags=re.IGNORECASE)
         if answer_is_matches:
-            return answer_is_matches[-1].strip()
+            return ComputeExactMatch._normalize_extracted_answer(answer_is_matches[-1].strip())
 
-        return text
+        return ComputeExactMatch._normalize_extracted_answer(text)
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
