@@ -39,5 +39,5 @@ python -m train_sae.analyze_features \
   --cache_path ./sae_cache/hidden_states.pt \
   --output_dir ./feature_analysis \
   --top_n 20 \
-  --context_examples 10 \
+  --context_examples 100 \
   --device cuda

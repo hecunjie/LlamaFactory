@@ -192,8 +192,10 @@ class ComputeExactMatch:
         Priority:
         1) last \boxed{...}
         2) after last "####"
-        3) after last "The answer is ..."
-        4) full stripped text
+        3) after last "###"
+        4) after last "The final answer is ..."
+        5) after last "The answer is ..."
+        6) full stripped text
         """
         text = text.strip()
 
@@ -203,6 +205,14 @@ class ComputeExactMatch:
 
         if "####" in text:
             return ComputeExactMatch._normalize_extracted_answer(text.split("####")[-1].strip())
+
+        # Support formats like "... The final answer is: ### 18"
+        if "###" in text:
+            return ComputeExactMatch._normalize_extracted_answer(text.split("###")[-1].strip())
+
+        final_answer_matches = re.findall(r"The final answer is\s*[:\-]?\s*(.+)", text, flags=re.IGNORECASE)
+        if final_answer_matches:
+            return ComputeExactMatch._normalize_extracted_answer(final_answer_matches[-1].strip())
 
         answer_is_matches = re.findall(r"The answer is\s*(.+)", text, flags=re.IGNORECASE)
         if answer_is_matches:
