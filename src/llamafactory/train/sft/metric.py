@@ -144,15 +144,55 @@ class ComputeExactMatch:
         return False
 
     @staticmethod
-    def _extract_after_delimiter(text: str, delimiter: str = "####") -> str:
-        """Extract the part after the last occurrence of the delimiter.
+    def _extract_boxed_content(text: str) -> Optional[str]:
+        r"""Extract content from the last \boxed{...} block, supports nested braces."""
+        key = r"\boxed{"
+        start = text.rfind(key)
+        if start == -1:
+            return None
 
-        For GSM8K-style answers like '...reasoning...#### 42', returns '42'.
-        If delimiter is not found, returns the full text stripped.
+        i = start + len(key)
+        depth = 1
+        buf = []
+        while i < len(text):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+                buf.append(ch)
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return "".join(buf).strip()
+                buf.append(ch)
+            else:
+                buf.append(ch)
+            i += 1
+        return None
+
+    @staticmethod
+    def _extract_answer_from_output(text: str) -> str:
+        r"""Extract final answer from model output.
+
+        Priority:
+        1) last \boxed{...}
+        2) after last "####"
+        3) after last "The answer is ..."
+        4) full stripped text
         """
-        if delimiter in text:
-            return text.split(delimiter)[-1].strip()
-        return text.strip()
+        text = text.strip()
+
+        boxed = ComputeExactMatch._extract_boxed_content(text)
+        if boxed:
+            return boxed
+
+        if "####" in text:
+            return text.split("####")[-1].strip()
+
+        answer_is_matches = re.findall(r"The answer is\s*(.+)", text, flags=re.IGNORECASE)
+        if answer_is_matches:
+            return answer_is_matches[-1].strip()
+
+        return text
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
@@ -180,9 +220,8 @@ class ComputeExactMatch:
                     labels_clean[i], skip_special_tokens=True
                 ).strip()
 
-                # Extract answer after #### delimiter
-                pred_answer = self._extract_after_delimiter(decoded_pred)
-                label_answer = self._extract_after_delimiter(decoded_label)
+                pred_answer = self._extract_answer_from_output(decoded_pred)
+                label_answer = self._extract_answer_from_output(decoded_label)
 
                 match = self._compare_answers(pred_answer, label_answer)
                 self.score_dict["exact_match"].append(1.0 if match else 0.0)
@@ -193,10 +232,12 @@ class ComputeExactMatch:
                     _logger = _logging.getLogger(__name__)
                     _has_delim_pred = "####" in decoded_pred
                     _has_delim_label = "####" in decoded_label
+                    _has_boxed_pred = r"\boxed{" in decoded_pred
+                    _has_boxed_label = r"\boxed{" in decoded_label
                     _logger.info(
                         f"[exact_match generate] sample={i} match={match}\n"
-                        f"  pred_answer='{pred_answer}' (has_####={_has_delim_pred})\n"
-                        f"  label_answer='{label_answer}' (has_####={_has_delim_label})\n"
+                        f"  pred_answer='{pred_answer}' (has_boxed={_has_boxed_pred}, has_####={_has_delim_pred})\n"
+                        f"  label_answer='{label_answer}' (has_boxed={_has_boxed_label}, has_####={_has_delim_label})\n"
                         f"  decoded_pred[:200]='{decoded_pred[:200]}'\n"
                         f"  decoded_label[:200]='{decoded_label[:200]}'"
                     )
@@ -224,9 +265,8 @@ class ComputeExactMatch:
                     label_answer_ids, skip_special_tokens=True
                 ).strip()
 
-                # Extract answer after #### delimiter (works for both with/without delimiter)
-                pred_answer = self._extract_after_delimiter(decoded_pred)
-                label_answer = self._extract_after_delimiter(decoded_label)
+                pred_answer = self._extract_answer_from_output(decoded_pred)
+                label_answer = self._extract_answer_from_output(decoded_label)
 
                 match = self._compare_answers(pred_answer, label_answer)
                 self.score_dict["exact_match"].append(1.0 if match else 0.0)
