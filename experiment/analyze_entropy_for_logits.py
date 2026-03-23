@@ -344,7 +344,7 @@ def main() -> None:
             if npos <= 0:
                 batch_sample_buffers.append(
                     {
-                        "prompt_preview": prompts[i][:80],
+                        "prompt_preview": prompts[i],
                         "is_correct": is_correct,
                         "total_positions": 0,
                         "case_counts": sample_case_counts,
@@ -427,7 +427,7 @@ def main() -> None:
 
             batch_sample_buffers.append(
                 {
-                    "prompt_preview": prompts[i][:80],
+                    "prompt_preview": prompts[i],
                     "is_correct": is_correct,
                     "total_positions": sample_total_positions,
                     "case_counts": sample_case_counts,
