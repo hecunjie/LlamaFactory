@@ -1070,6 +1070,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     @override
     def evaluation_loop(self, *args, **kwargs):
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
+        dataloader = args[0] if len(args) > 0 else kwargs.get("dataloader", None)
+        metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
         output = super().evaluation_loop(*args, **kwargs)
         for k, v in self._eval_loss_buffer.items():
             if v:
@@ -1086,9 +1088,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             and getattr(output, "predictions", None) is not None
             and getattr(output, "label_ids", None) is not None
         ):
-            eval_dataloader = kwargs.get("dataloader", None)
-            eval_dataset = getattr(eval_dataloader, "dataset", None)
-            metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
+            eval_dataset = getattr(dataloader, "dataset", None)
             if eval_dataset is not None:
                 dump_dir = os.path.join(self.args.output_dir, "eval_predictions")
                 os.makedirs(dump_dir, exist_ok=True)
@@ -1100,6 +1100,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     output_file=dump_file,
                 )
                 logger.info_rank0(f"[eval] Saved intermediate predictions to: {dump_file}")
+            else:
+                logger.warning_rank0("[eval] Skip saving predictions: dataloader.dataset is None.")
+        elif self.args.predict_with_generate and self.is_world_process_zero():
+            logger.warning_rank0(
+                "[eval] Skip saving predictions: predictions/labels are None. "
+                "Please ensure predict_with_generate=true and eval is not loss-only."
+            )
 
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         return output
