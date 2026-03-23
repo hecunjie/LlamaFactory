@@ -89,6 +89,19 @@ def _plot_results(
     sim = np.array([r["max_cosine_sim"] for r in all_high_rows], dtype=np.float64)
     mass = np.array([r["top5_mass"] for r in all_high_rows], dtype=np.float64)
     cases = np.array([r["case"] for r in all_high_rows], dtype=object)
+    finite_mask = np.isfinite(ent) & np.isfinite(sim) & np.isfinite(mass)
+    ent = ent[finite_mask]
+    sim = sim[finite_mask]
+    mass = mass[finite_mask]
+    cases = cases[finite_mask]
+    if ent.size == 0:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "No finite high-entropy points.", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(output_plot, dpi=150)
+        plt.close(fig)
+        return
 
     case_to_color = {
         CASE_A: "tab:blue",
@@ -138,17 +151,20 @@ def _plot_results(
     # 4) joint heatmap of entropy and max_sim
     ax = axes[1, 1]
     heat, xedges, yedges = np.histogram2d(ent, sim, bins=40)
-    im = ax.imshow(
-        heat.T,
-        origin="lower",
-        aspect="auto",
-        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-        cmap="magma",
-    )
+    if np.allclose(xedges[0], xedges[-1]) or np.allclose(yedges[0], yedges[-1]):
+        ax.scatter(ent, sim, s=10, alpha=0.5, color="tab:purple")
+    else:
+        im = ax.imshow(
+            heat.T,
+            origin="lower",
+            aspect="auto",
+            extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+            cmap="magma",
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel("entropy")
     ax.set_ylabel("max_cosine_sim")
     ax.set_title("Joint Density Heatmap")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     fig.tight_layout()
     fig.savefig(output_plot, dpi=150)
@@ -499,6 +515,8 @@ def main() -> None:
 
     all_ent_arr = np.asarray(all_entropies, dtype=np.float64)
     all_sim_arr = np.asarray(all_max_sims, dtype=np.float64)
+    all_ent_arr = all_ent_arr[np.isfinite(all_ent_arr)]
+    all_sim_arr = all_sim_arr[np.isfinite(all_sim_arr)]
 
     print("=" * 50)
     print("【高熵位置类型分析】")
