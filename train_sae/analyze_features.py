@@ -441,6 +441,8 @@ def main() -> None:
         Xzt = z_np_f[idx][:, top_ids]
         Xh = h_np[idx]
         y_sub = y_np[idx]
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+        axes = np.atleast_1d(axes).reshape(-1)
 
         def _one_pca_plot(ax: Any, X: np.ndarray, title_prefix: str) -> None:
             pca = PCA(n_components=2, random_state=args.seed)
