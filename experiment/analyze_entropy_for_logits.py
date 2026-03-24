@@ -496,9 +496,13 @@ def main() -> None:
                     ms = float(m["max_cosine_sim"])
                     token_id = int(token_id_list[t])
                     token_str = token_strs[t]
+                    token_text = tokenizer.decode([token_id], skip_special_tokens=False)
                     top_ids_t = top5_ids[t].tolist()
                     top_probs_t = top5_vals[t].float().tolist()
-                    top_tokens_t = tokenizer.convert_ids_to_tokens(top_ids_t)
+                    top_tokens_raw = tokenizer.convert_ids_to_tokens(top_ids_t)
+                    top_tokens_text = [
+                        tokenizer.decode([int(_tid)], skip_special_tokens=False) for _tid in top_ids_t
+                    ]
                     case_all = classify_case(
                         entropy=e,
                         top1_prob=p1,
@@ -507,6 +511,8 @@ def main() -> None:
                         entropy_threshold=args.entropy_threshold,
                         sim_threshold=args.sim_threshold,
                     )
+                    if case_all == CASE_NORMAL:
+                        continue
                     per_token_json_rows.append(
                         {
                             "sample_idx": st + sample_i,
@@ -519,7 +525,8 @@ def main() -> None:
                             "is_correct": is_correct,
                             "t": t,
                             "token_id": token_id,
-                            "token": token_str,
+                            "token": token_text,
+                            "token_raw": token_str,
                             "context": _build_token_context(token_strs, t, window=6),
                             "entropy": e,
                             "top1_prob": p1,
@@ -527,7 +534,8 @@ def main() -> None:
                             "max_cosine_sim": ms,
                             "top5_cosine_sim": [float(x) for x in top5_cosine_sim[t].tolist()],
                             "case": case_all,
-                            "top5_tokens": top_tokens_t,
+                            "top5_tokens": top_tokens_text,
+                            "top5_tokens_raw": top_tokens_raw,
                             "top5_probs": [float(x) for x in top_probs_t],
                         }
                     )
