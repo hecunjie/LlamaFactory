@@ -193,6 +193,12 @@ def _build_token_context(token_strs: list[str], t: int, window: int = 6) -> str:
     return "".join(parts)
 
 
+def _build_prompt_prefix(tokenizer: Any, prompt_text: str, token_strs: list[str], t: int) -> str:
+    # 截止到当前 token（含当前 token）的完整前缀：prompt + response_prefix
+    response_prefix = tokenizer.convert_tokens_to_string(token_strs[: t + 1])
+    return prompt_text + response_prefix
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze logits entropy and hidden-state confidence.")
     parser.add_argument("--data", type=str, required=True, help="Input JSONL path")
@@ -504,7 +510,12 @@ def main() -> None:
                     per_token_json_rows.append(
                         {
                             "sample_idx": st + sample_i,
-                            "prompt_preview": sample_buf["prompt_preview"],
+                            "prompt_prefix": _build_prompt_prefix(
+                                tokenizer=tokenizer,
+                                prompt_text=sample_buf["prompt_preview"],
+                                token_strs=token_strs,
+                                t=t,
+                            ),
                             "is_correct": is_correct,
                             "t": t,
                             "token_id": token_id,
