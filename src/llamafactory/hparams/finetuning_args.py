@@ -686,6 +686,34 @@ class FinetuningArguments(
             )
         },
     )
+    low_confidence_entropy_threshold: float = field(
+        default=2.0,
+        metadata={
+            "help": (
+                "Entropy threshold for B_lowconf marking. "
+                "Only response positions with entropy >= this value are considered."
+            )
+        },
+    )
+    low_confidence_sim_threshold: float = field(
+        default=0.3,
+        metadata={
+            "help": (
+                "Cosine-similarity threshold for B_lowconf marking. "
+                "A position is marked only when max cosine similarity between "
+                "last hidden state and token embeddings is below this value."
+            )
+        },
+    )
+    low_confidence_insert_position: str = field(
+        default="before",
+        metadata={
+            "help": (
+                "Where to insert <add_think> around marked B_lowconf tokens. "
+                "Choices: `before` or `after`."
+            )
+        },
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
@@ -727,6 +755,9 @@ class FinetuningArguments(
 
         if self.stage == "distill" and (not self.teacher_models or len(self.teacher_models) == 0):
             raise ValueError("`teacher_models` is necessary for distillation training.")
+
+        if self.low_confidence_insert_position not in {"before", "after"}:
+            raise ValueError("`low_confidence_insert_position` must be either `before` or `after`.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

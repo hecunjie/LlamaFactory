@@ -272,11 +272,17 @@ def run_sft(
                     trainer.mark_low_confidence_positions(
                         dataset=split_ds,
                         prob_threshold=finetuning_args.low_confidence_prob_threshold,
+                        entropy_threshold=finetuning_args.low_confidence_entropy_threshold,
+                        sim_threshold=finetuning_args.low_confidence_sim_threshold,
+                        insert_position=finetuning_args.low_confidence_insert_position,
                     )
             else:
                 trainer.mark_low_confidence_positions(
                     dataset=eval_dataset,
                     prob_threshold=finetuning_args.low_confidence_prob_threshold,
+                    entropy_threshold=finetuning_args.low_confidence_entropy_threshold,
+                    sim_threshold=finetuning_args.low_confidence_sim_threshold,
+                    insert_position=finetuning_args.low_confidence_insert_position,
                 )
 
     # Create model card

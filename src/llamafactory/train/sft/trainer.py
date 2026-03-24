@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -2273,6 +2274,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self,
         dataset: "Dataset",
         prob_threshold: float = 0.3,
+        entropy_threshold: float = 2.0,
+        sim_threshold: float = 0.3,
+        insert_position: str = "before",
         max_seq_len: int = 4096,
     ) -> None:
         r"""Identify low-confidence positions via teacher-forcing and insert ``<add_think>`` markers.
@@ -2306,8 +2310,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return
 
         logger.info_rank0(
-            f"[mark_low_conf] Starting low-confidence marking "
-            f"(threshold={prob_threshold}) …"
+            f"[mark_low_conf] Start B_lowconf marking "
+            f"(entropy>={entropy_threshold}, max_sim<{sim_threshold}, insert={insert_position}) …"
         )
 
         # ---- Unwrap model ----
@@ -2330,6 +2334,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             )
         add_think_id = self.processing_class.convert_tokens_to_ids(add_think_token)
         logger.info_rank0(f"[mark_low_conf] <add_think> token id = {add_think_id}")
+        if insert_position not in {"before", "after"}:
+            raise ValueError("insert_position must be `before` or `after`.")
+
+        # tied embeddings: hidden states and embedding matrix share hidden dim
+        embed_matrix = unwrapped.get_input_embeddings().weight.detach()
+        embed_norm_t = F.normalize(embed_matrix.float(), dim=-1, eps=1e-12).transpose(0, 1).contiguous()
 
         # ---- Output directory ----
         out_dir = os.path.join(self.args.output_dir, "low_confidence_marked")
@@ -2381,13 +2391,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     outputs = unwrapped(
                         input_ids=input_tensor,
                         use_cache=False,
+                        output_hidden_states=True,
                     )
                     logits = outputs.logits[0]  # (seq_len, vocab)
+                    hidden_last = outputs.hidden_states[-1][0]
                     del outputs
 
                 # logits[t] predicts token at position t+1
                 # So for position t+1, the probability is softmax(logits[t])[input_ids[t+1]]
-                probs = torch.softmax(logits.float(), dim=-1)  # (seq_len, vocab)
+                logits_fp32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                probs = torch.softmax(logits_fp32, dim=-1)  # (seq_len, vocab)
+                entropies = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)  # (seq_len,)
+                hidden_last = torch.nan_to_num(hidden_last.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                hidden_norm = F.normalize(hidden_last, dim=-1, eps=1e-12).to(embed_norm_t.device, dtype=embed_norm_t.dtype)
+                max_cos_sims = (hidden_norm @ embed_norm_t).max(dim=-1).values.float()  # (seq_len,)
 
                 # Compute probability of the actual next token at each position
                 # next_token_probs[t] = P(input_ids[t+1] | input_ids[:t+1])
@@ -2410,8 +2427,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 for t in range(1, seq_len):
                     if labels_list[t] == IGNORE_INDEX:
                         continue  # skip prompt positions
-                    p = next_token_probs[t - 1].item()
-                    if p < prob_threshold:
+                    p = float(next_token_probs[t - 1].item())
+                    ent = float(entropies[t - 1].item())
+                    max_sim = float(max_cos_sims[t - 1].item())
+                    # B_lowconf: high entropy + low hidden/embedding cosine similarity
+                    if ent >= entropy_threshold and max_sim < sim_threshold:
                         marked_positions.append(t)
                         marked_tokens.append(
                             self.processing_class.decode(
@@ -2428,9 +2448,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 new_labels = list(labels_list)
 
                 for ins_pos in reversed(marked_positions):
-                    # Insert AFTER position ins_pos → at index ins_pos + 1
-                    new_input_ids.insert(ins_pos + 1, add_think_id)
-                    new_labels.insert(ins_pos + 1, IGNORE_INDEX)
+                    if insert_position == "before":
+                        insert_idx = ins_pos
+                    else:
+                        insert_idx = ins_pos + 1
+                    new_input_ids.insert(insert_idx, add_think_id)
+                    new_labels.insert(insert_idx, IGNORE_INDEX)
 
                 # Truncate if too long
                 if len(new_input_ids) > max_seq_len:
