@@ -641,6 +641,18 @@ class FinetuningArguments(
             )
         },
     )
+    add_think_token: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, register `<add_think>` as a special token and resize embeddings before "
+                "SFT, without enabling recurrent hidden-as-input training. Use this for normal "
+                "SFT where `<add_think>` is treated like any other token (standard embeddings + "
+                "LM head). Mutually complements `recurrent_add_think_training` (which also adds "
+                "the token if missing)."
+            )
+        },
+    )
     recurrent_add_think_training: bool = field(
         default=False,
         metadata={

@@ -57,17 +57,20 @@ def run_sft(
             logger.info(f"Added {num_added} latent thinking tokens to vocabulary: {latent_tokens}")
 
     # Add <add_think> to tokenizer before dataset is built so it is tokenized as one token.
-    # 仅在 recurrent_add_think_training 训练阶段需要显式添加；对于只做
-    # entropy_analyze_at_add_think_positions 的离线分析，应直接复用已保存
-    # 模型目录中的 tokenizer（其中已经包含 <add_think>），这里不再重复 add_tokens，
-    # 以避免 id 偏移或与 checkpoint 中 embedding 行号不一致。
+    # - `add_think_token`: normal SFT (standard token embeddings; no recurrent forward).
+    # - `recurrent_add_think_training`: same registration + recurrent hidden-as-input path.
+    # For offline analysis only, reuse tokenizer from a saved checkpoint that already has
+    # <add_think> to avoid duplicate add_tokens / id drift.
     add_think_added = 0
-    if getattr(finetuning_args, "recurrent_add_think_training", False):
+    if getattr(finetuning_args, "add_think_token", False) or getattr(
+        finetuning_args, "recurrent_add_think_training", False
+    ):
         add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
         if add_think_added > 0:
             logger.info(
                 "Added '<add_think>' to tokenizer "
                 f"(new vocab size={len(tokenizer)}; "
+                f"add_think_token={getattr(finetuning_args, 'add_think_token', False)}, "
                 f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)})"
             )
 
@@ -75,15 +78,24 @@ def run_sft(
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
-    # Resize embeddings if we added <add_think> (model was loaded with previous vocab size)
-    if add_think_added > 0:
+    # Resize embeddings when tokenizer vocab != model embedding rows (e.g. new <add_think> or
+    # tokenizer already had the token but base checkpoint did not).
+    if getattr(finetuning_args, "add_think_token", False) or getattr(
+        finetuning_args, "recurrent_add_think_training", False
+    ):
         unwrapped = model
         while hasattr(unwrapped, "module"):
             unwrapped = unwrapped.module
-        unwrapped.resize_token_embeddings(len(tokenizer))
-        if getattr(unwrapped.config, "tie_word_embeddings", False):
-            unwrapped.tie_weights()
-        logger.info(f"Resized model token embeddings to {len(tokenizer)} for '<add_think>'.")
+        vocab_size = len(tokenizer)
+        emb = unwrapped.get_input_embeddings()
+        if emb is not None and emb.num_embeddings != vocab_size:
+            unwrapped.resize_token_embeddings(vocab_size)
+            if getattr(unwrapped.config, "tie_word_embeddings", False) and hasattr(unwrapped, "tie_weights"):
+                unwrapped.tie_weights()
+            logger.info_rank0(
+                f"Resized model token embeddings to {vocab_size} for '<add_think>' "
+                f"(add_think_added={add_think_added})."
+            )
 
     # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.
     # The model's final_norm (RMSNorm) is trained for the LM head and does NOT produce

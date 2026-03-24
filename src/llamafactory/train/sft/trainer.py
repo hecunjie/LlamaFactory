@@ -136,11 +136,28 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             for name, tensor in state_dict.items():
                 if isinstance(tensor, torch.Tensor):
                     ptrs[id(tensor)].append(name)
+
+            def _keep_one_tied_key(names: list[str]) -> str:
+                # Prefer keeping embedding-table keys over lm_head so checkpoints stay
+                # compatible with from_pretrained (tied models load embed first).
+                for needle in (
+                    "embed_tokens",
+                    "wte",
+                    "word_embeddings",
+                    "tok_embeddings",
+                    "wte.weight",
+                ):
+                    cands = [n for n in names if needle in n]
+                    if cands:
+                        return sorted(cands)[0]
+                return sorted(names)[0]
+
             for names in ptrs.values():
                 if len(names) > 1:
-                    names.sort()
-                    for name in names[1:]:
-                        state_dict.pop(name, None)
+                    keep = _keep_one_tied_key(names)
+                    for name in names:
+                        if name != keep:
+                            state_dict.pop(name, None)
         super()._save(output_dir, state_dict)
 
     def _build_reasoning_inputs(
