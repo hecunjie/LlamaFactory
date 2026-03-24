@@ -4,8 +4,10 @@ Convert JSONL with prompt + response into LlamaFactory SFT training format.
 
 Input JSONL format (one JSON object per line):
   {"prompt": "<|im_start|>system\\n...<|im_end|>\\n<|im_start|>user\\n...<|im_end|>\\n<|im_start|>assistant\\n", "response": "..."}
+or:
+  {"prompt": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\\n\\n...<|eot_id|><|start_header_id|>assistant<|end_header_id|>\\n\\n", "response": "..."}
 
-The script parses the ChatML-style prompt to extract system and user content,
+The script parses supported prompt styles to extract system and user content,
 then outputs Alpaca-style examples for LlamaFactory:
   - instruction: user message (required)
   - output: assistant response, including <add_think> etc. (required)
@@ -25,13 +27,16 @@ import re
 # ChatML-style: <|im_start|>role\ncontent<|im_end|>
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
+LLAMA_START_HEADER = "<|start_header_id|>"
+LLAMA_END_HEADER = "<|end_header_id|>"
+LLAMA_EOT = "<|eot_id|>"
 
 
-def trim_response_after_last_im_end(response: str) -> str:
-    """Remove the last <im_end>/<|im_end|> token and anything after it."""
+def trim_response_after_last_end_token(response: str) -> str:
+    """Remove the last known conversation-end token and anything after it."""
     if not response:
         return response
-    candidates = (IM_END, "<im_end>")
+    candidates = (IM_END, "<im_end>", LLAMA_EOT, "<eot_id>")
     last_pos = -1
     for tok in candidates:
         pos = response.rfind(tok)
@@ -70,6 +75,45 @@ def parse_chatml_prompt(prompt: str) -> tuple[str, str]:
     return system_content, user_content
 
 
+def parse_llama_header_prompt(prompt: str) -> tuple[str, str]:
+    """Extract (system_content, user_content) from Llama header-token prompt.
+
+    Example block:
+      <|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|>
+    """
+    system_content = ""
+    user_content = ""
+    if not prompt.strip():
+        return system_content, user_content
+
+    pattern = re.compile(
+        re.escape(LLAMA_START_HEADER)
+        + r"(.*?)"
+        + re.escape(LLAMA_END_HEADER)
+        + r"\s*(.*?)"
+        + re.escape(LLAMA_EOT),
+        re.DOTALL,
+    )
+    for m in pattern.finditer(prompt):
+        role = m.group(1).strip().lower()
+        content = m.group(2).strip()
+        if role == "system":
+            system_content = content
+        elif role == "user":
+            user_content = content
+
+    return system_content, user_content
+
+
+def parse_prompt(prompt: str) -> tuple[str, str]:
+    """Parse supported prompt styles and return (system_content, user_content)."""
+    if IM_START in prompt:
+        return parse_chatml_prompt(prompt)
+    if LLAMA_START_HEADER in prompt and LLAMA_END_HEADER in prompt:
+        return parse_llama_header_prompt(prompt)
+    return "", ""
+
+
 def convert_line(line: str) -> dict | None:
     """Convert one JSONL line to Alpaca-style example. Returns None if invalid."""
     line = line.strip()
@@ -85,8 +129,8 @@ def convert_line(line: str) -> dict | None:
         return None
     prompt = str(prompt)
     response = str(response).strip()
-    response = trim_response_after_last_im_end(response)
-    system_content, user_content = parse_chatml_prompt(prompt)
+    response = trim_response_after_last_end_token(response)
+    system_content, user_content = parse_prompt(prompt)
     out = {
         "instruction": user_content,
         "output": response,

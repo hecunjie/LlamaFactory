@@ -2311,7 +2311,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         logger.info_rank0(
             f"[mark_low_conf] Start B_lowconf marking "
-            f"(entropy>={entropy_threshold}, max_sim<{sim_threshold}, insert={insert_position}) …"
+            f"(entropy>={entropy_threshold}, max_sim<{sim_threshold}, "
+            f"p<{prob_threshold}, insert={insert_position}) …"
         )
 
         # ---- Unwrap model ----
@@ -2430,8 +2431,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     p = float(next_token_probs[t - 1].item())
                     ent = float(entropies[t - 1].item())
                     max_sim = float(max_cos_sims[t - 1].item())
-                    # B_lowconf: high entropy + low hidden/embedding cosine similarity
-                    if ent >= entropy_threshold and max_sim < sim_threshold:
+                    # B_lowconf + low probability: high entropy + low hidden/embedding similarity
+                    # + low probability on the gold next token.
+                    if ent >= entropy_threshold and max_sim < sim_threshold and p < prob_threshold:
                         marked_positions.append(t)
                         marked_tokens.append(
                             self.processing_class.decode(
