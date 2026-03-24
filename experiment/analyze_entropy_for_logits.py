@@ -180,6 +180,19 @@ def _collect_examples(all_high_rows: list[dict[str, Any]], per_case: int = 2) ->
     return out
 
 
+def _build_token_context(token_strs: list[str], t: int, window: int = 6) -> str:
+    lo = max(0, t - window)
+    hi = min(len(token_strs), t + window + 1)
+    parts: list[str] = []
+    for i in range(lo, hi):
+        tok = token_strs[i]
+        if i == t:
+            parts.append(f"[[{tok}]]")
+        else:
+            parts.append(tok)
+    return "".join(parts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze logits entropy and hidden-state confidence.")
     parser.add_argument("--data", type=str, required=True, help="Input JSONL path")
@@ -254,7 +267,7 @@ def main() -> None:
     case_counts_global = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
     case_counts_high = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
     all_high_rows: list[dict[str, Any]] = []
-    per_sample_json_rows: list[dict[str, Any]] = []
+    per_token_json_rows: list[dict[str, Any]] = []
     total_positions = 0
     high_entropy_count = 0
 
@@ -465,6 +478,49 @@ def main() -> None:
             top5_cosine_sim = sample_buf["top5_cosine_sim"]
 
             if target_ids is not None and top5_ids is not None and top5_vals is not None and top5_cosine_sim is not None:
+                token_id_list = target_ids.tolist()
+                token_strs = tokenizer.convert_ids_to_tokens(token_id_list)
+
+                # 保存所有 case：每个 token 位置一条 JSONL
+                for m in token_metrics:
+                    t = int(m["t"])
+                    e = float(m["entropy"])
+                    p1 = float(m["top1_prob"])
+                    p5m = float(m["top5_mass"])
+                    ms = float(m["max_cosine_sim"])
+                    token_id = int(token_id_list[t])
+                    token_str = token_strs[t]
+                    top_ids_t = top5_ids[t].tolist()
+                    top_probs_t = top5_vals[t].float().tolist()
+                    top_tokens_t = tokenizer.convert_ids_to_tokens(top_ids_t)
+                    case_all = classify_case(
+                        entropy=e,
+                        top1_prob=p1,
+                        top5_mass=p5m,
+                        max_cosine_sim=ms,
+                        entropy_threshold=args.entropy_threshold,
+                        sim_threshold=args.sim_threshold,
+                    )
+                    per_token_json_rows.append(
+                        {
+                            "sample_idx": st + sample_i,
+                            "prompt_preview": sample_buf["prompt_preview"],
+                            "is_correct": is_correct,
+                            "t": t,
+                            "token_id": token_id,
+                            "token": token_str,
+                            "context": _build_token_context(token_strs, t, window=6),
+                            "entropy": e,
+                            "top1_prob": p1,
+                            "top5_mass": p5m,
+                            "max_cosine_sim": ms,
+                            "top5_cosine_sim": [float(x) for x in top5_cosine_sim[t].tolist()],
+                            "case": case_all,
+                            "top5_tokens": top_tokens_t,
+                            "top5_probs": [float(x) for x in top_probs_t],
+                        }
+                    )
+
                 for m in token_metrics:
                     t = int(m["t"])
                     if (sample_i, t) not in high_key_set:
@@ -506,16 +562,8 @@ def main() -> None:
                     if case in case_counts_high:
                         case_counts_high[case] += 1
 
-            per_sample_json_rows.append(
-                {
-                    "prompt_preview": sample_buf["prompt_preview"],
-                    "is_correct": is_correct,
-                    "total_positions": int(sample_buf["total_positions"]),
-                    "high_entropy_count": sample_high_count,
-                    "case_counts": sample_buf["case_counts"],
-                    "high_entropy_positions": sample_high_positions,
-                }
-            )
+            _ = sample_high_positions
+            _ = sample_high_count
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -576,7 +624,7 @@ def main() -> None:
     print(f"\n[plot] saved: {output_plot.resolve()}")
 
     with output_jsonl.open("w", encoding="utf-8") as f:
-        for row in per_sample_json_rows:
+        for row in per_token_json_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     print(f"[jsonl] saved: {output_jsonl.resolve()}")
 

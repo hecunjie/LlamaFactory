@@ -1,10 +1,10 @@
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8.jsonl \
+  --input_file /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/rllm_server/data/test.jsonl \
   --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/checkpoint-468 \
-  --max_samples 3000 \
+  --max_samples 8000 \
   --batch_size 4 \
-  --high_entropy_topk 20 \
-  --sim_threshold 1.0 \
+  --high_entropy_topk 10 \
+  --sim_threshold 0.18 \
   --only_wrong \
   --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_analysis.png \
   --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_results.jsonl
