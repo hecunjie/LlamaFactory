@@ -180,12 +180,12 @@ def _collect_examples(all_high_rows: list[dict[str, Any]], per_case: int = 2) ->
     return out
 
 
-def _build_token_context(token_strs: list[str], t: int, window: int = 6) -> str:
+def _build_token_context(tokenizer: Any, token_ids: list[int], t: int, window: int = 6) -> str:
     lo = max(0, t - window)
-    hi = min(len(token_strs), t + window + 1)
+    hi = min(len(token_ids), t + window + 1)
     parts: list[str] = []
     for i in range(lo, hi):
-        tok = token_strs[i]
+        tok = tokenizer.decode([int(token_ids[i])], skip_special_tokens=False)
         if i == t:
             parts.append(f"[[{tok}]]")
         else:
@@ -527,7 +527,12 @@ def main() -> None:
                             "token_id": token_id,
                             "token": token_text,
                             "token_raw": token_str,
-                            "context": _build_token_context(token_strs, t, window=6),
+                            "context": _build_token_context(
+                                tokenizer=tokenizer,
+                                token_ids=token_id_list,
+                                t=t,
+                                window=6,
+                            ),
                             "entropy": e,
                             "top1_prob": p1,
                             "top5_mass": p5m,
