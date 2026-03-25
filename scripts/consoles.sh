@@ -1,13 +1,13 @@
 python experiment/analyze_entropy_for_logits.py \
-  --input_file /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/rllm_server/data/test.jsonl \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/checkpoint-468 \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_add_think_sft_2_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_add_think_sft_2_epoch/checkpoint-936 \
   --max_samples 8000 \
   --batch_size 4 \
   --high_entropy_topk 10 \
   --sim_threshold 0.18 \
   --only_wrong \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_8_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_4_gsm_nl_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_1_epoch/vllm_infer/last_ckp_infer_4_gsm_nl_entropy_results.jsonl
 
 python -m train_sae.train \
   --data_path /mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/gsm8k/zeroshot_16_samples_qwen2.5-3b_instruct_on_math_train_full.jsonl \

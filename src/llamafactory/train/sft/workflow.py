@@ -152,11 +152,15 @@ def run_sft(
             extra_special_tokens = getattr(tokenizer, "_extra_special_tokens", [])
             string_tokens = [str(t) for t in extra_special_tokens]
             extra_ids = tokenizer.convert_tokens_to_ids(string_tokens)
+        add_think_id = tokenizer.convert_tokens_to_ids("<add_think>")
+        extra_ids = [i for i in extra_ids if i != -1 and i != add_think_id]
         all_eos_ids = [tokenizer.eos_token_id] + [i for i in extra_ids if i != -1]
         unique_eos_ids = list(dict.fromkeys(all_eos_ids))
         gen_kwargs["eos_token_id"] = unique_eos_ids
     else:
-        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+        add_think_id = tokenizer.convert_tokens_to_ids("<add_think>")
+        eos_ids = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+        gen_kwargs["eos_token_id"] = [i for i in eos_ids if i != add_think_id]
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     # Initialize our Trainer

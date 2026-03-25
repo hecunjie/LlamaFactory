@@ -1329,10 +1329,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.processing_class.pad_token_id,
         )
 
-        for i in range(len(preds)):
-            pad_len = np.nonzero(preds[i] != self.processing_class.pad_token_id)[0]
-            if len(pad_len):  # move pad token to last
-                preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
+        # Keep generation token order unchanged. Some models/generation settings may
+        # include left-padding in predictions; rotating arrays can corrupt prefix tokens.
 
         decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
@@ -1342,20 +1340,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Decode predicted answers (generated part is answer only, no think block)
         decoded_answers = []
+        decoded_answers_raw = []
         for i in range(len(preds)):
             seq = preds[i]
-            valid_len = (seq != self.processing_class.pad_token_id).sum()
-            seq = seq[:valid_len]
+            # Remove pad tokens while preserving original order.
+            seq = seq[seq != self.processing_class.pad_token_id]
             # Keep decoding behavior consistent with online exact-match metric.
             ans_text = self.processing_class.decode(seq, skip_special_tokens=skip_special_tokens)
+            ans_text_raw = self.processing_class.decode(seq, skip_special_tokens=False)
             decoded_answers.append(ans_text)
+            decoded_answers_raw.append(ans_text_raw)
 
         # Debug: log first sample
         if len(preds) > 0:
             seq0 = preds[0]
-            valid_len0 = int((seq0 != self.processing_class.pad_token_id).sum())
-            seq0 = seq0[:valid_len0]
-            logger.info_rank0(f"[save_predictions] Sample 0: valid_len={valid_len0}, first 20 token IDs: {seq0[:20].tolist()}")
+            seq0 = seq0[seq0 != self.processing_class.pad_token_id]
+            logger.info_rank0(f"[save_predictions] Sample 0: valid_len={len(seq0)}, first 20 token IDs: {seq0[:20].tolist()}")
             logger.info_rank0(f"[save_predictions] Sample 0 decoded: {self.processing_class.decode(seq0[:20], skip_special_tokens=False)}")
             logger.info_rank0(f"[save_predictions] Sample 0 input_ids len: {len(dataset[0]['input_ids'])}")
 
@@ -1402,8 +1402,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                         # Get generated answer tokens
                         seq = preds[i]
-                        valid_len = int((seq != self.processing_class.pad_token_id).sum())
-                        answer_ids = seq[:valid_len]
+                        answer_ids = seq[seq != self.processing_class.pad_token_id]
 
                         if i == 0:
                             logger.info_rank0(
@@ -1467,8 +1466,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 for i in range(len(preds)):
                     try:
                         seq = preds[i]
-                        valid_len = int((seq != self.processing_class.pad_token_id).sum())
-                        seq = seq[:valid_len]
+                        seq = seq[seq != self.processing_class.pad_token_id]
 
                         special_positions_in_gen = [j for j in range(len(seq)) if int(seq[j]) in special_token_ids]
                         if not special_positions_in_gen:
@@ -1502,10 +1500,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 logger.warning("[save_predictions] No special token IDs found in tokenizer. Skipping reasoning recovery.")
 
         with open(output_prediction_file, "w", encoding="utf-8") as f:
-            for text, ans, rea, label in zip(decoded_inputs, decoded_answers, decoded_reasonings, decoded_labels):
+            for text, ans, ans_raw, rea, label in zip(
+                decoded_inputs, decoded_answers, decoded_answers_raw, decoded_reasonings, decoded_labels
+            ):
                 f.write(json.dumps({
                     "prompt": text,
                     "predict_answer": ans,
+                    "predict_answer_raw": ans_raw,
                     "predict_reasoning": rea,
                     "label": label
                 }, ensure_ascii=False) + "\n")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -268,242 +269,209 @@ def main() -> None:
     embed_norm = F.normalize(embed_matrix.detach(), dim=1)
     embed_norm_t = embed_norm.transpose(0, 1).contiguous()
 
-    all_entropies: list[float] = []
-    all_max_sims: list[float] = []
-    case_counts_global = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
-    case_counts_high = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
-    all_high_rows: list[dict[str, Any]] = []
-    per_token_json_rows: list[dict[str, Any]] = []
-    total_positions = 0
-    high_entropy_count = 0
+    def _print_and_return_case_ratios(
+        case_counts_high_in: dict[str, int],
+        total_positions_in: int,
+        high_entropy_count_in: int,
+        variant_tag: str,
+    ) -> dict[str, Any]:
+        print("=" * 50)
+        print(f"【高熵位置类型分析】({variant_tag})")
+        print("=" * 50)
+        print(f"总 token 位置数：{total_positions_in:>12d}")
+        frac = (100.0 * high_entropy_count_in / total_positions_in) if total_positions_in > 0 else 0.0
+        print(f"高熵位置数：{high_entropy_count_in:>14d}  ({frac:.1f}%)")
 
-    for st in tqdm(range(0, len(rows_selected), args.batch_size), desc="Analyzing"):
-        batch_rows = rows_selected[st : st + args.batch_size]
-        full_texts = [str(r.get("prompt", "")) + str(r.get("predict", "")) for r in batch_rows]
-        prompts = [str(r.get("prompt", "")) for r in batch_rows]
-        predicts = [str(r.get("predict", "")) for r in batch_rows]
-        labels = [str(r.get("label", "")) for r in batch_rows]
+        denom_high = max(high_entropy_count_in, 1)
+        denom_total = max(total_positions_in, 1)
 
-        enc = tokenizer(
-            full_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-            add_special_tokens=False,
-        )
-        input_ids = enc["input_ids"].to(model.lm_head.weight.device)
-        attention_mask = enc["attention_mask"].to(model.lm_head.weight.device)
+        # 控制台“表格”展示 + 同时用于落盘
+        print("\n高熵位置中的类型分布：")
+        print("| 类别 | 高熵数量 | 占高熵 | 占总数 |")
+        print("|---|---:|---:|---:|")
 
-        prompt_lens = []
-        for p in prompts:
-            p_ids = tokenizer(p, add_special_tokens=False)["input_ids"]
-            prompt_lens.append(len(p_ids))
-
-        with torch.no_grad():
-            out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-            logits = out.logits  # [B, L, V]
-            hidden = out.hidden_states[-1]  # [B, L, D]
-
-        bsz, seq_len, vocab_size = logits.shape
-        _ = vocab_size
-
-        batch_sample_buffers: list[dict[str, Any]] = []
-        batch_wrong_candidates: list[tuple[float, int, int]] = []  # (entropy, sample_i, token_t)
-
-        for i in range(bsz):
-            attn_len = int(attention_mask[i].sum().item())
-            prompt_len = int(prompt_lens[i])
-            pred_answer = extract_answer(predicts[i])
-            gold_answer = extract_answer(labels[i])
-            is_correct = pred_answer == gold_answer
-
-            sample_case_counts = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
-            sample_total_positions = 0
-
-            if attn_len <= 1 or prompt_len >= attn_len:
-                batch_sample_buffers.append(
-                    {
-                        "prompt_preview": prompts[i],
-                        "is_correct": is_correct,
-                        "total_positions": 0,
-                        "case_counts": sample_case_counts,
-                        "token_metrics": [],
-                        "target_ids": None,
-                        "top5_ids": None,
-                        "top5_vals": None,
-                        "top5_cosine_sim": None,
-                        "sample_i": i,
-                    }
-                )
-                continue
-
-            pred_start = max(prompt_len - 1, 0)
-            pred_end = attn_len - 1
-            if pred_start >= pred_end:
-                batch_sample_buffers.append(
-                    {
-                        "prompt_preview": prompts[i],
-                        "is_correct": is_correct,
-                        "total_positions": 0,
-                        "case_counts": sample_case_counts,
-                        "token_metrics": [],
-                        "target_ids": None,
-                        "top5_ids": None,
-                        "top5_vals": None,
-                        "top5_cosine_sim": None,
-                        "sample_i": i,
-                    }
-                )
-                continue
-
-            logits_i = logits[i, pred_start:pred_end, :]
-            hidden_i = hidden[i, pred_start:pred_end, :]
-            target_ids = input_ids[i, prompt_len:attn_len]
-            npos = int(min(logits_i.shape[0], target_ids.shape[0]))
-            if npos <= 0:
-                batch_sample_buffers.append(
-                    {
-                        "prompt_preview": prompts[i],
-                        "is_correct": is_correct,
-                        "total_positions": 0,
-                        "case_counts": sample_case_counts,
-                        "token_metrics": [],
-                        "target_ids": None,
-                        "top5_ids": None,
-                        "top5_vals": None,
-                        "top5_cosine_sim": None,
-                        "sample_i": i,
-                    }
-                )
-                continue
-
-            logits_i = logits_i[:npos]
-            hidden_i = hidden_i[:npos]
-            target_ids = target_ids[:npos]
-
-            # 数值稳定：在 fp32 上计算概率与熵，避免 fp16 下出现 NaN/Inf
-            logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            probs = torch.softmax(logits_i_fp32, dim=-1)
-            log_probs = torch.log(probs.clamp_min(1e-12))
-            entropy = -(probs * log_probs).sum(dim=-1)
-            top1_prob = probs.max(dim=-1).values
-            top5_vals, top5_ids = probs.topk(k=min(5, probs.shape[-1]), dim=-1)
-            top5_mass = top5_vals.sum(dim=-1)
-
-            hidden_i = torch.nan_to_num(hidden_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            h_norm = F.normalize(hidden_i, dim=-1, eps=1e-12)
-            h_norm = h_norm.to(embed_norm_t.device, dtype=embed_norm_t.dtype)
-
-            # chunked matmul to reduce peak memory usage
-            chunk = 64
-            max_sim_list = []
-            top5_sim_list = []
-            for cs in range(0, npos, chunk):
-                ce = min(npos, cs + chunk)
-                sims = h_norm[cs:ce] @ embed_norm_t
-                max_sim_list.append(sims.max(dim=-1).values)
-                top5_sim_list.append(sims.topk(k=min(5, sims.shape[-1]), dim=-1).values)
-            max_cosine_sim = torch.cat(max_sim_list, dim=0).float().cpu()
-            top5_cosine_sim = torch.cat(top5_sim_list, dim=0).float().cpu()
-
-            entropy_np = entropy.float().cpu().numpy()
-            top1_np = top1_prob.float().cpu().numpy()
-            top5_mass_np = top5_mass.float().cpu().numpy()
-            token_metrics: list[dict[str, Any]] = []
-
-            for t in range(npos):
-                sample_total_positions += 1
-                total_positions += 1
-                e = float(entropy_np[t])
-                p1 = float(top1_np[t])
-                p5m = float(top5_mass_np[t])
-                ms = float(max_cosine_sim[t].item())
-                case = classify_case(
-                    entropy=e,
-                    top1_prob=p1,
-                    top5_mass=p5m,
-                    max_cosine_sim=ms,
-                    entropy_threshold=args.entropy_threshold,
-                    sim_threshold=args.sim_threshold,
-                )
-                sample_case_counts[case] += 1
-                case_counts_global[case] += 1
-                if np.isfinite(e):
-                    all_entropies.append(e)
-                if np.isfinite(ms):
-                    all_max_sims.append(ms)
-                token_metrics.append(
-                    {
-                        "t": t,
-                        "entropy": e,
-                        "top1_prob": p1,
-                        "top5_mass": p5m,
-                        "max_cosine_sim": ms,
-                    }
-                )
-                if (not is_correct) and np.isfinite(e):
-                    batch_wrong_candidates.append((e, i, t))
-
-            batch_sample_buffers.append(
-                {
-                    "prompt_preview": prompts[i],
-                    "is_correct": is_correct,
-                    "total_positions": sample_total_positions,
-                    "case_counts": sample_case_counts,
-                    "token_metrics": token_metrics,
-                    "target_ids": target_ids.detach().cpu(),
-                    "top5_ids": top5_ids.detach().cpu(),
-                    "top5_vals": top5_vals.detach().cpu(),
-                    "top5_cosine_sim": top5_cosine_sim.detach().cpu(),
-                    "sample_i": i,
-                }
+        case_ratios_high: dict[str, float] = {}
+        case_ratios_total: dict[str, float] = {}
+        for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
+            cnt = int(case_counts_high_in.get(c, 0))
+            ratio_high = cnt / denom_high
+            ratio_total = cnt / denom_total
+            case_ratios_high[c] = ratio_high
+            case_ratios_total[c] = ratio_total
+            print(
+                f"| {c} | {cnt:>10d} | {ratio_high * 100:>7.1f}% | {ratio_total * 100:>7.1f}% |"
             )
 
-        # 按 batch 在“错误路径”上全局取 top-k 高熵 token
-        k = max(0, int(args.high_entropy_topk))
-        high_key_set: set[tuple[int, int]] = set()
-        if k > 0 and batch_wrong_candidates:
-            if len(batch_wrong_candidates) <= k:
-                high_key_set = {(si, tt) for _, si, tt in batch_wrong_candidates}
-            else:
-                ent_arr = np.asarray([x[0] for x in batch_wrong_candidates], dtype=np.float64)
-                pick_idx = np.argpartition(ent_arr, -k)[-k:]
-                high_key_set = {
-                    (batch_wrong_candidates[int(j)][1], batch_wrong_candidates[int(j)][2]) for j in pick_idx
-                }
+        return {
+            "variant": variant_tag,
+            "total_positions": int(total_positions_in),
+            "high_entropy_count": int(high_entropy_count_in),
+            "high_entropy_frac_total": (high_entropy_count_in / total_positions_in) if total_positions_in > 0 else 0.0,
+            "case_counts_high": {c: int(case_counts_high_in.get(c, 0)) for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]},
+            "case_ratios_high": case_ratios_high,
+            "case_ratios_total": case_ratios_total,
+        }
 
-        for sample_buf in batch_sample_buffers:
-            sample_i = int(sample_buf["sample_i"])
-            sample_high_positions: list[dict[str, Any]] = []
-            sample_high_count = 0
-            is_correct = bool(sample_buf["is_correct"])
-            token_metrics = sample_buf["token_metrics"]
-            target_ids = sample_buf["target_ids"]
-            top5_ids = sample_buf["top5_ids"]
-            top5_vals = sample_buf["top5_vals"]
-            top5_cosine_sim = sample_buf["top5_cosine_sim"]
+    def run_for_rows(
+        rows_selected_local: list[dict[str, Any]],
+        variant_tag: str,
+        output_plot_path: Path,
+        output_jsonl_path: Path,
+        print_examples: bool = True,
+    ) -> dict[str, Any]:
+        all_entropies_local: list[float] = []
+        all_max_sims_local: list[float] = []
+        # CASE_NORMAL 目前只用于统计，不参与高熵 token 的聚类输出
+        case_counts_global_local = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
+        case_counts_high_local = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
+        all_high_rows_local: list[dict[str, Any]] = []
+        per_token_json_rows_local: list[dict[str, Any]] = []
 
-            if target_ids is not None and top5_ids is not None and top5_vals is not None and top5_cosine_sim is not None:
-                token_id_list = target_ids.tolist()
-                token_strs = tokenizer.convert_ids_to_tokens(token_id_list)
+        total_positions_local = 0
+        high_entropy_count_local = 0
 
-                # 保存所有 case：每个 token 位置一条 JSONL
-                for m in token_metrics:
-                    t = int(m["t"])
-                    e = float(m["entropy"])
-                    p1 = float(m["top1_prob"])
-                    p5m = float(m["top5_mass"])
-                    ms = float(m["max_cosine_sim"])
-                    token_id = int(token_id_list[t])
-                    token_str = token_strs[t]
-                    token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-                    top_ids_t = top5_ids[t].tolist()
-                    top_probs_t = top5_vals[t].float().tolist()
-                    top_tokens_raw = tokenizer.convert_ids_to_tokens(top_ids_t)
-                    top_tokens_text = [
-                        tokenizer.decode([int(_tid)], skip_special_tokens=False) for _tid in top_ids_t
-                    ]
-                    case_all = classify_case(
+        for st in tqdm(range(0, len(rows_selected_local), args.batch_size), desc=f"Analyzing({variant_tag})"):
+            batch_rows = rows_selected_local[st : st + args.batch_size]
+            full_texts = [str(r.get("prompt", "")) + str(r.get("predict", "")) for r in batch_rows]
+            prompts = [str(r.get("prompt", "")) for r in batch_rows]
+            predicts = [str(r.get("predict", "")) for r in batch_rows]
+            labels = [str(r.get("label", "")) for r in batch_rows]
+
+            enc = tokenizer(
+                full_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+                add_special_tokens=False,
+            )
+            input_ids = enc["input_ids"].to(model.lm_head.weight.device)
+            attention_mask = enc["attention_mask"].to(model.lm_head.weight.device)
+
+            prompt_lens = []
+            for p in prompts:
+                p_ids = tokenizer(p, add_special_tokens=False)["input_ids"]
+                prompt_lens.append(len(p_ids))
+
+            with torch.no_grad():
+                out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                logits = out.logits  # [B, L, V]
+                hidden = out.hidden_states[-1]  # [B, L, D]
+
+            bsz, _, vocab_size = logits.shape
+            _ = vocab_size
+
+            batch_sample_buffers: list[dict[str, Any]] = []
+            batch_wrong_candidates: list[tuple[float, int, int]] = []  # (entropy, sample_i, token_t)
+
+            for i in range(bsz):
+                attn_len = int(attention_mask[i].sum().item())
+                prompt_len = int(prompt_lens[i])
+                pred_answer = extract_answer(predicts[i])
+                gold_answer = extract_answer(labels[i])
+                is_correct = pred_answer == gold_answer
+
+                sample_case_counts = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
+                sample_total_positions = 0
+
+                if attn_len <= 1 or prompt_len >= attn_len:
+                    batch_sample_buffers.append(
+                        {
+                            "prompt_preview": prompts[i],
+                            "is_correct": is_correct,
+                            "total_positions": 0,
+                            "case_counts": sample_case_counts,
+                            "token_metrics": [],
+                            "target_ids": None,
+                            "top5_ids": None,
+                            "top5_vals": None,
+                            "top5_cosine_sim": None,
+                            "sample_i": i,
+                        }
+                    )
+                    continue
+
+                pred_start = max(prompt_len - 1, 0)
+                pred_end = attn_len - 1
+                if pred_start >= pred_end:
+                    batch_sample_buffers.append(
+                        {
+                            "prompt_preview": prompts[i],
+                            "is_correct": is_correct,
+                            "total_positions": 0,
+                            "case_counts": sample_case_counts,
+                            "token_metrics": [],
+                            "target_ids": None,
+                            "top5_ids": None,
+                            "top5_vals": None,
+                            "top5_cosine_sim": None,
+                            "sample_i": i,
+                        }
+                    )
+                    continue
+
+                logits_i = logits[i, pred_start:pred_end, :]
+                hidden_i = hidden[i, pred_start:pred_end, :]
+                target_ids = input_ids[i, prompt_len:attn_len]
+                npos = int(min(logits_i.shape[0], target_ids.shape[0]))
+                if npos <= 0:
+                    batch_sample_buffers.append(
+                        {
+                            "prompt_preview": prompts[i],
+                            "is_correct": is_correct,
+                            "total_positions": 0,
+                            "case_counts": sample_case_counts,
+                            "token_metrics": [],
+                            "target_ids": None,
+                            "top5_ids": None,
+                            "top5_vals": None,
+                            "top5_cosine_sim": None,
+                            "sample_i": i,
+                        }
+                    )
+                    continue
+
+                logits_i = logits_i[:npos]
+                hidden_i = hidden_i[:npos]
+                target_ids = target_ids[:npos]
+
+                # 数值稳定：在 fp32 上计算概率与熵，避免 fp16 下出现 NaN/Inf
+                logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                probs = torch.softmax(logits_i_fp32, dim=-1)
+                log_probs = torch.log(probs.clamp_min(1e-12))
+                entropy = -(probs * log_probs).sum(dim=-1)
+                top1_prob = probs.max(dim=-1).values
+                top5_vals, top5_ids = probs.topk(k=min(5, probs.shape[-1]), dim=-1)
+                top5_mass = top5_vals.sum(dim=-1)
+
+                hidden_i = torch.nan_to_num(hidden_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                h_norm = F.normalize(hidden_i, dim=-1, eps=1e-12)
+                h_norm = h_norm.to(embed_norm_t.device, dtype=embed_norm_t.dtype)
+
+                # chunked matmul to reduce peak memory usage
+                chunk = 64
+                max_sim_list = []
+                top5_sim_list = []
+                for cs in range(0, npos, chunk):
+                    ce = min(npos, cs + chunk)
+                    sims = h_norm[cs:ce] @ embed_norm_t
+                    max_sim_list.append(sims.max(dim=-1).values)
+                    top5_sim_list.append(sims.topk(k=min(5, sims.shape[-1]), dim=-1).values)
+                max_cosine_sim = torch.cat(max_sim_list, dim=0).float().cpu()
+                top5_cosine_sim = torch.cat(top5_sim_list, dim=0).float().cpu()
+
+                entropy_np = entropy.float().cpu().numpy()
+                top1_np = top1_prob.float().cpu().numpy()
+                top5_mass_np = top5_mass.float().cpu().numpy()
+                token_metrics: list[dict[str, Any]] = []
+
+                for t in range(npos):
+                    sample_total_positions += 1
+                    total_positions_local += 1
+                    e = float(entropy_np[t])
+                    p1 = float(top1_np[t])
+                    p5m = float(top5_mass_np[t])
+                    ms = float(max_cosine_sim[t].item())
+                    case = classify_case(
                         entropy=e,
                         top1_prob=p1,
                         top5_mass=p5m,
@@ -511,146 +479,308 @@ def main() -> None:
                         entropy_threshold=args.entropy_threshold,
                         sim_threshold=args.sim_threshold,
                     )
-                    if case_all == CASE_NORMAL:
-                        continue
-                    per_token_json_rows.append(
+                    sample_case_counts[case] += 1
+                    case_counts_global_local[case] += 1
+                    if np.isfinite(e):
+                        all_entropies_local.append(e)
+                    if np.isfinite(ms):
+                        all_max_sims_local.append(ms)
+                    token_metrics.append(
                         {
-                            "sample_idx": st + sample_i,
-                            "prompt_prefix": _build_prompt_prefix(
-                                tokenizer=tokenizer,
-                                prompt_text=sample_buf["prompt_preview"],
-                                token_strs=token_strs,
-                                t=t,
-                            ),
-                            "is_correct": is_correct,
                             "t": t,
-                            "token_id": token_id,
-                            "token": token_text,
-                            "token_raw": token_str,
-                            "context": _build_token_context(
-                                tokenizer=tokenizer,
-                                token_ids=token_id_list,
-                                t=t,
-                                window=6,
-                            ),
+                            "entropy": e,
+                            "top1_prob": p1,
+                            "top5_mass": p5m,
+                            "max_cosine_sim": ms,
+                        }
+                    )
+                    if (not is_correct) and np.isfinite(e):
+                        batch_wrong_candidates.append((e, i, t))
+
+                batch_sample_buffers.append(
+                    {
+                        "prompt_preview": prompts[i],
+                        "is_correct": is_correct,
+                        "total_positions": sample_total_positions,
+                        "case_counts": sample_case_counts,
+                        "token_metrics": token_metrics,
+                        "target_ids": target_ids.detach().cpu(),
+                        "top5_ids": top5_ids.detach().cpu(),
+                        "top5_vals": top5_vals.detach().cpu(),
+                        "top5_cosine_sim": top5_cosine_sim.detach().cpu(),
+                        "sample_i": i,
+                    }
+                )
+
+            # 按 batch 在“错误路径”上全局取 top-k 高熵 token
+            k = max(0, int(args.high_entropy_topk))
+            high_key_set: set[tuple[int, int]] = set()
+            if k > 0 and batch_wrong_candidates:
+                if len(batch_wrong_candidates) <= k:
+                    high_key_set = {(si, tt) for _, si, tt in batch_wrong_candidates}
+                else:
+                    ent_arr = np.asarray([x[0] for x in batch_wrong_candidates], dtype=np.float64)
+                    pick_idx = np.argpartition(ent_arr, -k)[-k:]
+                    high_key_set = {
+                        (batch_wrong_candidates[int(j)][1], batch_wrong_candidates[int(j)][2]) for j in pick_idx
+                    }
+
+            for sample_buf in batch_sample_buffers:
+                sample_i = int(sample_buf["sample_i"])
+                sample_high_positions: list[dict[str, Any]] = []
+                sample_high_count = 0
+                is_correct = bool(sample_buf["is_correct"])
+                token_metrics = sample_buf["token_metrics"]
+                target_ids = sample_buf["target_ids"]
+                top5_ids = sample_buf["top5_ids"]
+                top5_vals = sample_buf["top5_vals"]
+                top5_cosine_sim = sample_buf["top5_cosine_sim"]
+
+                if (
+                    target_ids is not None
+                    and top5_ids is not None
+                    and top5_vals is not None
+                    and top5_cosine_sim is not None
+                ):
+                    token_id_list = target_ids.tolist()
+                    token_strs = tokenizer.convert_ids_to_tokens(token_id_list)
+
+                    # 保存所有 case：每个 token 位置一条 JSONL
+                    for m in token_metrics:
+                        t = int(m["t"])
+                        e = float(m["entropy"])
+                        p1 = float(m["top1_prob"])
+                        p5m = float(m["top5_mass"])
+                        ms = float(m["max_cosine_sim"])
+                        token_id = int(token_id_list[t])
+                        token_str = token_strs[t]
+                        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+                        top_ids_t = top5_ids[t].tolist()
+                        top_probs_t = top5_vals[t].float().tolist()
+                        top_tokens_raw = tokenizer.convert_ids_to_tokens(top_ids_t)
+                        top_tokens_text = [
+                            tokenizer.decode([int(_tid)], skip_special_tokens=False) for _tid in top_ids_t
+                        ]
+                        case_all = classify_case(
+                            entropy=e,
+                            top1_prob=p1,
+                            top5_mass=p5m,
+                            max_cosine_sim=ms,
+                            entropy_threshold=args.entropy_threshold,
+                            sim_threshold=args.sim_threshold,
+                        )
+                        if case_all == CASE_NORMAL:
+                            continue
+                        per_token_json_rows_local.append(
+                            {
+                                "sample_idx": st + sample_i,
+                                "prompt_prefix": _build_prompt_prefix(
+                                    tokenizer=tokenizer,
+                                    prompt_text=sample_buf["prompt_preview"],
+                                    token_strs=token_strs,
+                                    t=t,
+                                ),
+                                "is_correct": is_correct,
+                                "t": t,
+                                "token_id": token_id,
+                                "token": token_text,
+                                "token_raw": token_str,
+                                "context": _build_token_context(
+                                    tokenizer=tokenizer,
+                                    token_ids=token_id_list,
+                                    t=t,
+                                    window=6,
+                                ),
+                                "entropy": e,
+                                "top1_prob": p1,
+                                "top5_mass": p5m,
+                                "max_cosine_sim": ms,
+                                "top5_cosine_sim": [float(x) for x in top5_cosine_sim[t].tolist()],
+                                "case": case_all,
+                                "top5_tokens": top_tokens_text,
+                                "top5_tokens_raw": top_tokens_raw,
+                                "top5_probs": [float(x) for x in top_probs_t],
+                            }
+                        )
+
+                    for m in token_metrics:
+                        t = int(m["t"])
+                        if (sample_i, t) not in high_key_set:
+                            continue
+                        e = float(m["entropy"])
+                        p1 = float(m["top1_prob"])
+                        p5m = float(m["top5_mass"])
+                        ms = float(m["max_cosine_sim"])
+                        if not (np.isfinite(e) and np.isfinite(p1) and np.isfinite(p5m) and np.isfinite(ms)):
+                            continue
+                        case = classify_high_case(
+                            top1_prob=p1,
+                            top5_mass=p5m,
+                            max_cosine_sim=ms,
+                            sim_threshold=args.sim_threshold,
+                        )
+                        sample_high_count += 1
+                        high_entropy_count_local += 1
+                        token_id = int(target_ids[t].item())
+                        token_str = tokenizer.convert_ids_to_tokens([token_id])[0]
+                        top_ids_t = top5_ids[t].tolist()
+                        top_probs_t = top5_vals[t].float().tolist()
+                        top_tokens_t = tokenizer.convert_ids_to_tokens(top_ids_t)
+                        row = {
+                            "sample_idx": st + sample_i,
+                            "t": t,
+                            "token": token_str,
                             "entropy": e,
                             "top1_prob": p1,
                             "top5_mass": p5m,
                             "max_cosine_sim": ms,
                             "top5_cosine_sim": [float(x) for x in top5_cosine_sim[t].tolist()],
-                            "case": case_all,
-                            "top5_tokens": top_tokens_text,
-                            "top5_tokens_raw": top_tokens_raw,
+                            "case": case,
+                            "top5_tokens": top_tokens_t,
                             "top5_probs": [float(x) for x in top_probs_t],
                         }
-                    )
+                        sample_high_positions.append(row)
+                        all_high_rows_local.append(row)
+                        if case in case_counts_high_local:
+                            case_counts_high_local[case] += 1
 
-                for m in token_metrics:
-                    t = int(m["t"])
-                    if (sample_i, t) not in high_key_set:
-                        continue
-                    e = float(m["entropy"])
-                    p1 = float(m["top1_prob"])
-                    p5m = float(m["top5_mass"])
-                    ms = float(m["max_cosine_sim"])
-                    if not (np.isfinite(e) and np.isfinite(p1) and np.isfinite(p5m) and np.isfinite(ms)):
-                        continue
-                    case = classify_high_case(
-                        top1_prob=p1,
-                        top5_mass=p5m,
-                        max_cosine_sim=ms,
-                        sim_threshold=args.sim_threshold,
-                    )
-                    sample_high_count += 1
-                    high_entropy_count += 1
-                    token_id = int(target_ids[t].item())
-                    token_str = tokenizer.convert_ids_to_tokens([token_id])[0]
-                    top_ids_t = top5_ids[t].tolist()
-                    top_probs_t = top5_vals[t].float().tolist()
-                    top_tokens_t = tokenizer.convert_ids_to_tokens(top_ids_t)
-                    row = {
-                        "sample_idx": st + sample_i,
-                        "t": t,
-                        "token": token_str,
-                        "entropy": e,
-                        "top1_prob": p1,
-                        "top5_mass": p5m,
-                        "max_cosine_sim": ms,
-                        "top5_cosine_sim": [float(x) for x in top5_cosine_sim[t].tolist()],
-                        "case": case,
-                        "top5_tokens": top_tokens_t,
-                        "top5_probs": [float(x) for x in top_probs_t],
-                    }
-                    sample_high_positions.append(row)
-                    all_high_rows.append(row)
-                    if case in case_counts_high:
-                        case_counts_high[case] += 1
+                _ = sample_high_positions
+                _ = sample_high_count
 
-            _ = sample_high_positions
-            _ = sample_high_count
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        all_ent_arr = np.asarray(all_entropies_local, dtype=np.float64)
+        all_sim_arr = np.asarray(all_max_sims_local, dtype=np.float64)
+        all_ent_arr = all_ent_arr[np.isfinite(all_ent_arr)]
+        all_sim_arr = all_sim_arr[np.isfinite(all_sim_arr)]
 
-    all_ent_arr = np.asarray(all_entropies, dtype=np.float64)
-    all_sim_arr = np.asarray(all_max_sims, dtype=np.float64)
-    all_ent_arr = all_ent_arr[np.isfinite(all_ent_arr)]
-    all_sim_arr = all_sim_arr[np.isfinite(all_sim_arr)]
-
-    print("=" * 50)
-    print("【高熵位置类型分析】")
-    print("=" * 50)
-    print(f"总 token 位置数：{total_positions:>12d}")
-    frac = (100.0 * high_entropy_count / total_positions) if total_positions > 0 else 0.0
-    print(f"高熵位置数：{high_entropy_count:>14d}  ({frac:.1f}%)")
-    print("\n高熵位置中的类型分布：")
-    denom_high = max(high_entropy_count, 1)
-    denom_total = max(total_positions, 1)
-    for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
-        cnt = case_counts_high[c]
-        print(
-            f"  {c:<12}: {cnt:>5d}  "
-            f"({100.0 * cnt / denom_high:>5.1f}% of 高熵, {100.0 * cnt / denom_total:>5.1f}% of 总数)"
+        summary = _print_and_return_case_ratios(
+            case_counts_high_in=case_counts_high_local,
+            total_positions_in=total_positions_local,
+            high_entropy_count_in=high_entropy_count_local,
+            variant_tag=variant_tag,
         )
 
-    if all_ent_arr.size > 0:
-        ent_stats = _summarize(all_ent_arr, [0.5, 0.9])
-        print("\n熵统计：")
-        print(
-            f"  mean={all_ent_arr.mean():.2f}, median={ent_stats[0.5]:.2f}, "
-            f"p90={ent_stats[0.9]:.2f}, max={all_ent_arr.max():.2f}"
-        )
-    else:
-        print("\n熵统计：无数据")
-
-    if all_sim_arr.size > 0:
-        sim_stats = _summarize(all_sim_arr, [0.1, 0.5])
-        print("\n最大余弦相似度统计（h_t vs 词嵌入）：")
-        print(
-            f"  mean={all_sim_arr.mean():.2f}, median={sim_stats[0.5]:.2f}, "
-            f"p10={sim_stats[0.1]:.2f}, min={all_sim_arr.min():.2f}"
-        )
-    else:
-        print("\n最大余弦相似度统计：无数据")
-
-    examples = _collect_examples(all_high_rows, per_case=2)
-    for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
-        for ex in examples[c]:
+        if all_ent_arr.size > 0:
+            ent_stats = _summarize(all_ent_arr, [0.5, 0.9])
+            print("\n熵统计：")
             print(
-                f"\n[{c}] t={ex['t']}, entropy={ex['entropy']:.2f}, "
-                f"top5_mass={ex['top5_mass']:.2f}, max_sim={ex['max_cosine_sim']:.2f}"
+                f"  mean={all_ent_arr.mean():.2f}, median={ent_stats[0.5]:.2f}, "
+                f"p90={ent_stats[0.9]:.2f}, max={all_ent_arr.max():.2f}"
             )
-            print(f"  top-1 token : {repr(ex['token'])}")
-            print(f"  top-5 tokens: {[t for t in ex['top5_tokens']]}")
-            print(f"  top-5 probs : {[round(float(x), 4) for x in ex['top5_probs']]}")
+        else:
+            print("\n熵统计：无数据")
 
-    _plot_results(all_high_rows, output_plot)
-    print(f"\n[plot] saved: {output_plot.resolve()}")
+        if all_sim_arr.size > 0:
+            sim_stats = _summarize(all_sim_arr, [0.1, 0.5])
+            print("\n最大余弦相似度统计（h_t vs 词嵌入）：")
+            print(
+                f"  mean={all_sim_arr.mean():.2f}, median={sim_stats[0.5]:.2f}, "
+                f"p10={sim_stats[0.1]:.2f}, min={all_sim_arr.min():.2f}"
+            )
+        else:
+            print("\n最大余弦相似度统计：无数据")
 
-    with output_jsonl.open("w", encoding="utf-8") as f:
-        for row in per_token_json_rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"[jsonl] saved: {output_jsonl.resolve()}")
+        if print_examples:
+            examples = _collect_examples(all_high_rows_local, per_case=2)
+            for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
+                for ex in examples[c]:
+                    print(
+                        f"\n[{c}] t={ex['t']}, entropy={ex['entropy']:.2f}, "
+                        f"top5_mass={ex['top5_mass']:.2f}, max_sim={ex['max_cosine_sim']:.2f}"
+                    )
+                    print(f"  top-1 token : {repr(ex['token'])}")
+                    print(f"  top-5 tokens: {[t for t in ex['top5_tokens']]}")
+                    print(f"  top-5 probs : {[round(float(x), 4) for x in ex['top5_probs']]}")
+
+        _plot_results(all_high_rows_local, output_plot_path)
+        print(f"\n[plot] saved: {output_plot_path.resolve()}")
+
+        with output_jsonl_path.open("w", encoding="utf-8") as f:
+            for row in per_token_json_rows_local:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"[jsonl] saved: {output_jsonl_path.resolve()}")
+
+        return summary
+
+    # 1) 原始输出分析
+    summary_original = run_for_rows(
+        rows_selected_local=rows_selected,
+        variant_tag="original",
+        output_plot_path=output_plot,
+        output_jsonl_path=output_jsonl,
+        print_examples=True,
+    )
+
+    # 2) 如果预测输出里包含 <add_think>，再分析一次“删除后的版本”
+    need_add_think_clean = any("<add_think>" in str(r.get("predict", "")) for r in rows_selected)
+    summaries_by_variant: dict[str, dict[str, Any]] = {"original": summary_original}
+
+    if need_add_think_clean:
+        output_plot_no_think = output_plot.parent / f"{output_plot.stem}_no_add_think{output_plot.suffix}"
+        output_jsonl_no_think = output_jsonl.parent / f"{output_jsonl.stem}_no_add_think{output_jsonl.suffix}"
+
+        rows_selected_no_think: list[dict[str, Any]] = []
+        for r in rows_selected:
+            rr = dict(r)
+            rr["predict"] = str(r.get("predict", "")).replace("<add_think>", "")
+            rows_selected_no_think.append(rr)
+
+        summaries_by_variant["no_add_think"] = run_for_rows(
+            rows_selected_local=rows_selected_no_think,
+            variant_tag="no_add_think",
+            output_plot_path=output_plot_no_think,
+            output_jsonl_path=output_jsonl_no_think,
+            print_examples=False,
+        )
+
+    # 3) 汇总保存三类比例表（CSV/JSON）
+    summary_json_path = output_jsonl.parent / f"{output_jsonl.stem}_case_ratios.json"
+    summary_csv_path = output_jsonl.parent / f"{output_jsonl.stem}_case_ratios.csv"
+
+    csv_rows: list[dict[str, Any]] = []
+    for variant_tag, s in summaries_by_variant.items():
+        for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
+            cnt_high = int(s["case_counts_high"][c])
+            ratio_high = float(s["case_ratios_high"][c])
+            ratio_total = float(s["case_ratios_total"][c])
+            csv_rows.append(
+                {
+                    "variant": variant_tag,
+                    "case": c,
+                    "count_high": cnt_high,
+                    "ratio_high": ratio_high,
+                    "ratio_total": ratio_total,
+                    "high_entropy_count": int(s["high_entropy_count"]),
+                    "total_positions": int(s["total_positions"]),
+                }
+            )
+
+    summary_payload = {
+        "variants": summaries_by_variant,
+    }
+    summary_json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with summary_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "variant",
+                "case",
+                "count_high",
+                "ratio_high",
+                "ratio_total",
+                "high_entropy_count",
+                "total_positions",
+            ],
+        )
+        writer.writeheader()
+        for row in csv_rows:
+            writer.writerow(row)
+
+    print(f"\n[ratio table] saved csv: {summary_csv_path.resolve()}")
+    print(f"[ratio table] saved json: {summary_json_path.resolve()}")
 
 
 if __name__ == "__main__":
