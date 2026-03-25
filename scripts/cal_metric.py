@@ -71,9 +71,10 @@ def extract_answer(text: str) -> Optional[str]:
     Extract the final answer from a GSM8K-style string.
 
     Priority:
-      1. Last occurrence of "#### <value>"
-      2. Last occurrence of "The answer is <value>"
-      3. Last standalone number in the text (fallback)
+      1. Last occurrence of "#### <value>" (GSM8K)
+      2. Last occurrence of "### <value>"
+      3. Last occurrence of "The answer is <value>"
+      4. Last standalone number in the text (fallback)
     """
     text = text.strip()
 
@@ -84,7 +85,14 @@ def extract_answer(text: str) -> Optional[str]:
         norm = _normalize_number(raw)
         return norm if norm is not None else raw
 
-    # 2. "The answer is X" pattern
+    # 2. ### pattern (common in CoT outputs; do not match the first 3 # of ####)
+    matches = list(re.finditer(r"(?<!#)###(?![#])\s*(.+?)(?:\n|$)", text))
+    if matches:
+        raw = matches[-1].group(1).strip()
+        norm = _normalize_number(raw)
+        return norm if norm is not None else raw
+
+    # 3. "The answer is X" pattern
     matches = list(re.finditer(
         r"[Tt]he\s+answer\s+is\s+[:\-]?\s*([^\.\n,]+)", text
     ))
@@ -93,7 +101,7 @@ def extract_answer(text: str) -> Optional[str]:
         norm = _normalize_number(raw)
         return norm if norm is not None else raw
 
-    # 3. Fallback: last number in the text
+    # 4. Fallback: last number in the text
     numbers = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
     if numbers:
         raw = numbers[-1].replace(",", "")
