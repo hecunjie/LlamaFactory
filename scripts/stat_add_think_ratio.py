@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Stat <add_think> usage ratio among correct/incorrect answers.
+Stat <add_think> token ratio among correct/incorrect answers.
 
 Input JSONL (one object per line), each record may contain:
   - "label": ground truth answer text
   - "predict": single prediction string (optional)
   - "predicts": list of prediction strings (optional)
 
-Correctness is judged by `extract_answer` + `answers_match`
-from `cal_metric.py`.
+Correctness is judged by `extract_answer` + `answers_match` from `cal_metric.py`.
+Ratio is computed by token count:
+  <add_think> token count / total token count
 """
 
 import argparse
@@ -52,6 +53,19 @@ def safe_ratio(num: int, den: int) -> float:
     return num / den if den else 0.0
 
 
+def token_stats(text: str) -> tuple[int, int]:
+    """
+    Return (add_think_token_count, total_token_count).
+
+    We force `<add_think>` to be tokenized as a standalone token even when it is
+    attached to words like `abc<add_think>def`.
+    """
+    normalized = text.replace(ADD_THINK_TOKEN, f" {ADD_THINK_TOKEN} ")
+    tokens = normalized.split()
+    add_think_count = sum(1 for t in tokens if t == ADD_THINK_TOKEN)
+    return add_think_count, len(tokens)
+
+
 def load_jsonl(path: str) -> list[dict]:
     records = []
     with open(path, "r", encoding="utf-8") as f:
@@ -92,15 +106,16 @@ def main() -> None:
     print(f"Loaded records: {len(records)}")
 
     total_answers = 0
-    total_with_add_think = 0
+    total_add_think_tokens = 0
+    total_tokens = 0
 
     correct_answers = 0
-    correct_with_add_think = 0
-    correct_add_think_occ = 0
+    correct_add_think_tokens = 0
+    correct_tokens = 0
 
     wrong_answers = 0
-    wrong_with_add_think = 0
-    wrong_add_think_occ = 0
+    wrong_add_think_tokens = 0
+    wrong_tokens = 0
 
     missing_label_answer = 0
 
@@ -113,24 +128,21 @@ def main() -> None:
         preds = iter_predictions(rec, dedup_per_record=args.dedup_per_record)
         for pred in preds:
             total_answers += 1
-            has_add_think = ADD_THINK_TOKEN in pred
-            add_think_occ = pred.count(ADD_THINK_TOKEN)
-            if has_add_think:
-                total_with_add_think += 1
+            add_think_cnt, token_cnt = token_stats(pred)
+            total_add_think_tokens += add_think_cnt
+            total_tokens += token_cnt
 
             pred_ans = extract_answer(pred)
             is_correct = answers_match(pred_ans, label_ans)
 
             if is_correct:
                 correct_answers += 1
-                if has_add_think:
-                    correct_with_add_think += 1
-                correct_add_think_occ += add_think_occ
+                correct_add_think_tokens += add_think_cnt
+                correct_tokens += token_cnt
             else:
                 wrong_answers += 1
-                if has_add_think:
-                    wrong_with_add_think += 1
-                wrong_add_think_occ += add_think_occ
+                wrong_add_think_tokens += add_think_cnt
+                wrong_tokens += token_cnt
 
     result = {
         "num_records": len(records),
@@ -138,40 +150,40 @@ def main() -> None:
         "dedup_per_record": args.dedup_per_record,
         "missing_label_answer": missing_label_answer,
         "overall": {
-            "with_add_think_ratio": safe_ratio(total_with_add_think, total_answers),
-            "with_add_think": total_with_add_think,
-            "total": total_answers,
+            "add_think_token_ratio": safe_ratio(total_add_think_tokens, total_tokens),
+            "add_think_tokens": total_add_think_tokens,
+            "total_tokens": total_tokens,
         },
         "correct": {
-            "with_add_think_ratio": safe_ratio(correct_with_add_think, correct_answers),
-            "with_add_think": correct_with_add_think,
-            "total": correct_answers,
-            "avg_add_think_occ_per_answer": safe_ratio(correct_add_think_occ, correct_answers),
+            "add_think_token_ratio": safe_ratio(correct_add_think_tokens, correct_tokens),
+            "add_think_tokens": correct_add_think_tokens,
+            "total_tokens": correct_tokens,
+            "answers": correct_answers,
         },
         "incorrect": {
-            "with_add_think_ratio": safe_ratio(wrong_with_add_think, wrong_answers),
-            "with_add_think": wrong_with_add_think,
-            "total": wrong_answers,
-            "avg_add_think_occ_per_answer": safe_ratio(wrong_add_think_occ, wrong_answers),
+            "add_think_token_ratio": safe_ratio(wrong_add_think_tokens, wrong_tokens),
+            "add_think_tokens": wrong_add_think_tokens,
+            "total_tokens": wrong_tokens,
+            "answers": wrong_answers,
         },
     }
 
-    print("\n=== <add_think> usage statistics ===")
+    print("\n=== <add_think> token statistics ===")
     print(f"answers used: {result['num_answers_used']}")
     print(
-        f"correct   : {correct_with_add_think}/{correct_answers} = "
-        f"{result['correct']['with_add_think_ratio']:.4f} "
-        f"({result['correct']['with_add_think_ratio'] * 100:.2f}%)"
+        f"correct   : {correct_add_think_tokens}/{correct_tokens} = "
+        f"{result['correct']['add_think_token_ratio']:.4f} "
+        f"({result['correct']['add_think_token_ratio'] * 100:.2f}%)"
     )
     print(
-        f"incorrect : {wrong_with_add_think}/{wrong_answers} = "
-        f"{result['incorrect']['with_add_think_ratio']:.4f} "
-        f"({result['incorrect']['with_add_think_ratio'] * 100:.2f}%)"
+        f"incorrect : {wrong_add_think_tokens}/{wrong_tokens} = "
+        f"{result['incorrect']['add_think_token_ratio']:.4f} "
+        f"({result['incorrect']['add_think_token_ratio'] * 100:.2f}%)"
     )
     print(
-        f"overall   : {total_with_add_think}/{total_answers} = "
-        f"{result['overall']['with_add_think_ratio']:.4f} "
-        f"({result['overall']['with_add_think_ratio'] * 100:.2f}%)"
+        f"overall   : {total_add_think_tokens}/{total_tokens} = "
+        f"{result['overall']['add_think_token_ratio']:.4f} "
+        f"({result['overall']['add_think_token_ratio'] * 100:.2f}%)"
     )
 
     if args.output:
