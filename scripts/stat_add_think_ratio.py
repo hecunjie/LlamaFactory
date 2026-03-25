@@ -201,27 +201,38 @@ def main() -> None:
             "add_think_token_ratio": safe_ratio(total_add_think_tokens, total_tokens),
             "add_think_tokens": total_add_think_tokens,
             "total_tokens": total_tokens,
+            "non_add_think_tokens": total_tokens - total_add_think_tokens,
         },
         "correct": {
             "add_think_token_ratio": safe_ratio(correct_add_think_tokens, correct_tokens),
             "add_think_tokens": correct_add_think_tokens,
             "total_tokens": correct_tokens,
+            "non_add_think_tokens": correct_tokens - correct_add_think_tokens,
             "answers": correct_answers,
         },
         "incorrect": {
             "add_think_token_ratio": safe_ratio(wrong_add_think_tokens, wrong_tokens),
             "add_think_tokens": wrong_add_think_tokens,
             "total_tokens": wrong_tokens,
+            "non_add_think_tokens": wrong_tokens - wrong_add_think_tokens,
             "answers": wrong_answers,
         },
     }
 
     print("\n=== <add_think> token statistics ===")
-    print(f"answers used: {result['num_answers_used']}")
+    print(f"records used : {result['num_records']}")
+    print(f"answers used : {result['num_answers_used']}")
+    print(f"correct answers   : {correct_answers}")
+    print(f"incorrect answers : {wrong_answers}")
+    print(f"missing label answer records: {missing_label_answer}")
     print(
         f"correct   : {correct_add_think_tokens}/{correct_tokens} = "
         f"{result['correct']['add_think_token_ratio']:.4f} "
         f"({result['correct']['add_think_token_ratio'] * 100:.2f}%)"
+    )
+    print(
+        f"           add_think_tokens={correct_add_think_tokens}, "
+        f"non_add_think_tokens={correct_tokens - correct_add_think_tokens}"
     )
     print(
         f"incorrect : {wrong_add_think_tokens}/{wrong_tokens} = "
@@ -229,9 +240,17 @@ def main() -> None:
         f"({result['incorrect']['add_think_token_ratio'] * 100:.2f}%)"
     )
     print(
+        f"           add_think_tokens={wrong_add_think_tokens}, "
+        f"non_add_think_tokens={wrong_tokens - wrong_add_think_tokens}"
+    )
+    print(
         f"overall   : {total_add_think_tokens}/{total_tokens} = "
         f"{result['overall']['add_think_token_ratio']:.4f} "
         f"({result['overall']['add_think_token_ratio'] * 100:.2f}%)"
+    )
+    print(
+        f"           add_think_tokens={total_add_think_tokens}, "
+        f"non_add_think_tokens={total_tokens - total_add_think_tokens}"
     )
 
     if args.output:
