@@ -53,7 +53,7 @@ def safe_ratio(num: int, den: int) -> float:
     return num / den if den else 0.0
 
 
-def token_stats(text: str) -> tuple[int, int]:
+def token_stats_by_split(text: str) -> tuple[int, int]:
     """
     Return (add_think_token_count, total_token_count).
 
@@ -64,6 +64,30 @@ def token_stats(text: str) -> tuple[int, int]:
     tokens = normalized.split()
     add_think_count = sum(1 for t in tokens if t == ADD_THINK_TOKEN)
     return add_think_count, len(tokens)
+
+
+def count_subseq(seq: list[int], pattern: list[int]) -> int:
+    """Count non-overlapping occurrences of pattern in seq."""
+    if not pattern:
+        return 0
+    count = 0
+    i = 0
+    n = len(pattern)
+    while i <= len(seq) - n:
+        if seq[i : i + n] == pattern:
+            count += 1
+            i += n
+        else:
+            i += 1
+    return count
+
+
+def token_stats_by_tokenizer(text: str, tokenizer, add_think_ids: list[int]) -> tuple[int, int]:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if not add_think_ids:
+        return 0, len(token_ids)
+    add_think_count = count_subseq(token_ids, add_think_ids)
+    return add_think_count, len(token_ids)
 
 
 def load_jsonl(path: str) -> list[dict]:
@@ -100,10 +124,31 @@ def main() -> None:
         default=None,
         help="Optional path to save stats as JSON",
     )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Optional HF tokenizer path/name for true token-level counting",
+    )
     args = parser.parse_args()
 
     records = load_jsonl(args.input)
     print(f"Loaded records: {len(records)}")
+
+    tokenizer = None
+    add_think_ids: list[int] = []
+    if args.tokenizer_path:
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "transformers is required when --tokenizer-path is set. "
+                "Please install it first."
+            ) from e
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, use_fast=True)
+        add_think_ids = tokenizer.encode(ADD_THINK_TOKEN, add_special_tokens=False)
+        print(f"Tokenizer loaded: {args.tokenizer_path}")
+        print(f"{ADD_THINK_TOKEN} token ids: {add_think_ids}")
 
     total_answers = 0
     total_add_think_tokens = 0
@@ -128,7 +173,10 @@ def main() -> None:
         preds = iter_predictions(rec, dedup_per_record=args.dedup_per_record)
         for pred in preds:
             total_answers += 1
-            add_think_cnt, token_cnt = token_stats(pred)
+            if tokenizer is None:
+                add_think_cnt, token_cnt = token_stats_by_split(pred)
+            else:
+                add_think_cnt, token_cnt = token_stats_by_tokenizer(pred, tokenizer, add_think_ids)
             total_add_think_tokens += add_think_cnt
             total_tokens += token_cnt
 
