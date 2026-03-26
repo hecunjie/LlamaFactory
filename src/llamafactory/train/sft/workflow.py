@@ -15,7 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import MethodType
 from typing import TYPE_CHECKING, Optional
+
+import torch
+import torch.nn.functional as F
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
@@ -82,6 +86,75 @@ def run_sft(
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+
+    if getattr(finetuning_args, "use_rgha", False):
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+
+        hidden_size = int(getattr(unwrapped.config, "hidden_size", 0))
+        mid_size = int(getattr(finetuning_args, "rgha_hidden_size", 256))
+        if hidden_size > 0:
+            if not hasattr(unwrapped, "rgha_ln"):
+                unwrapped.rgha_ln = torch.nn.LayerNorm(hidden_size)
+            if not hasattr(unwrapped, "rgha_mlp"):
+                unwrapped.rgha_mlp = torch.nn.Sequential(
+                    torch.nn.Linear(hidden_size, mid_size),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(mid_size, hidden_size),
+                )
+            if not hasattr(unwrapped, "rgha_gate"):
+                unwrapped.rgha_gate = torch.nn.Linear(2, 1)
+
+        unwrapped.use_rgha = True
+        unwrapped.rgha_entropy_alpha = float(getattr(finetuning_args, "rgha_entropy_alpha", 0.5))
+        unwrapped.rgha_sim_beta = float(getattr(finetuning_args, "rgha_sim_beta", 0.5))
+        unwrapped.rgha_threshold = float(getattr(finetuning_args, "rgha_threshold", 0.55))
+        unwrapped.rgha_warmup_steps = int(getattr(finetuning_args, "rgha_warmup_steps", 200))
+        unwrapped._rgha_original_forward = getattr(unwrapped, "_rgha_original_forward", unwrapped.forward)
+
+        def _forward_with_rgha(self, *args, **kwargs):
+            if not getattr(self, "use_rgha", False):
+                return self._rgha_original_forward(*args, **kwargs)
+
+            # Keep train/infer behavior consistent by ensuring hidden states are available.
+            if not kwargs.get("output_hidden_states", False):
+                kwargs["output_hidden_states"] = True
+
+            outputs = self._rgha_original_forward(*args, **kwargs)
+            if getattr(outputs, "hidden_states", None) is None or getattr(outputs, "logits", None) is None:
+                return outputs
+
+            hidden_states = outputs.hidden_states[-1]
+            logits = outputs.logits
+            input_embeds = self.get_input_embeddings()
+            output_embeds = self.get_output_embeddings()
+            if input_embeds is None or output_embeds is None:
+                return outputs
+
+            logits_fp32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            probs = torch.softmax(logits_fp32, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+            vocab_size = max(int(logits.size(-1)), 2)
+            norm_entropy = (entropy / torch.log(torch.tensor(float(vocab_size), device=entropy.device))).clamp(0.0, 1.0)
+
+            embed_norm_t = F.normalize(input_embeds.weight.float(), dim=-1, eps=1e-12).transpose(0, 1).contiguous()
+            h_norm = F.normalize(hidden_states.float(), dim=-1, eps=1e-12).to(embed_norm_t.dtype)
+            max_sim = torch.matmul(h_norm, embed_norm_t).max(dim=-1).values.float()
+            one_minus_max_sim = (1.0 - max_sim).clamp(0.0, 2.0)
+            risk = self.rgha_entropy_alpha * norm_entropy + self.rgha_sim_beta * one_minus_max_sim
+
+            risk_mask = risk > self.rgha_threshold
+            feat = torch.stack((norm_entropy, one_minus_max_sim), dim=-1).to(hidden_states.dtype)
+            gate = torch.sigmoid(self.rgha_gate(feat)).squeeze(-1) * risk_mask.to(hidden_states.dtype)
+            delta = self.rgha_mlp(self.rgha_ln(hidden_states))
+            refined_hidden = hidden_states + gate.unsqueeze(-1) * delta
+            refined_logits = output_embeds(refined_hidden)
+            outputs.logits = refined_logits
+            return outputs
+
+        unwrapped.forward = MethodType(_forward_with_rgha, unwrapped)
+        logger.info_rank0("Enabled RGHA forward patch for both training and inference.")
 
     # Resize embeddings when tokenizer vocab != model embedding rows (e.g. new <add_think> or
     # tokenizer already had the token but base checkpoint did not).

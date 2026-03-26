@@ -560,6 +560,39 @@ class FinetuningArguments(
         default=0.1,
         metadata={"help": "Weight for orthogonal loss. total_loss += ortho_loss_weight * loss_ortho."},
     )
+    use_rgha: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable Risk-Gated Hidden Adapter (RGHA) in standard SFT. "
+                "RGHA refines hidden states at high-risk positions before auxiliary CE."
+            )
+        },
+    )
+    rgha_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight for RGHA auxiliary CE loss. total_loss += rgha_weight * loss_rgha."},
+    )
+    rgha_entropy_alpha: float = field(
+        default=0.5,
+        metadata={"help": "Alpha coefficient for normalized entropy in RGHA risk score."},
+    )
+    rgha_sim_beta: float = field(
+        default=0.5,
+        metadata={"help": "Beta coefficient for (1 - max_cosine_sim) in RGHA risk score."},
+    )
+    rgha_threshold: float = field(
+        default=0.55,
+        metadata={"help": "Risk threshold to trigger RGHA positions."},
+    )
+    rgha_hidden_size: int = field(
+        default=256,
+        metadata={"help": "Hidden size of RGHA MLP adapter."},
+    )
+    rgha_warmup_steps: int = field(
+        default=200,
+        metadata={"help": "Warmup steps before RGHA masking is enabled."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -803,6 +836,14 @@ class FinetuningArguments(
             raise ValueError("`align_loss_weight` must be non-negative.")
         if self.ortho_loss_weight < 0:
             raise ValueError("`ortho_loss_weight` must be non-negative.")
+        if self.rgha_weight < 0:
+            raise ValueError("`rgha_weight` must be non-negative.")
+        if self.rgha_entropy_alpha < 0 or self.rgha_sim_beta < 0:
+            raise ValueError("`rgha_entropy_alpha` and `rgha_sim_beta` must be non-negative.")
+        if self.rgha_hidden_size <= 0:
+            raise ValueError("`rgha_hidden_size` must be positive.")
+        if self.rgha_warmup_steps < 0:
+            raise ValueError("`rgha_warmup_steps` must be non-negative.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

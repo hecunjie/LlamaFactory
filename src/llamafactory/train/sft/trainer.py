@@ -17,6 +17,7 @@
 
 import csv
 import json
+import math
 import os
 from collections import defaultdict
 from types import MethodType
@@ -107,8 +108,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.align_loss_weight = getattr(finetuning_args, "align_loss_weight", 0.1)
         self.use_ortho_loss = getattr(finetuning_args, "use_ortho_loss", False)
         self.ortho_loss_weight = getattr(finetuning_args, "ortho_loss_weight", 0.1)
+        self.use_rgha = getattr(finetuning_args, "use_rgha", False)
+        self.rgha_weight = getattr(finetuning_args, "rgha_weight", 0.05)
+        self.rgha_entropy_alpha = getattr(finetuning_args, "rgha_entropy_alpha", 0.5)
+        self.rgha_sim_beta = getattr(finetuning_args, "rgha_sim_beta", 0.5)
+        self.rgha_threshold = getattr(finetuning_args, "rgha_threshold", 0.55)
+        self.rgha_warmup_steps = getattr(finetuning_args, "rgha_warmup_steps", 200)
         self.think_token_id = None
         self._align_warned_no_think_token = False
+        self._rgha_warned_missing_module = False
 
         if self.use_align_loss or self.use_ortho_loss:
             tokenizer = self.processing_class
@@ -161,6 +169,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 self.use_align_loss = False
             else:
                 self.think_token_id = int(think_token_id)
+
+        if self.use_rgha:
+            unwrapped = self.model
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
+            hidden_size = int(getattr(unwrapped.config, "hidden_size", 0))
+            mid_size = int(getattr(finetuning_args, "rgha_hidden_size", 256))
+            if hidden_size > 0:
+                if not hasattr(unwrapped, "rgha_ln"):
+                    unwrapped.rgha_ln = torch.nn.LayerNorm(hidden_size)
+                if not hasattr(unwrapped, "rgha_mlp"):
+                    unwrapped.rgha_mlp = torch.nn.Sequential(
+                        torch.nn.Linear(hidden_size, mid_size),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(mid_size, hidden_size),
+                    )
+                if not hasattr(unwrapped, "rgha_gate"):
+                    unwrapped.rgha_gate = torch.nn.Linear(2, 1)
 
     def compute_align_loss(
         self,
@@ -237,6 +263,62 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         e_sample_norm = e_sample / e_sample.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
         cos_sims = torch.matmul(e_sample_norm, z_norm)
         return cos_sims.abs().mean()
+
+    def _compute_rgha_risk(
+        self, model: "torch.nn.Module", hidden_states: torch.Tensor, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""Compute RGHA risk score and ingredients: (risk, norm_entropy, one_minus_max_sim)."""
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+
+        input_embeds = unwrapped.get_input_embeddings()
+        if input_embeds is None:
+            zero = torch.zeros_like(hidden_states[..., 0])
+            return zero, zero, zero
+
+        # token-level normalized entropy in [0, 1]
+        logits_fp32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        probs = torch.softmax(logits_fp32, dim=-1)
+        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+        vocab_size = max(int(logits.size(-1)), 2)
+        norm_entropy = entropy / math.log(vocab_size)
+        norm_entropy = norm_entropy.clamp(0.0, 1.0)
+
+        embed_weight = input_embeds.weight
+        embed_norm_t = F.normalize(embed_weight.float(), dim=-1, eps=1e-12).transpose(0, 1).contiguous()
+        h_norm = F.normalize(hidden_states.float(), dim=-1, eps=1e-12).to(embed_norm_t.dtype)
+        max_sim = torch.matmul(h_norm, embed_norm_t).max(dim=-1).values.float()
+        one_minus_max_sim = (1.0 - max_sim).clamp(0.0, 2.0)
+
+        risk = self.rgha_entropy_alpha * norm_entropy + self.rgha_sim_beta * one_minus_max_sim
+        return risk, norm_entropy, one_minus_max_sim
+
+    def _apply_rgha(
+        self,
+        model: "torch.nn.Module",
+        hidden_states: torch.Tensor,
+        norm_entropy: torch.Tensor,
+        one_minus_max_sim: torch.Tensor,
+        risk_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""Apply RGHA residual refinement and return (refined_hidden_states, gate)."""
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        if not (hasattr(unwrapped, "rgha_ln") and hasattr(unwrapped, "rgha_mlp") and hasattr(unwrapped, "rgha_gate")):
+            if not self._rgha_warned_missing_module and self.is_world_process_zero():
+                logger.warning_rank0("[rgha] Modules not initialized; skip RGHA for this step.")
+                self._rgha_warned_missing_module = True
+            gate = torch.zeros_like(hidden_states[..., 0])
+            return hidden_states, gate
+
+        feat = torch.stack((norm_entropy, one_minus_max_sim), dim=-1).to(hidden_states.dtype)
+        gate = torch.sigmoid(unwrapped.rgha_gate(feat)).squeeze(-1)
+        gate = gate * risk_mask.to(gate.dtype)
+        delta = unwrapped.rgha_mlp(unwrapped.rgha_ln(hidden_states))
+        refined = hidden_states + gate.unsqueeze(-1) * delta
+        return refined, gate
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -935,6 +1017,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         )
         align_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
         ortho_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        rgha_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        rgha_trigger_rate = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        rgha_mean_risk = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        rgha_mean_gate = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
 
         if do_latent_chain:
             # ---- Forward 1: Sequential latent chain + answer CE ----
@@ -1029,7 +1115,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
-            if self.use_align_loss:
+            if self.use_align_loss or self.use_rgha:
                 inputs["output_hidden_states"] = True
             with self.compute_loss_context_manager():
                 loss_answer, outputs = super().compute_loss(
@@ -1051,6 +1137,42 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     self._align_warned_no_think_token = True
                 align_loss = self.compute_align_loss(model, hidden_states, inputs["input_ids"])
+            if self.use_rgha and getattr(outputs, "hidden_states", None) is not None and getattr(outputs, "logits", None) is not None:
+                hidden_states = outputs.hidden_states[-1]
+                logits = outputs.logits
+                labels = inputs.get("labels")
+                if labels is not None:
+                    risk, norm_entropy, one_minus_max_sim = self._compute_rgha_risk(model, hidden_states, logits)
+                    rgha_mean_risk = risk.mean()
+                    risk_mask = risk > self.rgha_threshold
+                    if self.state.global_step < self.rgha_warmup_steps:
+                        risk_mask = torch.zeros_like(risk_mask)
+                    refined_hidden, gate = self._apply_rgha(
+                        model, hidden_states, norm_entropy, one_minus_max_sim, risk_mask
+                    )
+                    rgha_mean_gate = gate.mean()
+                    rgha_trigger_rate = risk_mask.float().mean()
+
+                    # Causal LM shift: position t predicts token t+1.
+                    labels_shift = labels[:, 1:].contiguous()
+                    valid_shift = labels_shift.ne(IGNORE_INDEX)
+                    if valid_shift.any():
+                        unwrapped = model
+                        while hasattr(unwrapped, "module"):
+                            unwrapped = unwrapped.module
+                        output_embeds = unwrapped.get_output_embeddings()
+                        if output_embeds is not None:
+                            refined_logits = output_embeds(refined_hidden).float()
+                            refined_logits_shift = refined_logits[:, :-1, :].contiguous()
+                            flat_ce = F.cross_entropy(
+                                refined_logits_shift.view(-1, refined_logits_shift.size(-1)),
+                                labels_shift.view(-1),
+                                reduction="none",
+                                ignore_index=IGNORE_INDEX,
+                            ).view_as(labels_shift)
+                            risk_mask_shift = risk_mask[:, :-1] & valid_shift
+                            if risk_mask_shift.any():
+                                rgha_loss = flat_ce[risk_mask_shift].mean()
             del outputs
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             total_loss = loss_answer + self.align_loss_weight * align_loss
@@ -1058,6 +1180,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.use_ortho_loss:
             ortho_loss = self.compute_orthogonal_loss(model)
             total_loss = total_loss + self.ortho_loss_weight * ortho_loss
+        if self.use_rgha:
+            total_loss = total_loss + self.rgha_weight * rgha_loss
 
         # ---- GA scaling + backward ----
         # Replicate HF Trainer's exact logic: divide loss by gradient_accumulation_steps
@@ -1082,11 +1206,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # == train/loss at every logging point, even at epoch-boundary partial steps.
         ga = self.args.gradient_accumulation_steps
         if not hasattr(self, "_custom_loss_buffer"):
-            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": [], "ortho": []}
+            self._custom_loss_buffer = {
+                "sft": [],
+                "reasoning": [],
+                "align": [],
+                "ortho": [],
+                "rgha": [],
+                "rgha_trigger_rate": [],
+                "rgha_mean_risk": [],
+                "rgha_mean_gate": [],
+            }
         self._custom_loss_buffer["sft"].append(loss_answer.detach().float() / ga)
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float() / ga)
         self._custom_loss_buffer["align"].append(align_loss.detach().float() / ga)
         self._custom_loss_buffer["ortho"].append(ortho_loss.detach().float() / ga)
+        self._custom_loss_buffer["rgha"].append(rgha_loss.detach().float() / ga)
+        self._custom_loss_buffer["rgha_trigger_rate"].append(rgha_trigger_rate.detach().float() / ga)
+        self._custom_loss_buffer["rgha_mean_risk"].append(rgha_mean_risk.detach().float() / ga)
+        self._custom_loss_buffer["rgha_mean_gate"].append(rgha_mean_gate.detach().float() / ga)
 
         return total_loss.detach()
 
@@ -1113,7 +1250,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                         logs[f"loss_{k}"] = round(local_loss.item(), 4)
             self._custom_loss_last_logged_step = self.state.global_step
-            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": [], "ortho": []}
+            self._custom_loss_buffer = {
+                "sft": [],
+                "reasoning": [],
+                "align": [],
+                "ortho": [],
+                "rgha": [],
+                "rgha_trigger_rate": [],
+                "rgha_mean_risk": [],
+                "rgha_mean_gate": [],
+            }
 
         # Inject eval-time split losses
         if hasattr(self, "_eval_loss_buffer") and self._eval_loss_buffer:
