@@ -215,7 +215,12 @@ def main() -> None:
     parser.add_argument("--entropy_threshold", type=float, default=2.0, help="High entropy threshold")
     parser.add_argument("--sim_threshold", type=float, default=0.3, help="Low-confidence sim threshold")
     parser.add_argument("--only_wrong", action="store_true", default=True, help="Analyze only wrong samples")
-    parser.add_argument("--all_samples", action="store_true", help="Analyze all samples (override only_wrong)")
+    parser.add_argument("--only_correct", action="store_true", help="Analyze only correct samples")
+    parser.add_argument(
+        "--all_samples",
+        action="store_true",
+        help="Analyze all samples (override only_wrong/only_correct)",
+    )
     parser.add_argument("--output_plot", type=str, default="entropy_analysis.png", help="Output plot path")
     parser.add_argument("--output_jsonl", type=str, default="entropy_results.jsonl", help="Output result JSONL path")
     args = parser.parse_args()
@@ -239,6 +244,9 @@ def main() -> None:
         is_correct = extract_answer(pred) == extract_answer(label)
         if args.all_samples:
             rows_selected.append(row)
+        elif args.only_correct:
+            if is_correct:
+                rows_selected.append(row)
         else:
             if args.only_wrong and (not is_correct):
                 rows_selected.append(row)
@@ -361,7 +369,7 @@ def main() -> None:
             _ = vocab_size
 
             batch_sample_buffers: list[dict[str, Any]] = []
-            batch_wrong_candidates: list[tuple[float, int, int]] = []  # (entropy, sample_i, token_t)
+            batch_topk_candidates: list[tuple[float, int, int]] = []  # (entropy, sample_i, token_t)
 
             for i in range(bsz):
                 attn_len = int(attention_mask[i].sum().item())
@@ -494,8 +502,8 @@ def main() -> None:
                             "max_cosine_sim": ms,
                         }
                     )
-                    if (not is_correct) and np.isfinite(e):
-                        batch_wrong_candidates.append((e, i, t))
+                    if np.isfinite(e):
+                        batch_topk_candidates.append((e, i, t))
 
                 batch_sample_buffers.append(
                     {
@@ -512,17 +520,17 @@ def main() -> None:
                     }
                 )
 
-            # 按 batch 在“错误路径”上全局取 top-k 高熵 token
+            # 按 batch 在“当前筛选样本”上全局取 top-k 高熵 token
             k = max(0, int(args.high_entropy_topk))
             high_key_set: set[tuple[int, int]] = set()
-            if k > 0 and batch_wrong_candidates:
-                if len(batch_wrong_candidates) <= k:
-                    high_key_set = {(si, tt) for _, si, tt in batch_wrong_candidates}
+            if k > 0 and batch_topk_candidates:
+                if len(batch_topk_candidates) <= k:
+                    high_key_set = {(si, tt) for _, si, tt in batch_topk_candidates}
                 else:
-                    ent_arr = np.asarray([x[0] for x in batch_wrong_candidates], dtype=np.float64)
+                    ent_arr = np.asarray([x[0] for x in batch_topk_candidates], dtype=np.float64)
                     pick_idx = np.argpartition(ent_arr, -k)[-k:]
                     high_key_set = {
-                        (batch_wrong_candidates[int(j)][1], batch_wrong_candidates[int(j)][2]) for j in pick_idx
+                        (batch_topk_candidates[int(j)][1], batch_topk_candidates[int(j)][2]) for j in pick_idx
                     }
 
             for sample_buf in batch_sample_buffers:
