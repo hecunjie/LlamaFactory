@@ -166,7 +166,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Align ``<add_think>`` embedding with pre-``<add_think>`` hidden states."""
+        r"""Align ``<add_think>`` embedding with previous hidden states before ``<add_think>``."""
         device = hidden_states.device
         if self.think_token_id is None:
             return torch.zeros((), device=device)
@@ -180,32 +180,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             unwrapped = unwrapped.module
 
         input_embeds = unwrapped.get_input_embeddings()
-        output_embeds = unwrapped.get_output_embeddings()
         if input_embeds is None:
             return torch.zeros((), device=device)
 
         embed_weight = input_embeds.weight
-        lm_head_weight = embed_weight
-        if output_embeds is not None and output_embeds.weight is not embed_weight:
-            lm_head_weight = output_embeds.weight
-
         if self.think_token_id >= embed_weight.size(0):
             return torch.zeros((), device=device)
 
         z_think = embed_weight[self.think_token_id]
-        z_think_norm = F.normalize(z_think.unsqueeze(0), dim=-1)
+        z_think_norm = z_think / z_think.norm(p=2).clamp_min(1e-12)
         think_positions = think_mask.nonzero(as_tuple=False)
         align_losses = []
 
         for batch_idx, seq_idx in think_positions:
             if seq_idx.item() == 0:
                 continue
-            h_t = hidden_states[batch_idx, seq_idx - 1, :]
-            logit_t = torch.matmul(lm_head_weight, h_t)
-            prob_t = torch.softmax(logit_t, dim=-1)
-            e_soft = torch.matmul(prob_t, embed_weight).detach()
-            e_soft_norm = F.normalize(e_soft.unsqueeze(0), dim=-1)
-            cos_sim = (z_think_norm * e_soft_norm).sum()
+            h_prev = hidden_states[batch_idx, seq_idx - 1, :]
+            h_prev_norm = h_prev / h_prev.norm(p=2).clamp_min(1e-12)
+            cos_sim = (z_think_norm * h_prev_norm).sum()
             align_losses.append(1.0 - cos_sim)
 
         if not align_losses:
