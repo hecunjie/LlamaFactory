@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,10 +23,70 @@ CASE_B = "B_lowconf"
 CASE_AMBIGUOUS = "ambiguous"
 
 
-def extract_answer(text: str) -> str:
-    if "###" in text:
-        return text.split("###")[-1].strip().split()[0]
-    return ""
+def _normalize_number(text: str) -> Optional[str]:
+    text = text.strip().replace(",", "").replace("$", "").replace("%", "").rstrip(".")
+    m = re.fullmatch(r"-?\d+(?:\.\d+)?", text)
+    if m:
+        try:
+            val = float(text)
+            if not math.isfinite(val):
+                return None
+            if val == int(val):
+                return str(int(val))
+            return str(val)
+        except (ValueError, OverflowError):
+            pass
+
+    m2 = re.match(r"^(-?\d+(?:\.\d+)?)", text)
+    if m2:
+        try:
+            val = float(m2.group(1))
+            if not math.isfinite(val):
+                return None
+            if val == int(val):
+                return str(int(val))
+            return str(val)
+        except (ValueError, OverflowError):
+            pass
+    return None
+
+
+def extract_answer(text: str) -> Optional[str]:
+    text = str(text).strip()
+
+    matches = list(re.finditer(r"####\s*(.+?)(?:\n|$)", text))
+    if matches:
+        raw = matches[-1].group(1).strip()
+        norm = _normalize_number(raw)
+        return norm if norm is not None else raw
+
+    matches = list(re.finditer(r"(?<!#)###(?![#])\s*(.+?)(?:\n|$)", text))
+    if matches:
+        raw = matches[-1].group(1).strip()
+        norm = _normalize_number(raw)
+        return norm if norm is not None else raw
+
+    matches = list(re.finditer(r"[Tt]he\s+answer\s+is\s+[:\-]?\s*([^\.\n,]+)", text))
+    if matches:
+        raw = matches[-1].group(1).strip().rstrip(".")
+        norm = _normalize_number(raw)
+        return norm if norm is not None else raw
+
+    numbers = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
+    if numbers:
+        raw = numbers[-1].replace(",", "")
+        return _normalize_number(raw) or raw
+
+    return None
+
+
+def answers_match(pred_ans: Optional[str], label_ans: Optional[str]) -> bool:
+    if pred_ans is None or label_ans is None:
+        return False
+    try:
+        return float(pred_ans) == float(label_ans)
+    except (ValueError, TypeError):
+        return pred_ans.strip().lower() == label_ans.strip().lower()
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -225,6 +287,9 @@ def main() -> None:
     parser.add_argument("--output_jsonl", type=str, default="entropy_results.jsonl", help="Output result JSONL path")
     args = parser.parse_args()
 
+    if args.only_correct and args.all_samples:
+        raise ValueError("--only_correct 与 --all_samples 不能同时设置")
+
     data_path = Path(args.data)
     output_plot = Path(args.output_plot)
     output_jsonl = Path(args.output_jsonl)
@@ -237,11 +302,19 @@ def main() -> None:
         print("输入数据为空，退出。")
         return
 
+    total_count = 0
+    correct_count = 0
+    wrong_count = 0
     rows_selected: list[dict[str, Any]] = []
     for row in data:
+        total_count += 1
         pred = str(row.get("predict", ""))
         label = str(row.get("label", ""))
-        is_correct = extract_answer(pred) == extract_answer(label)
+        is_correct = answers_match(extract_answer(pred), extract_answer(label))
+        if is_correct:
+            correct_count += 1
+        else:
+            wrong_count += 1
         if args.all_samples:
             rows_selected.append(row)
         elif args.only_correct:
@@ -254,6 +327,12 @@ def main() -> None:
                 rows_selected.append(row)
         if len(rows_selected) >= args.max_samples:
             break
+
+    print(
+        f"[filter] total={total_count}, correct={correct_count}, wrong={wrong_count}, "
+        f"selected={len(rows_selected)}, mode="
+        f"{'all' if args.all_samples else ('correct' if args.only_correct else 'wrong')}"
+    )
 
     if not rows_selected:
         print("没有满足筛选条件的样本，退出。")
@@ -376,7 +455,7 @@ def main() -> None:
                 prompt_len = int(prompt_lens[i])
                 pred_answer = extract_answer(predicts[i])
                 gold_answer = extract_answer(labels[i])
-                is_correct = pred_answer == gold_answer
+                is_correct = answers_match(pred_answer, gold_answer)
 
                 sample_case_counts = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
                 sample_total_positions = 0

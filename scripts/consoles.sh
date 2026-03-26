@@ -1,13 +1,26 @@
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/last_ckp_gsm_nl.jsonl \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/checkpoint-936 \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/last_ckp_svamp.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/checkpoint-936 \
   --max_samples 8000 \
   --batch_size 4 \
   --high_entropy_topk 10 \
   --sim_threshold 0.18 \
   --only_wrong \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/last_ckp_gsm_nl_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/last_ckp_gsm_nl_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/svamp/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/svamp/last_ckp_entropy_results.jsonl
+
+##只看正确
+python experiment/analyze_entropy_for_logits.py \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/last_ckp_svamp.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/checkpoint-936 \
+  --max_samples 8000 \
+  --batch_size 4 \
+  --high_entropy_topk 10 \
+  --sim_threshold 1.0 \
+  --only_correct \
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/svamp_correct/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/svamp_correct/last_ckp_entropy_results.jsonl
+
 
 python -m train_sae.train \
   --data_path /mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/gsm8k/zeroshot_16_samples_qwen2.5-3b_instruct_on_math_train_full.jsonl \
