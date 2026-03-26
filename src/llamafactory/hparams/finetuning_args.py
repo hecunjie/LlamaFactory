@@ -546,6 +546,20 @@ class FinetuningArguments(
         default=0.1,
         metadata={"help": "Weight for alignment loss. total_loss += align_loss_weight * loss_align."},
     )
+    use_ortho_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable orthogonal loss for <add_think> embedding. "
+                "When enabled, trainer minimizes the absolute cosine similarity "
+                "between <add_think> and sampled normal token embeddings."
+            )
+        },
+    )
+    ortho_loss_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight for orthogonal loss. total_loss += ortho_loss_weight * loss_ortho."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -787,6 +801,8 @@ class FinetuningArguments(
 
         if self.align_loss_weight < 0:
             raise ValueError("`align_loss_weight` must be non-negative.")
+        if self.ortho_loss_weight < 0:
+            raise ValueError("`ortho_loss_weight` must be non-negative.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")

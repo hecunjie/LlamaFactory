@@ -105,6 +105,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         self.use_align_loss = getattr(finetuning_args, "use_align_loss", False)
         self.align_loss_weight = getattr(finetuning_args, "align_loss_weight", 0.1)
+        self.use_ortho_loss = getattr(finetuning_args, "use_ortho_loss", False)
+        self.ortho_loss_weight = getattr(finetuning_args, "ortho_loss_weight", 0.1)
         self.think_token_id = None
         self._align_warned_no_think_token = False
 
@@ -203,6 +205,38 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if not align_losses:
             return torch.zeros((), device=device)
         return torch.stack(align_losses).mean()
+
+    def compute_orthogonal_loss(self, model: "torch.nn.Module", n_sample: int = 512) -> torch.Tensor:
+        r"""Push ``<add_think>`` embedding away from normal word-embedding directions."""
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+
+        input_embeds = unwrapped.get_input_embeddings()
+        if input_embeds is None or self.think_token_id is None:
+            return torch.zeros((), device=next(unwrapped.parameters()).device)
+
+        embed_weight = input_embeds.weight
+        vocab_size = embed_weight.size(0)
+        if self.think_token_id < 0 or self.think_token_id >= vocab_size:
+            return torch.zeros((), device=embed_weight.device)
+
+        z = embed_weight[self.think_token_id]
+        z_norm = z / z.norm(p=2).clamp_min(1e-12)
+
+        all_indices = torch.arange(vocab_size, device=embed_weight.device)
+        word_indices = all_indices[all_indices != self.think_token_id]
+        if word_indices.numel() == 0:
+            return torch.zeros((), device=embed_weight.device)
+
+        sample_n = min(int(n_sample), int(word_indices.numel()))
+        perm = torch.randperm(word_indices.numel(), device=embed_weight.device)[:sample_n]
+        sample_indices = word_indices[perm]
+
+        e_sample = embed_weight[sample_indices]
+        e_sample_norm = e_sample / e_sample.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+        cos_sims = torch.matmul(e_sample_norm, z_norm)
+        return cos_sims.abs().mean()
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -900,6 +934,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             and reasoning_input_ids is not None
         )
         align_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        ortho_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
 
         if do_latent_chain:
             # ---- Forward 1: Sequential latent chain + answer CE ----
@@ -1020,6 +1055,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             total_loss = loss_answer + self.align_loss_weight * align_loss
 
+        if self.use_ortho_loss:
+            ortho_loss = self.compute_orthogonal_loss(model)
+            total_loss = total_loss + self.ortho_loss_weight * ortho_loss
+
         # ---- GA scaling + backward ----
         # Replicate HF Trainer's exact logic: divide loss by gradient_accumulation_steps
         # BEFORE backward (so gradients are correctly scaled) and BEFORE return (so
@@ -1043,10 +1082,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # == train/loss at every logging point, even at epoch-boundary partial steps.
         ga = self.args.gradient_accumulation_steps
         if not hasattr(self, "_custom_loss_buffer"):
-            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": []}
+            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": [], "ortho": []}
         self._custom_loss_buffer["sft"].append(loss_answer.detach().float() / ga)
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float() / ga)
         self._custom_loss_buffer["align"].append(align_loss.detach().float() / ga)
+        self._custom_loss_buffer["ortho"].append(ortho_loss.detach().float() / ga)
 
         return total_loss.detach()
 
@@ -1073,7 +1113,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                         logs[f"loss_{k}"] = round(local_loss.item(), 4)
             self._custom_loss_last_logged_step = self.state.global_step
-            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": []}
+            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": [], "ortho": []}
 
         # Inject eval-time split losses
         if hasattr(self, "_eval_loss_buffer") and self._eval_loss_buffer:
