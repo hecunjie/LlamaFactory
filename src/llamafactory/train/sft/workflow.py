@@ -66,6 +66,7 @@ def run_sft(
         getattr(finetuning_args, "add_think_token", False)
         or getattr(finetuning_args, "recurrent_add_think_training", False)
         or getattr(finetuning_args, "use_align_loss", False)
+        or getattr(finetuning_args, "use_ortho_loss", False)
     ):
         add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
         if add_think_added > 0:
@@ -74,7 +75,8 @@ def run_sft(
                 f"(new vocab size={len(tokenizer)}; "
                 f"add_think_token={getattr(finetuning_args, 'add_think_token', False)}, "
                 f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)}, "
-                f"use_align_loss={getattr(finetuning_args, 'use_align_loss', False)})"
+                f"use_align_loss={getattr(finetuning_args, 'use_align_loss', False)}, "
+                f"use_ortho_loss={getattr(finetuning_args, 'use_ortho_loss', False)})"
             )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -87,6 +89,7 @@ def run_sft(
         getattr(finetuning_args, "add_think_token", False)
         or getattr(finetuning_args, "recurrent_add_think_training", False)
         or getattr(finetuning_args, "use_align_loss", False)
+        or getattr(finetuning_args, "use_ortho_loss", False)
     ):
         unwrapped = model
         while hasattr(unwrapped, "module"):

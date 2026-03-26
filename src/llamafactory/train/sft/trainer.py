@@ -110,7 +110,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.think_token_id = None
         self._align_warned_no_think_token = False
 
-        if self.use_align_loss:
+        if self.use_align_loss or self.use_ortho_loss:
             tokenizer = self.processing_class
             unwrapped = self.model
             while hasattr(unwrapped, "module"):
