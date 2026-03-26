@@ -106,6 +106,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self.use_align_loss = getattr(finetuning_args, "use_align_loss", False)
         self.align_loss_weight = getattr(finetuning_args, "align_loss_weight", 0.1)
         self.think_token_id = None
+        self._align_warned_no_think_token = False
 
         if self.use_align_loss:
             tokenizer = self.processing_class
@@ -1010,6 +1011,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             align_loss = torch.zeros((), device=loss_answer.device)
             if self.use_align_loss and getattr(outputs, "hidden_states", None) is not None:
                 hidden_states = outputs.hidden_states[-1]
+                if (
+                    self.think_token_id is not None
+                    and not inputs["input_ids"].eq(self.think_token_id).any()
+                    and not self._align_warned_no_think_token
+                    and self.is_world_process_zero()
+                ):
+                    logger.warning_rank0(
+                        "[align_loss] Current batch contains no '<add_think>' tokens, "
+                        "so align loss is 0 for this step. If this keeps happening, "
+                        "ensure tokenizer had '<add_think>' before dataset preprocessing."
+                    )
+                    self._align_warned_no_think_token = True
                 align_loss = self.compute_align_loss(model, hidden_states, inputs["input_ids"])
             del outputs
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)

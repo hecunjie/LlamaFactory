@@ -62,8 +62,10 @@ def run_sft(
     # For offline analysis only, reuse tokenizer from a saved checkpoint that already has
     # <add_think> to avoid duplicate add_tokens / id drift.
     add_think_added = 0
-    if getattr(finetuning_args, "add_think_token", False) or getattr(
-        finetuning_args, "recurrent_add_think_training", False
+    if (
+        getattr(finetuning_args, "add_think_token", False)
+        or getattr(finetuning_args, "recurrent_add_think_training", False)
+        or getattr(finetuning_args, "use_align_loss", False)
     ):
         add_think_added = tokenizer.add_tokens(["<add_think>"], special_tokens=True)
         if add_think_added > 0:
@@ -71,7 +73,8 @@ def run_sft(
                 "Added '<add_think>' to tokenizer "
                 f"(new vocab size={len(tokenizer)}; "
                 f"add_think_token={getattr(finetuning_args, 'add_think_token', False)}, "
-                f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)})"
+                f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)}, "
+                f"use_align_loss={getattr(finetuning_args, 'use_align_loss', False)})"
             )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -80,8 +83,10 @@ def run_sft(
 
     # Resize embeddings when tokenizer vocab != model embedding rows (e.g. new <add_think> or
     # tokenizer already had the token but base checkpoint did not).
-    if getattr(finetuning_args, "add_think_token", False) or getattr(
-        finetuning_args, "recurrent_add_think_training", False
+    if (
+        getattr(finetuning_args, "add_think_token", False)
+        or getattr(finetuning_args, "recurrent_add_think_training", False)
+        or getattr(finetuning_args, "use_align_loss", False)
     ):
         unwrapped = model
         while hasattr(unwrapped, "module"):
