@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+THINK_TOKEN = "<add_think>"
 
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
@@ -101,6 +102,114 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
             verify_fp8_status(self.accelerator, training_args)
+
+        self.use_align_loss = getattr(finetuning_args, "use_align_loss", False)
+        self.align_loss_weight = getattr(finetuning_args, "align_loss_weight", 0.1)
+        self.think_token_id = None
+
+        if self.use_align_loss:
+            tokenizer = self.processing_class
+            unwrapped = self.model
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
+
+            num_added = tokenizer.add_tokens([THINK_TOKEN], special_tokens=True)
+            if num_added > 0:
+                input_embeds = unwrapped.get_input_embeddings()
+                output_embeds = unwrapped.get_output_embeddings()
+                old_vocab_size = input_embeds.num_embeddings
+                unwrapped.resize_token_embeddings(len(tokenizer))
+                if getattr(unwrapped.config, "tie_word_embeddings", False) and hasattr(unwrapped, "tie_weights"):
+                    unwrapped.tie_weights()
+
+                with torch.no_grad():
+                    input_weight = unwrapped.get_input_embeddings().weight
+                    think_token_id = tokenizer.convert_tokens_to_ids(THINK_TOKEN)
+                    if old_vocab_size > 0:
+                        mean_embed = input_weight[:old_vocab_size].mean(dim=0)
+                    else:
+                        mean_embed = input_weight.mean(dim=0)
+                    noise = 0.02 * torch.randn_like(mean_embed)
+                    init_vec = mean_embed + noise
+                    input_weight[think_token_id] = init_vec
+
+                    new_output_embeds = unwrapped.get_output_embeddings()
+                    if (
+                        output_embeds is not None
+                        and new_output_embeds is not None
+                        and new_output_embeds.weight is not input_weight
+                        and think_token_id < new_output_embeds.weight.size(0)
+                    ):
+                        new_output_embeds.weight[think_token_id] = init_vec
+
+                logger.info_rank0(
+                    f"[align_loss] Added '{THINK_TOKEN}' to tokenizer "
+                    f"(new vocab size={len(tokenizer)}) and initialized embedding."
+                )
+
+            think_token_id = tokenizer.convert_tokens_to_ids(THINK_TOKEN)
+            if isinstance(think_token_id, list):
+                think_token_id = think_token_id[0] if think_token_id else None
+            if think_token_id is None or (isinstance(think_token_id, int) and think_token_id < 0):
+                logger.warning_rank0(
+                    f"[align_loss] Failed to resolve token id for {THINK_TOKEN!r}. "
+                    "Disabling align loss."
+                )
+                self.use_align_loss = False
+            else:
+                self.think_token_id = int(think_token_id)
+
+    def compute_align_loss(
+        self,
+        model: "torch.nn.Module",
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Align ``<add_think>`` embedding with pre-``<add_think>`` hidden states."""
+        device = hidden_states.device
+        if self.think_token_id is None:
+            return torch.zeros((), device=device)
+
+        think_mask = input_ids.eq(self.think_token_id)
+        if not think_mask.any():
+            return torch.zeros((), device=device)
+
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+
+        input_embeds = unwrapped.get_input_embeddings()
+        output_embeds = unwrapped.get_output_embeddings()
+        if input_embeds is None:
+            return torch.zeros((), device=device)
+
+        embed_weight = input_embeds.weight
+        lm_head_weight = embed_weight
+        if output_embeds is not None and output_embeds.weight is not embed_weight:
+            lm_head_weight = output_embeds.weight
+
+        if self.think_token_id >= embed_weight.size(0):
+            return torch.zeros((), device=device)
+
+        z_think = embed_weight[self.think_token_id]
+        z_think_norm = F.normalize(z_think.unsqueeze(0), dim=-1)
+        think_positions = think_mask.nonzero(as_tuple=False)
+        align_losses = []
+
+        for batch_idx, seq_idx in think_positions:
+            if seq_idx.item() == 0:
+                continue
+            h_t = hidden_states[batch_idx, seq_idx - 1, :]
+            logit_t = torch.matmul(lm_head_weight, h_t)
+            prob_t = torch.softmax(logit_t, dim=-1)
+            e_soft = torch.matmul(prob_t, embed_weight).detach()
+            e_soft_norm = F.normalize(e_soft.unsqueeze(0), dim=-1)
+            cos_sim = (z_think_norm * e_soft_norm).sum()
+            align_losses.append(1.0 - cos_sim)
+
+        if not align_losses:
+            return torch.zeros((), device=device)
+        return torch.stack(align_losses).mean()
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -797,6 +906,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             and w > 0
             and reasoning_input_ids is not None
         )
+        align_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
 
         if do_latent_chain:
             # ---- Forward 1: Sequential latent chain + answer CE ----
@@ -891,13 +1001,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
+            if self.use_align_loss:
+                inputs["output_hidden_states"] = True
             with self.compute_loss_context_manager():
                 loss_answer, outputs = super().compute_loss(
                     model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
                 )
+            align_loss = torch.zeros((), device=loss_answer.device)
+            if self.use_align_loss and getattr(outputs, "hidden_states", None) is not None:
+                hidden_states = outputs.hidden_states[-1]
+                align_loss = self.compute_align_loss(model, hidden_states, inputs["input_ids"])
             del outputs
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
-            total_loss = loss_answer
+            total_loss = loss_answer + self.align_loss_weight * align_loss
 
         # ---- GA scaling + backward ----
         # Replicate HF Trainer's exact logic: divide loss by gradient_accumulation_steps
@@ -922,9 +1038,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # == train/loss at every logging point, even at epoch-boundary partial steps.
         ga = self.args.gradient_accumulation_steps
         if not hasattr(self, "_custom_loss_buffer"):
-            self._custom_loss_buffer = {"sft": [], "reasoning": []}
+            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": []}
         self._custom_loss_buffer["sft"].append(loss_answer.detach().float() / ga)
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float() / ga)
+        self._custom_loss_buffer["align"].append(align_loss.detach().float() / ga)
 
         return total_loss.detach()
 
@@ -951,7 +1068,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
                         logs[f"loss_{k}"] = round(local_loss.item(), 4)
             self._custom_loss_last_logged_step = self.state.global_step
-            self._custom_loss_buffer = {"sft": [], "reasoning": []}
+            self._custom_loss_buffer = {"sft": [], "reasoning": [], "align": []}
 
         # Inject eval-time split losses
         if hasattr(self, "_eval_loss_buffer") and self._eval_loss_buffer:

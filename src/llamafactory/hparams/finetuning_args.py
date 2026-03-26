@@ -532,6 +532,20 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "Coefficient for reasoning loss. total_loss = loss_sft + reasoning_loss_weight * loss_reasoning."},
     )
+    use_align_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable <add_think> alignment loss in standard SFT branch. "
+                "When enabled, trainer computes an auxiliary cosine alignment loss "
+                "between <add_think> embedding and pre-<add_think> hidden-state soft projection."
+            )
+        },
+    )
+    align_loss_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight for alignment loss. total_loss += align_loss_weight * loss_align."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -770,6 +784,9 @@ class FinetuningArguments(
 
         if self.low_confidence_insert_position not in {"before", "after"}:
             raise ValueError("`low_confidence_insert_position` must be either `before` or `after`.")
+
+        if self.align_loss_weight < 0:
+            raise ValueError("`align_loss_weight` must be non-negative.")
 
         if self.stage == "ppo" and self.reward_model is None:
             raise ValueError("`reward_model` is necessary for PPO training.")
