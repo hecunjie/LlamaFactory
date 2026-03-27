@@ -143,12 +143,15 @@ def run_sft(
             max_sim = torch.matmul(h_norm, embed_norm_t).max(dim=-1).values.float()
             one_minus_max_sim = (1.0 - max_sim).clamp(0.0, 2.0)
             risk = self.rgha_entropy_alpha * norm_entropy + self.rgha_sim_beta * one_minus_max_sim
-
-            risk_mask = risk > self.rgha_threshold
+            # Keep gate features unchanged, but trigger mask uses only low cosine similarity.
+            risk_mask = one_minus_max_sim > self.rgha_threshold
             feat = torch.stack((norm_entropy, one_minus_max_sim), dim=-1).to(hidden_states.dtype)
             gate = torch.sigmoid(self.rgha_gate(feat)).squeeze(-1) * risk_mask.to(hidden_states.dtype)
             delta = self.rgha_mlp(self.rgha_ln(hidden_states))
             refined_hidden = hidden_states + gate.unsqueeze(-1) * delta
+            pre_norm = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+            post_norm = refined_hidden.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+            refined_hidden = refined_hidden * (pre_norm / post_norm)
             refined_logits = output_embeds(refined_hidden)
             outputs.logits = refined_logits
             return outputs

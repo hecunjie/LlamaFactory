@@ -318,6 +318,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         gate = gate * risk_mask.to(gate.dtype)
         delta = unwrapped.rgha_mlp(unwrapped.rgha_ln(hidden_states))
         refined = hidden_states + gate.unsqueeze(-1) * delta
+        # Keep token-wise hidden norm close to pre-correction scale for stable logits.
+        pre_norm = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+        post_norm = refined.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+        refined = refined * (pre_norm / post_norm)
         return refined, gate
 
     @override
@@ -1144,7 +1148,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 if labels is not None:
                     risk, norm_entropy, one_minus_max_sim = self._compute_rgha_risk(model, hidden_states, logits)
                     rgha_mean_risk = risk.mean()
-                    risk_mask = risk > self.rgha_threshold
+                    # Mask uses only low cosine similarity positions (drop entropy criterion).
+                    risk_mask = one_minus_max_sim > self.rgha_threshold
                     if self.state.global_step < self.rgha_warmup_steps:
                         risk_mask = torch.zeros_like(risk_mask)
                     refined_hidden, gate = self._apply_rgha(
