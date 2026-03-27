@@ -169,7 +169,12 @@ def main() -> None:
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--do_sample", action="store_true", default=False)
     parser.add_argument("--num_generations", type=int, default=1, help="Number of generations per prompt")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device for inference: auto/cuda/cuda:0/cpu. `auto` will use multi-GPU device_map when available.",
+    )
 
     parser.add_argument("--use_rgha", action="store_true", default=False)
     parser.add_argument("--rgha_hidden_size", type=int, default=256)
@@ -210,13 +215,39 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Decoder-only models should use left padding during generation.
+    tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).to(args.device)
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    use_multi_gpu = args.device == "auto" and torch.cuda.is_available() and torch.cuda.device_count() > 1
+    if use_multi_gpu:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+        )
+        # Pick one concrete CUDA device for input tensors (first CUDA shard).
+        input_device = "cuda:0"
+        hf_map = getattr(model, "hf_device_map", None)
+        if isinstance(hf_map, dict):
+            for dev in hf_map.values():
+                if isinstance(dev, str) and dev.startswith("cuda"):
+                    input_device = dev
+                    break
+    else:
+        if args.device == "auto":
+            target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        else:
+            target_device = args.device
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        ).to(target_device)
+        input_device = target_device
     model.eval()
 
     if args.use_rgha:
@@ -232,7 +263,8 @@ def main() -> None:
         print("[RGHA] disabled.")
 
     with output_path.open("w", encoding="utf-8") as fout:
-        for st in tqdm(range(0, len(rows), args.batch_size), desc="Infer"):
+        pbar = tqdm(range(0, len(rows), args.batch_size), desc="Infer", total=(len(rows) + args.batch_size - 1) // args.batch_size)
+        for st in pbar:
             batch = rows[st : st + args.batch_size]
             prompts = [str(r.get("prompt", "")) for r in batch]
             labels = [str(r.get("label", "")) for r in batch]
@@ -243,7 +275,7 @@ def main() -> None:
                 padding=True,
                 truncation=False,
                 add_special_tokens=False,
-            ).to(args.device)
+            ).to(input_device)
 
             with torch.no_grad():
                 out_ids = model.generate(
@@ -274,6 +306,8 @@ def main() -> None:
                     "label": labels[i],
                 }
                 fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            processed = min(st + len(batch), len(rows))
+            pbar.set_postfix_str(f"samples={processed}/{len(rows)}")
 
     print(f"Saved predictions to: {output_path}")
 
