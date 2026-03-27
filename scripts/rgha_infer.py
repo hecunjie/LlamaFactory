@@ -87,17 +87,24 @@ def patch_rgha_forward(
     hidden_size = int(getattr(unwrapped.config, "hidden_size", 0))
     if hidden_size <= 0:
         raise ValueError("Cannot resolve hidden_size from model config.")
+    ref_param = next(unwrapped.parameters())
+    module_device = ref_param.device
+    module_dtype = ref_param.dtype
 
     if not hasattr(unwrapped, "rgha_ln"):
-        unwrapped.rgha_ln = torch.nn.LayerNorm(hidden_size)
+        unwrapped.rgha_ln = torch.nn.LayerNorm(hidden_size, device=module_device, dtype=module_dtype)
     if not hasattr(unwrapped, "rgha_mlp"):
         unwrapped.rgha_mlp = torch.nn.Sequential(
-            torch.nn.Linear(hidden_size, rgha_hidden_size),
+            torch.nn.Linear(hidden_size, rgha_hidden_size, device=module_device, dtype=module_dtype),
             torch.nn.SiLU(),
-            torch.nn.Linear(rgha_hidden_size, hidden_size),
+            torch.nn.Linear(rgha_hidden_size, hidden_size, device=module_device, dtype=module_dtype),
         )
     if not hasattr(unwrapped, "rgha_gate"):
-        unwrapped.rgha_gate = torch.nn.Linear(2, 1)
+        unwrapped.rgha_gate = torch.nn.Linear(2, 1, device=module_device, dtype=module_dtype)
+    else:
+        unwrapped.rgha_ln = unwrapped.rgha_ln.to(device=module_device, dtype=module_dtype)
+        unwrapped.rgha_mlp = unwrapped.rgha_mlp.to(device=module_device, dtype=module_dtype)
+        unwrapped.rgha_gate = unwrapped.rgha_gate.to(device=module_device, dtype=module_dtype)
 
     unwrapped.use_rgha = True
     unwrapped.rgha_entropy_alpha = float(rgha_entropy_alpha)

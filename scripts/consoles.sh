@@ -1,13 +1,13 @@
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/last_ckp_svamp.jsonl \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/checkpoint-936 \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_orthogonal_0.1_add_think_on_v2_data/vllm_infer/last_ckp_gsm_nl.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_orthogonal_0.1_add_think_on_v2_data/checkpoint-936 \
   --max_samples 8000 \
   --batch_size 4 \
   --high_entropy_topk 20 \
   --sim_threshold 0.18 \
   --only_wrong \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/svamp/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/svamp/last_ckp_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_orthogonal_0.1_add_think_on_v2_data/vllm_infer/gsm_nl/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_orthogonal_0.1_add_think_on_v2_data/vllm_infer/gsm_nl/last_ckp_entropy_results.jsonl
 
 ##只看正确
 python experiment/analyze_entropy_for_logits.py \
@@ -20,6 +20,29 @@ python experiment/analyze_entropy_for_logits.py \
   --only_correct \
   --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/svamp_correct/last_ckp_entropy_analysis.png \
   --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/svamp_correct/last_ckp_entropy_results.jsonl
+
+python scripts/stat_add_think_entropy_shift.py \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/last_ckp_svamp.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/checkpoint-936 \
+  --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.0_add_think_on_v2_data/vllm_infer/svamp/add_think_entropy_shift \
+  --hist_bins 60
+
+python3 scripts/stat_add_think_top5_by_case.py /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/last_ckp_gsm_nl_entropy_results.jsonl \
+  --output-json /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/gsm_nl/add_think_top5_case_summary.json \
+  --output-csv /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_2_aligh_0.1_add_think_on_v2_data/vllm_infer/gsm_nl/add_think_top5_case_correctness.csv \
+
+## 推理
+python scripts/rgha_infer.py \
+  --model_name_or_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_test/checkpoint-936 \
+  --dataset gsm_nl_test \
+  --dataset_dir data \
+  --template llama3 \
+  --output /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_test/vllm_infer/gsm_nl/last_ckp_rgha_preds.jsonl \
+  --use_rgha \
+  --do_sample \
+  --temperature 1 \
+  --top_p 0.95 \
+  --num_generations 4
 
 
 python -m train_sae.train \
