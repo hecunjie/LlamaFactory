@@ -24,6 +24,104 @@ from llamafactory.hparams import get_infer_args
 from llamafactory.model import load_tokenizer
 
 
+def _unwrap_causal_lm(model: torch.nn.Module) -> torch.nn.Module:
+    unwrapped = model
+    while hasattr(unwrapped, "module"):
+        unwrapped = unwrapped.module
+    return unwrapped
+
+
+def _resolve_checkpoint_dir(model_name_or_path: str) -> Path:
+    p = Path(model_name_or_path).expanduser()
+    if p.is_dir():
+        return p.resolve()
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(repo_id=model_name_or_path))
+    except Exception:
+        return p.resolve()
+
+
+def _load_raw_state_dict(ckpt_dir: Path) -> dict[str, torch.Tensor]:
+    """Load full checkpoint tensors from a HF-style model directory (single or sharded safetensors)."""
+    single = ckpt_dir / "model.safetensors"
+    if single.is_file():
+        from safetensors.torch import load_file
+
+        return dict(load_file(str(single)))
+
+    idx = ckpt_dir / "model.safetensors.index.json"
+    if idx.is_file():
+        from safetensors.torch import load_file
+
+        with idx.open("r", encoding="utf-8") as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        merged: dict[str, torch.Tensor] = {}
+        shard_files = sorted(set(weight_map.values()))
+        for sf in shard_files:
+            shard_path = ckpt_dir / sf
+            if not shard_path.is_file():
+                continue
+            merged.update(load_file(str(shard_path)))
+        return merged
+
+    bin_path = ckpt_dir / "pytorch_model.bin"
+    if bin_path.is_file():
+        try:
+            return torch.load(bin_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(bin_path, map_location="cpu")
+
+    return {}
+
+
+def _strip_known_prefixes(key: str) -> str:
+    k = key
+    changed = True
+    while changed:
+        changed = False
+        for pref in ("module.", "base_model.model.", "model."):
+            if k.startswith(pref):
+                k = k[len(pref) :]
+                changed = True
+    return k
+
+
+def load_rgha_weights_from_checkpoint(model: torch.nn.Module, model_name_or_path: str) -> int:
+    r"""Load ``rgha_*`` tensors saved by LlamaFactory training into patched submodules.
+
+    ``AutoModelForCausalLM.from_pretrained`` ignores these keys (unexpected in checkpoint), so we
+    must load them after ``patch_rgha_forward`` creates ``rgha_ln`` / ``rgha_mlp`` / ``rgha_gate``.
+    """
+    unwrapped = _unwrap_causal_lm(model)
+    ckpt_dir = _resolve_checkpoint_dir(model_name_or_path)
+    raw = _load_raw_state_dict(ckpt_dir)
+    if not raw:
+        return 0
+
+    rgha_ckpt = {k: v for k, v in raw.items() if "rgha_" in k}
+    if not rgha_ckpt:
+        return 0
+
+    model_sd = unwrapped.state_dict()
+    to_load: dict[str, torch.Tensor] = {}
+    for ck, tensor in rgha_ckpt.items():
+        candidates = {_strip_known_prefixes(ck), ck}
+        for cand in candidates:
+            if cand not in model_sd:
+                continue
+            if model_sd[cand].shape != tensor.shape:
+                continue
+            to_load[cand] = tensor.to(dtype=model_sd[cand].dtype, device=model_sd[cand].device)
+            break
+
+    if not to_load:
+        return 0
+    unwrapped.load_state_dict(to_load, strict=False)
+    return len(to_load)
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
@@ -85,9 +183,7 @@ def patch_rgha_forward(
     rgha_sim_beta: float = 0.6,
     rgha_threshold: float = 0.58,
 ) -> torch.nn.Module:
-    unwrapped = model
-    while hasattr(unwrapped, "module"):
-        unwrapped = unwrapped.module
+    unwrapped = _unwrap_causal_lm(model)
 
     hidden_size = int(getattr(unwrapped.config, "hidden_size", 0))
     if hidden_size <= 0:
@@ -380,7 +476,14 @@ def main() -> None:
             rgha_sim_beta=args.rgha_sim_beta,
             rgha_threshold=args.rgha_threshold,
         )
-        print("[RGHA] forward patch enabled.")
+        n_rgha = load_rgha_weights_from_checkpoint(model, args.model_name_or_path)
+        if n_rgha > 0:
+            print(f"[RGHA] forward patch enabled; loaded {n_rgha} RGHA tensor(s) from checkpoint.")
+        else:
+            print(
+                "[RGHA] forward patch enabled but no rgha_* weights found in checkpoint — "
+                "RGHA modules are randomly initialized (expect HF 'unused / not initialized' warnings on load)."
+            )
     else:
         print("[RGHA] disabled.")
 
