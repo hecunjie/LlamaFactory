@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -155,6 +160,104 @@ def patch_rgha_forward(
     return model
 
 
+def _split_rows(rows: list[dict[str, Any]], num_shards: int) -> list[list[dict[str, Any]]]:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive.")
+    n = len(rows)
+    chunk = (n + num_shards - 1) // num_shards
+    return [rows[i * chunk : min((i + 1) * chunk, n)] for i in range(num_shards)]
+
+
+def _run_data_parallel_inference(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
+    """Spawn one process per GPU; each loads full model on a single card (true data parallel)."""
+    n_gpu = int(args.data_parallel_gpus)
+    if n_gpu < 2:
+        return
+    if not torch.cuda.is_available() or torch.cuda.device_count() < n_gpu:
+        raise ValueError(
+            f"--data_parallel_gpus={n_gpu} requires at least {n_gpu} visible CUDA devices "
+            f"(got {0 if not torch.cuda.is_available() else torch.cuda.device_count()})."
+        )
+
+    out_base = Path(args.output)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="rgha_dp_")
+    try:
+        shards = _split_rows(rows, n_gpu)
+        shard_outs = [out_base.with_suffix(out_base.suffix + f".shard{i}") for i in range(n_gpu)]
+
+        procs: list[subprocess.Popen] = []
+        script_path = Path(__file__).resolve()
+        py = sys.executable
+
+        for i in range(n_gpu):
+            chunk = shards[i]
+            if not chunk:
+                continue
+            sf = Path(tmpdir) / f"shard_{i}.jsonl"
+            with sf.open("w", encoding="utf-8") as f:
+                for r in chunk:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(i)
+            outp = shard_outs[i]
+
+            cmd = [
+                py,
+                "-u",
+                str(script_path),
+                "--model_name_or_path",
+                args.model_name_or_path,
+                "--data",
+                str(sf),
+                "--output",
+                str(outp),
+                "--batch_size",
+                str(args.batch_size),
+                "--max_new_tokens",
+                str(args.max_new_tokens),
+                "--temperature",
+                str(args.temperature),
+                "--top_p",
+                str(args.top_p),
+                "--num_generations",
+                str(args.num_generations),
+                "--device",
+                "cuda:0",
+                "--rgha_hidden_size",
+                str(args.rgha_hidden_size),
+                "--rgha_entropy_alpha",
+                str(args.rgha_entropy_alpha),
+                "--rgha_sim_beta",
+                str(args.rgha_sim_beta),
+                "--rgha_threshold",
+                str(args.rgha_threshold),
+                "--_dp_worker",
+            ]
+            if args.do_sample:
+                cmd.append("--do_sample")
+            if args.use_rgha:
+                cmd.append("--use_rgha")
+
+            procs.append(subprocess.Popen(cmd, env=env))
+
+        for p in procs:
+            rc = p.wait()
+            if rc != 0:
+                raise RuntimeError(f"Data-parallel worker exited with code {rc}.")
+
+        with out_base.open("w", encoding="utf-8") as fout:
+            for outp in shard_outs:
+                if not outp.exists():
+                    continue
+                with outp.open("r", encoding="utf-8") as fin:
+                    shutil.copyfileobj(fin, fout)
+        print(f"Merged {n_gpu} shard slot(s) into: {out_base.resolve()}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HF inference with RGHA forward patch.")
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Checkpoint path")
@@ -179,6 +282,17 @@ def main() -> None:
         default="auto",
         help="Device for inference: auto/cuda/cuda:0/cpu. `auto` will use multi-GPU device_map when available.",
     )
+    parser.add_argument(
+        "--data_parallel_gpus",
+        type=int,
+        default=0,
+        help=(
+            "If >=2, split samples across this many processes, each with CUDA_VISIBLE_DEVICES=i "
+            "and full model on one GPU (true data parallel). Output is merged to --output. "
+            "Use 0 or 1 to disable."
+        ),
+    )
+    parser.add_argument("--_dp_worker", action="store_true", help=argparse.SUPPRESS)
 
     parser.add_argument("--use_rgha", action="store_true", default=False)
     parser.add_argument("--rgha_hidden_size", type=int, default=256)
@@ -215,6 +329,10 @@ def main() -> None:
         raise ValueError("`--num_generations` must be >= 1.")
     if args.num_generations > 1 and (not args.do_sample or args.temperature <= 0):
         raise ValueError("When `--num_generations > 1`, set `--do_sample` and `--temperature > 0`.")
+
+    if args.data_parallel_gpus >= 2 and not args._dp_worker:
+        _run_data_parallel_inference(args, rows)
+        return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
