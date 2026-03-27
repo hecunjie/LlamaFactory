@@ -38,7 +38,7 @@ def build_rows_from_llamafactory(
     max_samples: int | None,
     default_system: str | None,
     enable_thinking: bool,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     model_args, data_args, _, _ = get_infer_args(
         dict(
             model_name_or_path=model_name_or_path,
@@ -59,13 +59,22 @@ def build_rows_from_llamafactory(
     dataset_module = get_dataset(template_obj, model_args, data_args, training_args, "ppo", **tokenizer_module)
     hf_ds = dataset_module["train_dataset"]
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for i in range(len(hf_ds)):
-        input_ids = hf_ds[i]["input_ids"]
-        labels = hf_ds[i]["labels"]
-        prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
-        label = tokenizer.decode([int(x) for x in labels if int(x) != IGNORE_INDEX], skip_special_tokens=True)
-        rows.append({"prompt": prompt, "predict": label})
+        input_ids = [int(x) for x in hf_ds[i]["input_ids"]]
+        labels = [int(x) for x in hf_ds[i]["labels"]]
+        predict_ids = [x for x in labels if x != IGNORE_INDEX]
+        # 文本字段仅用于可读性；分析主逻辑优先走 ids，避免 decode->tokenize 导致 <add_think> 丢失。
+        prompt = tokenizer.decode(input_ids, skip_special_tokens=False)
+        label = tokenizer.decode(predict_ids, skip_special_tokens=False)
+        rows.append(
+            {
+                "prompt": prompt,
+                "predict": label,
+                "prompt_ids": input_ids,
+                "predict_ids": predict_ids,
+            }
+        )
     return rows
 
 
@@ -233,13 +242,19 @@ def main() -> None:
     result_rows: list[dict[str, Any]] = []
     sample_with_think = 0
 
+    direct_ids_mode = False
     for sample_idx, r in enumerate(tqdm(rows, desc="Analyzing")):
-        prompt = str(r.get("prompt", ""))
-        predict = str(r.get("predict", ""))
-        full_text = prompt + predict
-
-        tokenized = tokenizer(full_text, add_special_tokens=False)
-        ids = tokenized["input_ids"]
+        prompt_ids = r.get("prompt_ids", None)
+        predict_ids = r.get("predict_ids", None)
+        if isinstance(prompt_ids, list) and isinstance(predict_ids, list):
+            ids = [int(x) for x in prompt_ids] + [int(x) for x in predict_ids]
+            direct_ids_mode = True
+        else:
+            prompt = str(r.get("prompt", ""))
+            predict = str(r.get("predict", ""))
+            full_text = prompt + predict
+            tokenized = tokenizer(full_text, add_special_tokens=False)
+            ids = tokenized["input_ids"]
         if len(ids) < 2:
             continue
 
@@ -371,6 +386,7 @@ def main() -> None:
     print(f"[done] per-point csv: {out_csv.resolve()}")
     print(f"[done] histogram: {out_plot.resolve()}")
     print(f"[stats] points={len(result_rows)}, samples_with_add_think={sample_with_think}")
+    print(f"[stats] direct_ids_mode={direct_ids_mode}, add_think_id={add_think_id}")
 
 
 if __name__ == "__main__":
