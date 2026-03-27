@@ -122,6 +122,31 @@ def load_rgha_weights_from_checkpoint(model: torch.nn.Module, model_name_or_path
     return len(to_load)
 
 
+
+
+def _build_eos_token_ids(tokenizer: AutoTokenizer, think_token: str = "<add_think>") -> int | list[int]:
+    eos_ids: list[int] = []
+    if tokenizer.eos_token_id is not None and tokenizer.eos_token_id >= 0:
+        eos_ids.append(int(tokenizer.eos_token_id))
+
+    extra_ids = getattr(tokenizer, "additional_special_tokens_ids", None)
+    if isinstance(extra_ids, list):
+        eos_ids.extend(int(i) for i in extra_ids if isinstance(i, int) and i >= 0)
+
+    for tok in ("<|eot_id|>", "<|im_end|>", "<|end|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+
+    think_id = tokenizer.convert_tokens_to_ids(think_token)
+    if isinstance(think_id, int) and think_id >= 0:
+        eos_ids = [i for i in eos_ids if i != think_id]
+
+    eos_ids = list(dict.fromkeys(eos_ids))
+    if not eos_ids:
+        raise ValueError("No valid eos_token_id found from tokenizer.")
+    return eos_ids[0] if len(eos_ids) == 1 else eos_ids
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
@@ -160,7 +185,7 @@ def build_rows_from_llamafactory(
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template_obj = get_template_and_fix_tokenizer(tokenizer, data_args)
-    dataset_module = get_dataset(template_obj, model_args, data_args, training_args, "ppo", **tokenizer_module)
+    dataset_module = get_dataset(template_obj, model_args, data_args, training_args, "sft", **tokenizer_module)
     hf_ds = dataset_module["train_dataset"]
 
     rows: list[dict[str, str]] = []
@@ -319,6 +344,10 @@ def _run_data_parallel_inference(args: argparse.Namespace, rows: list[dict[str, 
                 str(args.top_p),
                 "--num_generations",
                 str(args.num_generations),
+                "--repetition_penalty",
+                str(args.repetition_penalty),
+                "--no_repeat_ngram_size",
+                str(args.no_repeat_ngram_size),
                 "--device",
                 "cuda:0",
                 "--rgha_hidden_size",
@@ -371,6 +400,8 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--do_sample", action="store_true", default=False)
+    parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=0)
     parser.add_argument("--num_generations", type=int, default=1, help="Number of generations per prompt")
     parser.add_argument(
         "--device",
@@ -441,6 +472,8 @@ def main() -> None:
             "[RGHA] Note: from_pretrained will warn that rgha_* keys in the checkpoint are unused. "
             "That is normal — LlamaForCausalLM has no RGHA slots until we patch; weights are loaded right after."
         )
+
+    eos_token_id = _build_eos_token_ids(tokenizer)
 
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     use_multi_gpu = args.device == "auto" and torch.cuda.is_available() and torch.cuda.device_count() > 1
@@ -519,8 +552,10 @@ def main() -> None:
                     top_p=args.top_p,
                     max_new_tokens=args.max_new_tokens,
                     num_return_sequences=args.num_generations,
+                    repetition_penalty=args.repetition_penalty,
+                    no_repeat_ngram_size=max(0, int(args.no_repeat_ngram_size)),
                     pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
+                    eos_token_id=eos_token_id,
                 )
 
             # With left padding, non-pad length != tensor width. HF appends new tokens after the
