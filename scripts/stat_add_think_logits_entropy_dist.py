@@ -163,6 +163,46 @@ def forward_single(
     return outputs.logits[0].float().cpu()
 
 
+def resolve_marker_token_id(tokenizer: Any, token: str) -> int:
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if isinstance(token_id, list):
+        token_id = token_id[0] if token_id else -1
+    if token_id is None:
+        return -1
+    token_id = int(token_id)
+    if token_id < 0:
+        return -1
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == int(unk_id) and token != getattr(tokenizer, "unk_token", None):
+        # convert_tokens_to_ids 返回 unk，说明该 token 不在词表中
+        return -1
+    return token_id
+
+
+def replace_source_token_in_rows(
+    rows: list[dict[str, Any]],
+    source_token: str,
+    target_token: str,
+) -> tuple[list[dict[str, Any]], int]:
+    replaced_count = 0
+    replaced_rows: list[dict[str, Any]] = []
+    for r in rows:
+        nr = dict(r)
+        p = str(nr.get("prompt", ""))
+        pr = str(nr.get("predict", ""))
+        np = p.replace(source_token, target_token)
+        npr = pr.replace(source_token, target_token)
+        if np != p or npr != pr:
+            replaced_count += 1
+            # 发生文本替换后，禁用已有 ids，避免 old ids 与新文本不一致
+            nr.pop("prompt_ids", None)
+            nr.pop("predict_ids", None)
+        nr["prompt"] = np
+        nr["predict"] = npr
+        replaced_rows.append(nr)
+    return replaced_rows, replaced_count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="统计 <add_think>（或其前一位置）的熵与logit分布。")
     parser.add_argument("--data", type=str, default=None, help="输入 JSONL，需包含 prompt/predict")
@@ -173,6 +213,20 @@ def main() -> None:
     parser.add_argument("--default_system", type=str, default=None, help="模板构建时使用的默认 system prompt")
     parser.add_argument("--enable_thinking", action="store_true", default=True, help="构建数据时启用 thinking 模式")
     parser.add_argument("--model", type=str, required=True, help="本地模型路径（也用于 dataset 模式构建 tokenizer）")
+    parser.add_argument("--source_marker_token", type=str, default="<add_think>", help="数据中待替换的源标记 token")
+    parser.add_argument("--marker_token", type=str, default="<add_think>", help="默认用于定位分析位置的 token")
+    parser.add_argument(
+        "--fallback_marker_token",
+        type=str,
+        default=None,
+        help="当 marker_token 不在词表中时，使用的替代 token（可选）",
+    )
+    parser.add_argument(
+        "--fallback_marker_token_id",
+        type=int,
+        default=None,
+        help="当 marker_token 不在词表中时，直接使用的替代 token id（优先级高于 fallback_marker_token）",
+    )
     parser.add_argument("--output_dir", type=str, default="add_think_logits_entropy_dist_outputs", help="输出目录")
     parser.add_argument("--max_samples", type=int, default=2000, help="最多处理样本数")
     parser.add_argument("--hist_bins", type=int, default=60, help="直方图 bins 数")
@@ -230,12 +284,36 @@ def main() -> None:
     ).eval()
     device = next(model.parameters()).device
 
-    add_think_id = tokenizer.convert_tokens_to_ids("<add_think>")
-    if isinstance(add_think_id, list):
-        add_think_id = add_think_id[0] if add_think_id else -1
-    if add_think_id is None or int(add_think_id) < 0:
-        raise ValueError("tokenizer 中未找到 <add_think>。")
-    add_think_id = int(add_think_id)
+    marker_token_used = args.marker_token
+    marker_id = resolve_marker_token_id(tokenizer, args.marker_token)
+    if marker_id < 0:
+        if args.fallback_marker_token_id is not None:
+            marker_id = int(args.fallback_marker_token_id)
+            marker_token_used = f"id:{marker_id}"
+        elif args.fallback_marker_token is not None:
+            marker_id = resolve_marker_token_id(tokenizer, args.fallback_marker_token)
+            marker_token_used = args.fallback_marker_token
+
+    if marker_id < 0:
+        raise ValueError(
+            f"tokenizer 中未找到 marker_token={args.marker_token}。"
+            "请设置 --fallback_marker_token 或 --fallback_marker_token_id。"
+        )
+
+    replacement_applied = False
+    replaced_row_count = 0
+    if (
+        args.source_marker_token
+        and marker_token_used
+        and (not str(marker_token_used).startswith("id:"))
+        and args.source_marker_token != marker_token_used
+    ):
+        rows, replaced_row_count = replace_source_token_in_rows(
+            rows=rows,
+            source_token=args.source_marker_token,
+            target_token=str(marker_token_used),
+        )
+        replacement_applied = True
 
     entropy_values: list[float] = []
     target_logits: list[float] = []
@@ -258,7 +336,7 @@ def main() -> None:
         if len(ids) < 2:
             continue
 
-        think_positions = [i for i, tid in enumerate(ids) if int(tid) == add_think_id]
+        think_positions = [i for i, tid in enumerate(ids) if int(tid) == marker_id]
         if not think_positions:
             continue
         sample_with_think += 1
@@ -345,6 +423,12 @@ def main() -> None:
         "meta": {
             "data": data_path_str,
             "model": str(args.model),
+            "source_marker_token": str(args.source_marker_token),
+            "marker_token_requested": str(args.marker_token),
+            "marker_token_used": str(marker_token_used),
+            "marker_token_id": int(marker_id),
+            "replacement_applied": bool(replacement_applied),
+            "replaced_row_count": int(replaced_row_count),
             "max_samples": int(args.max_samples),
             "drop_think_position": bool(args.drop_think_position),
             "num_samples_loaded": int(len(rows)),
@@ -386,7 +470,10 @@ def main() -> None:
     print(f"[done] per-point csv: {out_csv.resolve()}")
     print(f"[done] histogram: {out_plot.resolve()}")
     print(f"[stats] points={len(result_rows)}, samples_with_add_think={sample_with_think}")
-    print(f"[stats] direct_ids_mode={direct_ids_mode}, add_think_id={add_think_id}")
+    print(
+        f"[stats] direct_ids_mode={direct_ids_mode}, "
+        f"marker_token_used={marker_token_used}, marker_id={marker_id}"
+    )
 
 
 if __name__ == "__main__":
