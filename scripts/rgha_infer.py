@@ -436,6 +436,12 @@ def main() -> None:
     # Decoder-only models should use left padding during generation.
     tokenizer.padding_side = "left"
 
+    if args.use_rgha:
+        print(
+            "[RGHA] Note: from_pretrained will warn that rgha_* keys in the checkpoint are unused. "
+            "That is normal — LlamaForCausalLM has no RGHA slots until we patch; weights are loaded right after."
+        )
+
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     use_multi_gpu = args.device == "auto" and torch.cuda.is_available() and torch.cuda.device_count() > 1
     if use_multi_gpu:
@@ -478,7 +484,10 @@ def main() -> None:
         )
         n_rgha = load_rgha_weights_from_checkpoint(model, args.model_name_or_path)
         if n_rgha > 0:
-            print(f"[RGHA] forward patch enabled; loaded {n_rgha} RGHA tensor(s) from checkpoint.")
+            print(
+                f"[RGHA] forward patch enabled; loaded {n_rgha} RGHA tensor(s) from checkpoint "
+                f"(safe to ignore the earlier 'not used when initializing' message for those keys)."
+            )
         else:
             print(
                 "[RGHA] forward patch enabled but no rgha_* weights found in checkpoint — "
@@ -514,14 +523,17 @@ def main() -> None:
                     eos_token_id=tokenizer.eos_token_id,
                 )
 
-            input_lens = enc["attention_mask"].sum(dim=1).tolist()
+            # With left padding, non-pad length != tensor width. HF appends new tokens after the
+            # full padded row (width = input_ids.shape[1]); using attention_mask.sum() slices wrong
+            # and leaks prompt tail into "predict" (often mid-sentence) and looks like repetition.
+            prompt_width = int(enc["input_ids"].shape[1])
             bsz = len(batch)
             for i in range(bsz):
                 pred_list: list[str] = []
                 for k in range(args.num_generations):
                     out_idx = i * args.num_generations + k
                     ids = out_ids[out_idx]
-                    gen_ids = ids[int(input_lens[i]) :].tolist()
+                    gen_ids = ids[prompt_width:].tolist()
                     pred_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
                     pred_list.append(pred_text)
                 rec = {
