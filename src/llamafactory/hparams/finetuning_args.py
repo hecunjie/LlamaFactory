@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 
 @dataclass
@@ -707,8 +707,8 @@ class FinetuningArguments(
         metadata={
             "help": (
                 "If True, during standard SFT record per-token entropy, max cosine (LN hidden vs lm_head), "
-                "and max logit before/after each optimizer step and append grouped stats to jsonl "
-                "(requires CustomSeq2SeqTrainer standard branch)."
+                "and max logit before/after each optimizer step and append grouped stats to jsonl under "
+                "``logits_analysis_output_path/train/`` (requires CustomSeq2SeqTrainer standard branch)."
             )
         },
     )
@@ -726,7 +726,12 @@ class FinetuningArguments(
     )
     logits_analysis_output_path: str = field(
         default="./analysis_logs/",
-        metadata={"help": "Directory for logits analysis jsonl files."},
+        metadata={
+            "help": (
+                "Root directory for logits analysis. Training jsonl is written under ``<this>/train/``; "
+                "eval snapshots under ``<this>/eval/``."
+            )
+        },
     )
     logits_analysis_cosine_seq_chunk: int = field(
         default=512,
@@ -774,6 +779,33 @@ class FinetuningArguments(
             "help": (
                 "If True, include per-position focused logits (top-k or prob-threshold) in each jsonl record. "
                 "Large; default False — clustering stats (groups A–D) are always saved."
+            )
+        },
+    )
+    logits_analysis_on_eval: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, during evaluation (standard loss eval, not predict_with_generate) run an extra analysis "
+                "forward per batch and append jsonl lines under ``logits_analysis_output_path/eval/``. "
+                "Eval has no optimizer step, so records use analysis=eval_cluster_snapshot (static H / max_cos / "
+                "max_logit per A–D cluster, not train-time Δ). Requires LogitsAnalysisCallback — enable "
+                "logits_analysis_in_sft or logits_analysis_on_eval."
+            )
+        },
+    )
+    logits_analysis_eval_every_n_batches: int = field(
+        default=1,
+        metadata={
+            "help": "When logits_analysis_on_eval is True, append at most one jsonl line every N eval batches."
+        },
+    )
+    logits_analysis_eval_max_batches: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "When set, only log the first this many eval batches per evaluation call (after subsampling "
+                "by logits_analysis_eval_every_n_batches). None means all batches."
             )
         },
     )

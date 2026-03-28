@@ -180,9 +180,13 @@ def run_sft(
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     logits_analysis_cb: Optional[LogitsAnalysisCallback] = None
-    if getattr(finetuning_args, "logits_analysis_in_sft", False):
+    if getattr(finetuning_args, "logits_analysis_in_sft", False) or getattr(
+        finetuning_args, "logits_analysis_on_eval", False
+    ):
         if model_args.use_kt:
-            logger.warning_rank0("`logits_analysis_in_sft` is not supported with KTrainer; skipping callback.")
+            logger.warning_rank0(
+                "`logits_analysis_in_sft` / `logits_analysis_on_eval` is not supported with KTrainer; skipping callback."
+            )
         else:
             logits_analysis_cb = LogitsAnalysisCallback(finetuning_args)
             callbacks = (callbacks or []) + [logits_analysis_cb]

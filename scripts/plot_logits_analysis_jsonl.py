@@ -15,14 +15,15 @@ per-step difference ``group_left - group_right``, then mean / variance of that d
 
 Example::
 
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs
+    # Training delta logs are under ``logits_analysis_output_path/train/`` (eval snapshots use ``.../eval/``).
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train
 
     # Custom directory and file name prefix
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs \\
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train \\
         --output_dir ./figures --basename run1_curves
 
     # Legacy: --output path/to/name.png → saves as path/to/name_01_*.png ...
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs \\
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train \\
         --output ./analysis_plots/curves.png
 """
 

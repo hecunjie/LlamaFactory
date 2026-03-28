@@ -27,6 +27,12 @@ logger = get_logger(__name__)
 _MAX_PARAM_SNAPSHOT_NUMEL = 150_000_000
 
 
+def _logits_analysis_phase_dir(base: str, phase: str) -> str:
+    r"""``logits_analysis_output_path``/train or .../eval (``phase`` is ``\"train\"`` or ``\"eval\"``)."""
+    root = os.path.normpath(os.path.expanduser(base.strip()))
+    return os.path.join(root, phase)
+
+
 def _ordered_trainable_named_params(unwrapped: "torch.nn.Module") -> list[tuple[str, "torch.nn.Parameter"]]:
     r"""LoRA / adapter tensors first so snapshot budget is not eaten by huge embeddings."""
     named = [(n, p) for n, p in unwrapped.named_parameters() if p.requires_grad]
@@ -341,6 +347,53 @@ def _masked_delta_summary(
     }
 
 
+def _group_value_stats(
+    H: "torch.Tensor",
+    max_cos: "torch.Tensor",
+    max_logit: "torch.Tensor",
+    group_mask: "torch.Tensor",
+) -> dict[str, Any]:
+    r"""Per cluster: mean/std/mean_abs of **static** H, max_cos, max_logit (eval snapshot)."""
+    if not group_mask.any():
+        z = {"mean": 0.0, "std": 0.0, "mean_abs": 0.0}
+        return {
+            "count": 0,
+            "entropy": z.copy(),
+            "max_cosine": z.copy(),
+            "max_logit": z.copy(),
+        }
+    h = H[group_mask].float()
+    c = max_cos[group_mask].float()
+    l = max_logit[group_mask].float()
+    return {
+        "count": int(group_mask.sum().item()),
+        "entropy": {**_stat_mean_std(h), "mean_abs": float(h.abs().mean().item())},
+        "max_cosine": {**_stat_mean_std(c), "mean_abs": float(c.abs().mean().item())},
+        "max_logit": {**_stat_mean_std(l), "mean_abs": float(l.abs().mean().item())},
+    }
+
+
+def _masked_value_summary(
+    H: "torch.Tensor",
+    max_cos: "torch.Tensor",
+    max_logit: "torch.Tensor",
+    mask: "torch.Tensor",
+) -> dict[str, Any]:
+    r"""All supervised positions: mean/std/mean_abs of H, max_cos, max_logit (no delta)."""
+    if not mask.any():
+        z = {"mean": 0.0, "std": 0.0, "mean_abs": 0.0}
+        return {"token_count": 0, "entropy": z, "max_cosine": z, "max_logit": z}
+    h = H[mask].float()
+    c = max_cos[mask].float()
+    l = max_logit[mask].float()
+    return {
+        "token_count": int(mask.sum().item()),
+        "entropy": {**_stat_mean_std(h), "mean_abs": float(h.abs().mean().item())},
+        "max_cosine": {**_stat_mean_std(c), "mean_abs": float(c.abs().mean().item())},
+        "max_logit": {**_stat_mean_std(l), "mean_abs": float(l.abs().mean().item())},
+    }
+
+
 # Cluster labels (high/low entropy × high/low max-cosine vs vocab), for jsonl output.
 _CLUSTER_DEFS: tuple[tuple[str, str, str], ...] = (
     ("A", "high_entropy_low_cos", "H > th_e AND max_cos < th_c (hard positions)"),
@@ -358,6 +411,9 @@ class LogitsAnalysisCallback(TrainerCallback):
 
     Writes jsonl records keyed by four clusters (A–D). Optional per-position focus when
     ``logits_analysis_save_focus_per_position`` is True.
+
+    When ``logits_analysis_on_eval`` is True, ``record_eval_snapshot`` appends **eval** lines
+    (static H / max_cos / max_logit per cluster; no optimizer step, so not train-style Δ).
     """
 
     def __init__(self, finetuning_args: "FinetuningArguments") -> None:
@@ -678,9 +734,105 @@ class LogitsAnalysisCallback(TrainerCallback):
                 "lm_head_dot_* is dot(h,W)+bias in float32 (same as before)."
             )
         self._optimizer_lr_before_step = None
-        out_dir = self.finetuning_args.logits_analysis_output_path
+        out_dir = _logits_analysis_phase_dir(self.finetuning_args.logits_analysis_output_path, "train")
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"analysis_step_{completed_step}_{completed_step}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def record_eval_snapshot(
+        self,
+        batch: dict[str, Any],
+        *,
+        global_step: int,
+        eval_batch_index: int,
+        metric_key_prefix: str,
+    ) -> None:
+        r"""Single eval forward: static H / max_cos / max_logit by A–D (no optimizer step ⇒ no train-style Δ).
+
+        Called from ``CustomSeq2SeqTrainer.prediction_step`` for standard loss eval (not ``predict_with_generate``).
+        Appends one line under ``logits_analysis_output_path/eval/`` to
+        ``eval_logits_analysis_{metric_key_prefix}_step_{global_step}.jsonl``.
+        """
+        if self._trainer is None:
+            return
+        if not bool(getattr(self.finetuning_args, "logits_analysis_on_eval", False)):
+            return
+        if not self._trainer.is_world_process_zero():
+            return
+        _sync_device_after_optimizer(batch["input_ids"].device)
+
+        model = self._trainer.accelerator.unwrap_model(self._trainer.model, keep_torch_compile=False)
+        unwrapped = _unwrap_model(model)
+        out_emb = unwrapped.get_output_embeddings()
+        if out_emb is None:
+            return
+        lm_w = out_emb.weight
+
+        fwd: dict[str, Any] = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "use_cache": False,
+        }
+        out = self._run_analysis_forward(fwd, lm_w)
+        if out is None:
+            return
+        H, mc, ml, ls0, lmx0, _logits, _hidden = out
+        del _logits, _hidden
+
+        attn = batch["attention_mask"].bool()
+        labels = batch.get("labels")
+        mask = attn
+        if labels is not None:
+            mask = mask & labels.ne(IGNORE_INDEX)
+
+        th_e = float(self.finetuning_args.logits_analysis_threshold_entropy)
+        th_c = float(self.finetuning_args.logits_analysis_threshold_cosine)
+        high_H = H > th_e
+        low_cos = mc < th_c
+        g_a = high_H & low_cos & mask
+        g_b = high_H & (~low_cos) & mask
+        g_c = (~high_H) & low_cos & mask
+        g_d = (~high_H) & (~low_cos) & mask
+
+        groups_clustered: dict[str, Any] = {}
+        for (cid, slug, desc), gm in zip(_CLUSTER_DEFS, (g_a, g_b, g_c, g_d)):
+            st = _group_value_stats(H, mc, ml, gm)
+            groups_clustered[cid] = {
+                "name": slug,
+                "description": desc,
+                **st,
+            }
+
+        masked_summary = _masked_value_summary(H, mc, ml, mask)
+
+        record: dict[str, Any] = {
+            "step": global_step,
+            "phase": "eval",
+            "metric_key_prefix": metric_key_prefix,
+            "eval_batch_index": eval_batch_index,
+            "analysis": "eval_cluster_snapshot",
+            "thresholds": {
+                "entropy_high_if_gt": th_e,
+                "max_cosine_low_if_lt": th_c,
+            },
+            "masked_summary": masked_summary,
+            "groups": groups_clustered,
+            "values_explained": {
+                "entropy": "Static H from softmax of **fp32** logits (single eval forward; not train Δ).",
+                "max_cosine": "Static max_k cos(h,w_k) (LN hidden vs lm_head rows).",
+                "max_logit": "Static max_k **fp32** logits.",
+            },
+            "logits_analysis_dtype": "float32",
+            "logits_fp64_sum": ls0,
+            "logits_fp64_absmax": lmx0,
+        }
+        out_dir = _logits_analysis_phase_dir(self.finetuning_args.logits_analysis_output_path, "eval")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(
+            out_dir,
+            f"eval_logits_analysis_{metric_key_prefix}_step_{global_step}.jsonl",
+        )
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 

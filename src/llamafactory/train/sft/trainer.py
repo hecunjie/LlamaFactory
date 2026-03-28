@@ -1424,6 +1424,34 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 total_loss = loss_answer
                 logits = outputs.logits
 
+        if (
+            not self.args.predict_with_generate
+            and not do_latent_chain
+            and getattr(self.finetuning_args, "logits_analysis_on_eval", False)
+        ):
+            _la_cb = self._get_logits_analysis_callback()
+            idx = int(getattr(self, "_logits_eval_batch_idx", 0))
+            if _la_cb is not None:
+                every_n = max(1, int(getattr(self.finetuning_args, "logits_analysis_eval_every_n_batches", 1)))
+                max_b = getattr(self.finetuning_args, "logits_analysis_eval_max_batches", None)
+                prefix = getattr(self, "_eval_metric_key_prefix", "eval")
+                if (
+                    self.is_world_process_zero()
+                    and idx % every_n == 0
+                    and (max_b is None or idx < max_b)
+                ):
+                    _la_cb.record_eval_snapshot(
+                        {
+                            "input_ids": inputs["input_ids"],
+                            "attention_mask": inputs["attention_mask"],
+                            "labels": inputs.get("labels"),
+                        },
+                        global_step=int(self.state.global_step),
+                        eval_batch_index=idx,
+                        metric_key_prefix=prefix,
+                    )
+            self._logits_eval_batch_idx = idx + 1
+
         if not hasattr(self, "_eval_loss_buffer"):
             self._eval_loss_buffer = {"sft": [], "reasoning": []}
         self._eval_loss_buffer["sft"].append(loss_answer.detach().float().cpu())
@@ -1436,6 +1464,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._eval_loss_buffer = {"sft": [], "reasoning": []}
         dataloader = args[0] if len(args) > 0 else kwargs.get("dataloader", None)
         metric_key_prefix = kwargs.get("metric_key_prefix", "eval")
+        if getattr(self.finetuning_args, "logits_analysis_on_eval", False):
+            self._logits_eval_batch_idx = 0
+            self._eval_metric_key_prefix = metric_key_prefix
         output = super().evaluation_loop(*args, **kwargs)
         for k, v in self._eval_loss_buffer.items():
             if v:
