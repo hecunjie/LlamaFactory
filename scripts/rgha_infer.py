@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -192,13 +193,26 @@ def build_rows_from_llamafactory(
     for i in range(len(hf_ds)):
         input_ids = hf_ds[i]["input_ids"]
         labels = hf_ds[i]["labels"]
-        prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
+        ids_list = [int(x) for x in input_ids]
+        lab_list = [int(x) for x in labels]
+        n = min(len(ids_list), len(lab_list))
+        ids_list = ids_list[:n]
+        lab_list = lab_list[:n]
+        # SFT packs prompt+answer in input_ids; labels are IGNORE_INDEX on the prompt span.
+        # Decoding full input_ids leaks the first answer tokens (e.g. "18") into the "prompt".
+        first_sup = next((j for j in range(n) if lab_list[j] != IGNORE_INDEX), n)
+        prompt = tokenizer.decode(ids_list[:first_sup], skip_special_tokens=True)
         label = tokenizer.decode(
-            [int(x) for x in labels if int(x) != IGNORE_INDEX],
+            [lab_list[j] for j in range(n) if lab_list[j] != IGNORE_INDEX],
             skip_special_tokens=True,
         )
         rows.append({"prompt": prompt, "label": label})
     return rows
+
+
+def _strip_leaked_numeric_after_assistant(text: str) -> str:
+    """If prompt ends with assistant header + only digits, drop the digits (common JSONL export bug)."""
+    return re.sub(r"(?i)(assistant\s*\n\s*)\d+\s*$", r"\1", text.rstrip()).rstrip()
 
 
 def patch_rgha_forward(
@@ -364,6 +378,8 @@ def _run_data_parallel_inference(args: argparse.Namespace, rows: list[dict[str, 
                 cmd.append("--do_sample")
             if args.use_rgha:
                 cmd.append("--use_rgha")
+            if args.no_strip_leaked_answer_tail:
+                cmd.append("--no_strip_leaked_answer_tail")
 
             procs.append(subprocess.Popen(cmd, env=env))
 
@@ -426,6 +442,14 @@ def main() -> None:
     parser.add_argument("--rgha_entropy_alpha", type=float, default=0.4)
     parser.add_argument("--rgha_sim_beta", type=float, default=0.6)
     parser.add_argument("--rgha_threshold", type=float, default=0.58)
+    parser.add_argument(
+        "--no_strip_leaked_answer_tail",
+        action="store_true",
+        help=(
+            "For --data JSONL only: disable stripping when prompt ends with "
+            "'assistant' + whitespace + digits-only (bad exports often leak the first answer token)."
+        ),
+    )
     args = parser.parse_args()
 
     output_path = Path(args.output)
@@ -531,10 +555,13 @@ def main() -> None:
 
     with output_path.open("w", encoding="utf-8") as fout:
         pbar = tqdm(range(0, len(rows), args.batch_size), desc="Infer", total=(len(rows) + args.batch_size - 1) // args.batch_size)
+        strip_tail = not args.no_strip_leaked_answer_tail
         for st in pbar:
             batch = rows[st : st + args.batch_size]
             prompts = [str(r.get("prompt", "")) for r in batch]
             labels = [str(r.get("label", "")) for r in batch]
+            if strip_tail:
+                prompts = [_strip_leaked_numeric_after_assistant(p) for p in prompts]
 
             enc = tokenizer(
                 prompts,
