@@ -768,6 +768,15 @@ class FinetuningArguments(
             )
         },
     )
+    logits_analysis_save_focus_per_position: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, include per-position focused logits (top-k or prob-threshold) in each jsonl record. "
+                "Large; default False — clustering stats (groups A–D) are always saved."
+            )
+        },
+    )
     add_think_token: bool = field(
         default=False,
         metadata={
