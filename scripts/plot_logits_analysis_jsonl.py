@@ -13,9 +13,9 @@ processed and written with a distinct output basename.
 **Multi-line files (eval)**: Multiple jsonl lines with the same ``step`` (batched eval) are merged
 into one per-step record using count-weighted means for group / masked statistics.
 
-**Plots** (train): 01–06 as before; **07** A–D token-count fractions; **08–09** A vs D and A vs B
-for ``delta_max_cosine.mean``. **Eval** snapshots use ``max_cosine.mean`` instead of deltas where
-applicable.
+**Plots** (train): 01–06 as before; **07** A–D token-count fractions; **10–11** cosine-mean **difference**
+curves **A−D** and **A−B** vs step (train: ``delta_max_cosine.mean``; eval: ``max_cosine.mean``).
+**Eval** snapshots use ``max_cosine.mean`` instead of deltas where applicable.
 
 Also writes ``{basename}_contrast_stats.json`` (train delta records only) with paired contrast stats.
 Use ``--no_contrast`` to skip; ``--contrast_full`` adds per-step arrays (large).
@@ -278,6 +278,24 @@ def _series_group_cosine_mean(rows: list[dict[str, Any]], kind: str, gid: str) -
     return out
 
 
+def _series_cosine_mean_pair_diff(
+    rows: list[dict[str, Any]],
+    kind: str,
+    g_left: str,
+    g_right: str,
+) -> list[Optional[float]]:
+    r"""Per step: ``cosine_mean(left) − cosine_mean(right)`` (same metric as :func:`_series_group_cosine_mean`)."""
+    yl = _series_group_cosine_mean(rows, kind, g_left)
+    yr = _series_group_cosine_mean(rows, kind, g_right)
+    out: list[Optional[float]] = []
+    for a, b in zip(yl, yr):
+        if a is None or b is None:
+            out.append(None)
+            continue
+        out.append(float(a) - float(b))
+    return out
+
+
 # (field under each group, stat key) — same metrics as in plots.
 _CONTRAST_METRICS: tuple[tuple[str, str], ...] = (
     ("delta_entropy", "mean_abs"),
@@ -408,7 +426,8 @@ def plot_and_save_separate(
     subtitle: str,
     dpi: int = 150,
 ) -> list[Path]:
-    r"""Save PNGs: ``01``–``06`` (train-centric; eval skips 01/06), ``07``–``09`` (fractions + cosine mean)."""
+    r"""Save PNGs: ``01``–``06`` (train-centric; eval skips 01/06), ``07`` (A–D fractions), ``10``–``11``
+    (A−D / A−B cosine-mean differences vs step)."""
     import matplotlib.pyplot as plt
 
     if not rows:
@@ -580,36 +599,34 @@ def plot_and_save_separate(
     written.append(p)
 
     ylab_cm = "delta_max_cosine.mean (train)" if train else "max_cosine.mean (eval)"
-    # 08 A vs D: cosine mean (Δ or static)
+    # 10 cosine mean difference A − D vs step
+    diff_ad = _series_cosine_mean_pair_diff(rows, kind, "A", "D")
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
-    y_a = _series_group_cosine_mean(rows, kind, "A")
-    y_d = _series_group_cosine_mean(rows, kind, "D")
-    ax.plot(steps, y_a, label="A", color="C0", linewidth=1.2, marker="o", markersize=3)
-    ax.plot(steps, y_d, label="D", color="C3", linewidth=1.2, marker="s", markersize=3)
-    ax.set_ylabel(ylab_cm)
+    ax.plot(steps, diff_ad, color="C2", linewidth=1.2, marker="o", markersize=3, label="A − D")
+    ax.axhline(0.0, color="0.5", linewidth=0.8, linestyle="--", alpha=0.8)
+    ax.set_ylabel(f"A − D ({ylab_cm})")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
-    ax.set_title("A vs D: cosine mean vs step")
-    p = _name("08_cosine_mean_A_vs_D")
+    ax.set_title("cosine mean difference (A − D) vs step")
+    p = _name("10_cosine_mean_diff_A_minus_D")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
     written.append(p)
 
-    # 09 A vs B: cosine mean
+    # 11 cosine mean difference A − B vs step
+    diff_ab = _series_cosine_mean_pair_diff(rows, kind, "A", "B")
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
-    y_a2 = _series_group_cosine_mean(rows, kind, "A")
-    y_b = _series_group_cosine_mean(rows, kind, "B")
-    ax.plot(steps, y_a2, label="A", color="C0", linewidth=1.2, marker="o", markersize=3)
-    ax.plot(steps, y_b, label="B", color="C1", linewidth=1.2, marker="s", markersize=3)
-    ax.set_ylabel(ylab_cm)
+    ax.plot(steps, diff_ab, color="C2", linewidth=1.2, marker="o", markersize=3, label="A − B")
+    ax.axhline(0.0, color="0.5", linewidth=0.8, linestyle="--", alpha=0.8)
+    ax.set_ylabel(f"A − B ({ylab_cm})")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
-    ax.set_title("A vs B: cosine mean vs step")
-    p = _name("09_cosine_mean_A_vs_B")
+    ax.set_title("cosine mean difference (A − B) vs step")
+    p = _name("11_cosine_mean_diff_A_minus_B")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
     written.append(p)
