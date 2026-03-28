@@ -24,6 +24,18 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _sync_device_after_optimizer(device: "torch.device") -> None:
+    r"""Ensure optimizer.step() has finished updating parameters before the next forward.
+
+    Without this, CUDA/MPS async execution can make the post-step forward read stale
+    weights, yielding zero delta_H / delta_cos / delta_logit.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
 def _unwrap_model(model: "torch.nn.Module") -> "torch.nn.Module":
     m = model
     while hasattr(m, "module"):
@@ -196,7 +208,11 @@ class LogitsAnalysisCallback(TrainerCallback):
                 seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
             )
             H, mc, ml = _compute_metrics(logits, max_cos)
-        self._metrics_before = {"H": H, "max_cos": mc, "max_logit": ml}
+        self._metrics_before = {
+            "H": H.detach().clone(),
+            "max_cos": mc.detach().clone(),
+            "max_logit": ml.detach().clone(),
+        }
         return control
 
     def on_optimizer_step(
@@ -218,6 +234,8 @@ class LogitsAnalysisCallback(TrainerCallback):
         batch = getattr(self._trainer, "_logits_analysis_batch", None)
         if batch is None:
             return control
+
+        _sync_device_after_optimizer(batch["input_ids"].device)
 
         model = self._trainer.accelerator.unwrap_model(self._trainer.model, keep_torch_compile=False)
         unwrapped = _unwrap_model(model)
