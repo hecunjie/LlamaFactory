@@ -73,10 +73,14 @@ def _max_abs_param_delta(
 
 
 def _sync_device_after_optimizer(device: "torch.device") -> None:
-    r"""Ensure optimizer.step() has finished updating parameters before the next forward.
+    r"""Synchronize the device stream (CUDA/MPS).
 
-    Without this, CUDA/MPS async execution can make the post-step forward read stale
-    weights, yielding zero delta_H / delta_cos / delta_logit.
+    Call **after** ``optimizer.step()`` so the next forward reads updated weights; also call
+    **before** the pre-step analysis forward so backward kernels have finished before we
+    snapshot parameters and run extra eval forwards.
+
+    Without this, async execution can make forwards read stale weights or gradients, yielding
+    zero ``delta_*`` metrics that look like "no training effect".
     """
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -326,13 +330,17 @@ class LogitsAnalysisCallback(TrainerCallback):
 
         Returns ``logits`` and final-norm ``hidden`` (for fp32 LM-head dot checks vs bf16 ``outputs.logits``).
         """
-        model = self._trainer.model
-        was_training = model.training
-        model.eval()
+        # Use the same unwrapped module as ``on_train_begin`` (hook on ``norm``): forwarding
+        # ``trainer.model`` can hit ``torch.compile`` / wrappers so submodule hooks or weight
+        # reads diverge from eager params, producing identical pre/post logits despite updates.
+        wrapped = self._trainer.model
+        was_training = wrapped.training
+        wrapped.eval()
+        inner = self._trainer.accelerator.unwrap_model(wrapped, keep_torch_compile=False)
         try:
             self._hidden_cache.clear()
             with torch.no_grad():
-                outputs = model(**fwd)
+                outputs = inner(**fwd)
                 logits = outputs.logits
                 logits_fp64_sum = float(logits.detach().double().sum().item())
                 logits_fp64_absmax = float(logits.detach().double().abs().max().item())
@@ -348,14 +356,15 @@ class LogitsAnalysisCallback(TrainerCallback):
                 return H, mc, ml, logits_fp64_sum, logits_fp64_absmax, logits, hidden
         finally:
             if was_training:
-                model.train()
+                wrapped.train()
 
     def _hook_fn(self, module: Any, inp: Any, output: Any) -> None:
         if isinstance(output, tuple):
             t = output[0]
         else:
             t = output
-        self._hidden_cache["last_ln"] = t.detach()
+        # Clone so we never alias activations that may be reused in-place on the next forward.
+        self._hidden_cache["last_ln"] = t.detach().clone()
 
     def on_train_begin(
         self,
@@ -403,6 +412,8 @@ class LogitsAnalysisCallback(TrainerCallback):
         batch = getattr(self._trainer, "_logits_analysis_batch", None)
         if batch is None:
             return control
+
+        _sync_device_after_optimizer(batch["input_ids"].device)
 
         opt = getattr(self._trainer, "optimizer", None)
         if opt is not None and len(opt.param_groups) > 0:

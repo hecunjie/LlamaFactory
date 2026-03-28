@@ -1185,10 +1185,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             total_loss = loss_answer + self.align_loss_weight * align_loss
             if getattr(self.finetuning_args, "logits_analysis_in_sft", False):
+                labels_b = inputs.get("labels")
                 self._logits_analysis_batch = {
-                    "input_ids": inputs["input_ids"],
-                    "attention_mask": inputs["attention_mask"],
-                    "labels": inputs.get("labels"),
+                    "input_ids": inputs["input_ids"].detach().clone(),
+                    "attention_mask": inputs["attention_mask"].detach().clone(),
+                    "labels": labels_b.detach().clone() if labels_b is not None else None,
                 }
 
         if self.use_ortho_loss:
