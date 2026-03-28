@@ -38,10 +38,18 @@ def _ordered_trainable_named_params(unwrapped: "torch.nn.Module") -> list[tuple[
 def _build_param_snapshot_pairs(
     ordered: list[tuple[str, "torch.nn.Parameter"]],
 ) -> list[tuple[str, "torch.Tensor"]]:
+    r"""Clone trainable tensors up to global numel budget.
+
+    Skip any single tensor larger than the budget (e.g. full ``embed_tokens``), otherwise the
+    first huge param caused ``break`` with an **empty** list and ``max_abs_trainable_param_delta``
+    stayed ``null`` while LoRA weights were never snapshotted.
+    """
     pairs: list[tuple[str, "torch.Tensor"]] = []
     total_numel = 0
     for name, p in ordered:
         n = p.numel()
+        if n > _MAX_PARAM_SNAPSHOT_NUMEL:
+            continue
         if total_numel + n > _MAX_PARAM_SNAPSHOT_NUMEL:
             break
         pairs.append((name, p.detach().cpu().clone()))
@@ -330,6 +338,7 @@ class LogitsAnalysisCallback(TrainerCallback):
             return control
         lm_w = out_emb.weight
 
+        n_param_snapshots = len(self._param_snapshot_pairs)
         param_delta_max: Optional[float] = None
         if self._param_snapshot_pairs:
             param_delta_max = _max_abs_param_delta(unwrapped, self._param_snapshot_pairs)
@@ -384,6 +393,7 @@ class LogitsAnalysisCallback(TrainerCallback):
             "step": completed_step,
             "optimizer_lr": self._optimizer_lr_before_step,
             "trainable_named_param_count": trainable_n,
+            "param_snapshot_tensor_count": n_param_snapshots,
             "max_abs_trainable_param_delta": param_delta_max,
             "mean_abs_delta_logit_masked": mean_abs_dl,
             "logits_fp64_sum_before": ls0,
