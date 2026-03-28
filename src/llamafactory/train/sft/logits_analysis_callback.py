@@ -317,6 +317,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         self._warned_no_norm: bool = False
         self._param_snapshot_pairs: list[tuple[str, "torch.Tensor"]] = []
         self._optimizer_lr_before_step: Optional[float] = None
+        self._pre_step_diag: dict[str, Any] = {}
 
     def attach_trainer(self, trainer: Any) -> None:
         self._trainer = trainer
@@ -431,6 +432,33 @@ class LogitsAnalysisCallback(TrainerCallback):
 
         ordered = _ordered_trainable_named_params(unwrapped)
         self._param_snapshot_pairs = _build_param_snapshot_pairs(ordered)
+
+        # ── Diagnostics captured before the optimizer step ──────────────────────
+        # 1. Gradient norm: non-zero means gradients are flowing.
+        # 2. Direct fp32 param element: we read the EXACT float32 value of the
+        #    first element of the first snapshotted parameter right now (before step)
+        #    and re-read it after the step.  If the two readings differ, the optimizer
+        #    DID update the parameter that `inner` references; the delta just might be
+        #    below bf16 ULP.  If they match EXACTLY (in float32), the optimizer either
+        #    did not run or is writing to a DIFFERENT set of parameter tensors than
+        #    what `inner` uses for forward — that would be the real code/setup bug.
+        _sample_grad_norm: Optional[float] = None
+        _sample_param_mean_abs: Optional[float] = None
+        _direct_param_name: Optional[str] = None
+        _direct_param_fp32_before: Optional[float] = None
+        for name, p in ordered[:min(5, len(ordered))]:
+            if _direct_param_name is None:
+                _direct_param_name = name
+                _direct_param_fp32_before = float(p.detach().float().flatten()[0].item())
+            if p.grad is not None and _sample_grad_norm is None:
+                _sample_grad_norm = float(p.grad.detach().float().norm().item())
+                _sample_param_mean_abs = float(p.detach().float().abs().mean().item())
+        self._pre_step_diag = {
+            "sample_grad_norm": _sample_grad_norm,
+            "sample_param_mean_abs": _sample_param_mean_abs,
+            "direct_param_name": _direct_param_name,
+            "direct_param_fp32_before": _direct_param_fp32_before,
+        }
 
         fwd: dict[str, Any] = {
             "input_ids": batch["input_ids"],
@@ -554,12 +582,53 @@ class LogitsAnalysisCallback(TrainerCallback):
             return control
 
         trainable_n = sum(1 for _, p in unwrapped.named_parameters() if p.requires_grad)
+
+        diag = self._pre_step_diag
+        sample_grad_norm = diag.get("sample_grad_norm")
+        sample_param_mean_abs = diag.get("sample_param_mean_abs")
+        bf16_ulp_estimate: Optional[float] = None
+        if sample_param_mean_abs is not None:
+            bf16_ulp_estimate = sample_param_mean_abs / 128.0
+
+        # Re-read the same parameter element we recorded before the step (in fp32).
+        # This is the DEFINITIVE check: if diag_direct_param_fp32_delta == 0.0 even in
+        # float32 at LR ~5e-4, the optimizer is NOT writing to the tensors that `inner`
+        # uses for forward.  That means there is a model/optimizer decoupling bug
+        # (e.g. FSDP shard vs. full-param mismatch, or compiled-model param aliasing).
+        # If delta != 0 but below bf16 ULP → pure precision issue.
+        _direct_param_name = diag.get("direct_param_name")
+        _direct_param_fp32_before = diag.get("direct_param_fp32_before")
+        _direct_param_fp32_after: Optional[float] = None
+        if _direct_param_name is not None:
+            _name_to_p = dict(unwrapped.named_parameters())
+            _p_direct = _name_to_p.get(_direct_param_name)
+            if _p_direct is not None:
+                _direct_param_fp32_after = float(_p_direct.detach().float().flatten()[0].item())
+        _direct_param_fp32_delta: Optional[float] = None
+        if _direct_param_fp32_before is not None and _direct_param_fp32_after is not None:
+            _direct_param_fp32_delta = _direct_param_fp32_after - _direct_param_fp32_before
+
+        self._pre_step_diag = {}
+
         record: dict[str, Any] = {
             "step": completed_step,
             "optimizer_lr": self._optimizer_lr_before_step,
             "trainable_named_param_count": trainable_n,
             "param_snapshot_tensor_count": n_param_snapshots,
             "max_abs_trainable_param_delta": param_delta_max,
+            "diag_sample_grad_norm": sample_grad_norm,
+            "diag_sample_param_mean_abs": sample_param_mean_abs,
+            "diag_bf16_ulp_estimate": bf16_ulp_estimate,
+            "diag_direct_param_name": _direct_param_name,
+            "diag_direct_param_fp32_before": _direct_param_fp32_before,
+            "diag_direct_param_fp32_after": _direct_param_fp32_after,
+            "diag_direct_param_fp32_delta": _direct_param_fp32_delta,
+            "diag_note": (
+                "KEY DIAGNOSTIC: if diag_direct_param_fp32_delta == 0.0 at LR > 1e-4, "
+                "the optimizer is updating a DIFFERENT set of tensors than `inner` uses for "
+                "forward (FSDP/ZeRO3 shard mismatch, compile aliasing, etc). "
+                "If delta != 0 but |delta| < diag_bf16_ulp_estimate, it is a bf16 precision issue."
+            ),
             "mean_abs_delta_logit_masked": mean_abs_dl,
             "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
             "logits_focus_positions_n": len(logits_focus_per_position),
