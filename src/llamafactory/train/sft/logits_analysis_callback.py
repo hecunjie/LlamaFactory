@@ -445,31 +445,39 @@ class LogitsAnalysisCallback(TrainerCallback):
         ordered = _ordered_trainable_named_params(unwrapped)
         self._param_snapshot_pairs = _build_param_snapshot_pairs(ordered)
 
-        # ── Diagnostics captured before the optimizer step ──────────────────────
-        # 1. Gradient norm: non-zero means gradients are flowing.
-        # 2. Direct fp32 param element: we read the EXACT float32 value of the
-        #    first element of the first snapshotted parameter right now (before step)
-        #    and re-read it after the step.  If the two readings differ, the optimizer
-        #    DID update the parameter that `inner` references; the delta just might be
-        #    below bf16 ULP.  If they match EXACTLY (in float32), the optimizer either
-        #    did not run or is writing to a DIFFERENT set of parameter tensors than
-        #    what `inner` uses for forward — that would be the real code/setup bug.
+        # ── Diagnostics: snapshot multiple param elements in fp32 before step ──
         _sample_grad_norm: Optional[float] = None
         _sample_param_mean_abs: Optional[float] = None
         _direct_param_name: Optional[str] = None
         _direct_param_fp32_before: Optional[float] = None
+        _multi_param_fp32_before: list[tuple[str, int, float]] = []
         for name, p in ordered[:min(5, len(ordered))]:
             if _direct_param_name is None:
                 _direct_param_name = name
                 _direct_param_fp32_before = float(p.detach().float().flatten()[0].item())
+            n_elem = min(3, p.numel())
+            flat = p.detach().float().flatten()
+            for ei in range(n_elem):
+                _multi_param_fp32_before.append((name, ei, float(flat[ei].item())))
             if p.grad is not None and _sample_grad_norm is None:
                 _sample_grad_norm = float(p.grad.detach().float().norm().item())
                 _sample_param_mean_abs = float(p.detach().float().abs().mean().item())
+
+        # Also try reading from the DeepSpeed engine's fp32 flat buffer if available
+        _ds_fp32_before: Optional[float] = None
+        _ds_engine = self._trainer.model
+        if hasattr(_ds_engine, "optimizer") and hasattr(_ds_engine.optimizer, "fp32_partitioned_groups_flat"):
+            fp32_groups = _ds_engine.optimizer.fp32_partitioned_groups_flat
+            if fp32_groups and len(fp32_groups) > 0 and fp32_groups[0] is not None:
+                _ds_fp32_before = float(fp32_groups[0].flatten()[0].item())
+
         self._pre_step_diag = {
             "sample_grad_norm": _sample_grad_norm,
             "sample_param_mean_abs": _sample_param_mean_abs,
             "direct_param_name": _direct_param_name,
             "direct_param_fp32_before": _direct_param_fp32_before,
+            "multi_param_fp32_before": _multi_param_fp32_before,
+            "ds_fp32_before": _ds_fp32_before,
         }
 
         fwd: dict[str, Any] = {
@@ -602,23 +610,50 @@ class LogitsAnalysisCallback(TrainerCallback):
         if sample_param_mean_abs is not None:
             bf16_ulp_estimate = sample_param_mean_abs / 128.0
 
-        # Re-read the same parameter element we recorded before the step (in fp32).
-        # This is the DEFINITIVE check: if diag_direct_param_fp32_delta == 0.0 even in
-        # float32 at LR ~5e-4, the optimizer is NOT writing to the tensors that `inner`
-        # uses for forward.  That means there is a model/optimizer decoupling bug
-        # (e.g. FSDP shard vs. full-param mismatch, or compiled-model param aliasing).
-        # If delta != 0 but below bf16 ULP → pure precision issue.
+        # ── Re-read params after optimizer.step() and compare ──────────────────
         _direct_param_name = diag.get("direct_param_name")
         _direct_param_fp32_before = diag.get("direct_param_fp32_before")
+        _name_to_p = dict(unwrapped.named_parameters())
+
         _direct_param_fp32_after: Optional[float] = None
         if _direct_param_name is not None:
-            _name_to_p = dict(unwrapped.named_parameters())
             _p_direct = _name_to_p.get(_direct_param_name)
             if _p_direct is not None:
                 _direct_param_fp32_after = float(_p_direct.detach().float().flatten()[0].item())
         _direct_param_fp32_delta: Optional[float] = None
         if _direct_param_fp32_before is not None and _direct_param_fp32_after is not None:
             _direct_param_fp32_delta = _direct_param_fp32_after - _direct_param_fp32_before
+
+        _multi_before = diag.get("multi_param_fp32_before", [])
+        _multi_deltas: list[dict[str, Any]] = []
+        for pname, eidx, val_before in _multi_before:
+            _pp = _name_to_p.get(pname)
+            if _pp is not None and eidx < _pp.numel():
+                val_after = float(_pp.detach().float().flatten()[eidx].item())
+                _multi_deltas.append({
+                    "name": pname, "idx": eidx,
+                    "before": val_before, "after": val_after,
+                    "delta": val_after - val_before,
+                })
+
+        # DeepSpeed fp32 master weight check
+        _ds_fp32_before = diag.get("ds_fp32_before")
+        _ds_fp32_after: Optional[float] = None
+        _ds_fp32_delta: Optional[float] = None
+        _ds_engine = self._trainer.model
+        if hasattr(_ds_engine, "optimizer") and hasattr(_ds_engine.optimizer, "fp32_partitioned_groups_flat"):
+            fp32_groups = _ds_engine.optimizer.fp32_partitioned_groups_flat
+            if fp32_groups and len(fp32_groups) > 0 and fp32_groups[0] is not None:
+                _ds_fp32_after = float(fp32_groups[0].flatten()[0].item())
+        if _ds_fp32_before is not None and _ds_fp32_after is not None:
+            _ds_fp32_delta = _ds_fp32_after - _ds_fp32_before
+
+        # Check if the callback was actually called (timing verification)
+        _callback_called_at = {
+            "pre_optimizer_step": True,
+            "optimizer_step": True,
+            "global_step_at_post": int(state.global_step),
+        }
 
         self._pre_step_diag = {}
 
@@ -635,16 +670,20 @@ class LogitsAnalysisCallback(TrainerCallback):
             "diag_direct_param_fp32_before": _direct_param_fp32_before,
             "diag_direct_param_fp32_after": _direct_param_fp32_after,
             "diag_direct_param_fp32_delta": _direct_param_fp32_delta,
+            "diag_multi_param_deltas": _multi_deltas[:10],
+            "diag_ds_fp32_master_before": _ds_fp32_before,
+            "diag_ds_fp32_master_after": _ds_fp32_after,
+            "diag_ds_fp32_master_delta": _ds_fp32_delta,
+            "diag_callback_timing": _callback_called_at,
             "diag_note": (
-                "KEY DIAGNOSTIC: "
-                "(A) diag_sample_grad_norm=null → p.grad is None for all checked params. "
-                "Normal with DeepSpeed/ZeRO (DS stores grads internally); abnormal for single-GPU vanilla PyTorch. "
-                "(B) diag_direct_param_fp32_delta=0.0 at LR>1e-4 → the optimizer did NOT update the bare-model "
-                "parameter tensors (e.g. ZeRO-3 fp32 masters are separate; DS step writes back to shards but "
-                "the shard element [0] belongs to a different rank). "
-                "(C) If delta!=0 but |delta|<diag_bf16_ulp_estimate → pure bf16 precision floor. "
-                "Analysis forwards now go through trainer.model (wrapped, DeepSpeed-aware) to ensure "
-                "correct parameter gathering; logits_fp64_sum_delta is the most reliable change indicator."
+                "NEW DIAGNOSTICS: "
+                "(1) diag_multi_param_deltas: fp32 before/after for multiple param elements. "
+                "If ALL are 0.0, optimizer.step() is not writing back to model params. "
+                "(2) diag_ds_fp32_master_before/after/delta: reads DeepSpeed's internal fp32 "
+                "master weight buffer directly. If ds_delta != 0 but param_delta == 0, "
+                "DeepSpeed updated its masters but did NOT copy back to bf16 model params. "
+                "(3) If ds_fp32 fields are null, DeepSpeed engine does not expose "
+                "fp32_partitioned_groups_flat (check ZeRO stage or DS version)."
             ),
             "mean_abs_delta_logit_masked": mean_abs_dl,
             "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
