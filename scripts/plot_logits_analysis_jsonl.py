@@ -8,6 +8,11 @@ r"""Merge all logits-analysis jsonl under a directory and plot metrics vs ``step
 Each file may contain only one JSON line. All lines are merged, sorted by ``step``.
 **Each subplot is saved as its own PNG** (6 files by default).
 
+Also writes ``{basename}_contrast_stats.json`` with **paired contrast stats** (A vs D, A vs B):
+per-step difference ``group_left - group_right``, then mean / variance of that difference and a
+**one-sample t-test** vs 0 (``scipy.stats.ttest_1samp``). Use ``--no_contrast`` to skip;
+``--contrast_full`` adds per-step arrays (large).
+
 Example::
 
     python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs
@@ -25,9 +30,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import warnings
 from pathlib import Path
 from typing import Any, Optional
+
+import numpy as np
 
 
 def _get(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -106,12 +114,126 @@ def _group_label(rows: list[dict[str, Any]], gid: str) -> str:
     return gid
 
 
-def _save_figure(path: Path, dpi: int) -> None:
-    import matplotlib.pyplot as plt
+# (field under each group, stat key) — same metrics as in plots.
+_CONTRAST_METRICS: tuple[tuple[str, str], ...] = (
+    ("delta_entropy", "mean_abs"),
+    ("delta_entropy", "mean"),
+    ("delta_max_logit", "mean_abs"),
+    ("delta_max_logit", "mean"),
+    ("delta_max_cosine", "mean_abs"),
+    ("delta_max_cosine", "mean"),
+)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close()
+
+def _paired_diff_series(
+    rows: list[dict[str, Any]],
+    g_left: str,
+    g_right: str,
+    field: str,
+    stat: str,
+) -> tuple[list[float], list[int]]:
+    r"""Per step: ``value_left - value_right`` when both finite."""
+    diffs: list[float] = []
+    steps_out: list[int] = []
+    for r in rows:
+        v1 = _get(r, "groups", g_left, field, stat)
+        v2 = _get(r, "groups", g_right, field, stat)
+        if v1 is None or v2 is None:
+            continue
+        f1, f2 = float(v1), float(v2)
+        if math.isnan(f1) or math.isnan(f2):
+            continue
+        diffs.append(f1 - f2)
+        steps_out.append(int(r.get("step", 0)))
+    return diffs, steps_out
+
+
+def _summarize_diffs(diffs: list[float]) -> dict[str, Any]:
+    r"""Mean, population variance, sample variance / std; t-test vs 0 if ``n >= 2``."""
+    arr = np.asarray(diffs, dtype=np.float64)
+    n = int(arr.size)
+    if n == 0:
+        return {
+            "n_paired": 0,
+            "diff_mean": None,
+            "diff_variance_population": None,
+            "diff_variance_sample": None,
+            "diff_std_sample": None,
+            "paired_ttest_vs_zero": None,
+        }
+    mean = float(arr.mean())
+    var_pop = float(arr.var(ddof=0))
+    var_sam = float(arr.var(ddof=1)) if n > 1 else float("nan")
+    std_sam = float(arr.std(ddof=1)) if n > 1 else float("nan")
+    tinfo: Optional[dict[str, Any]] = None
+    if n >= 2:
+        from scipy import stats
+
+        tstat, pval = stats.ttest_1samp(arr, popmean=0.0, alternative="two-sided")
+        tinfo = {
+            "statistic": float(tstat),
+            "pvalue_two_sided": float(pval),
+            "significant_at_0.05": bool(pval < 0.05),
+            "significant_at_0.01": bool(pval < 0.01),
+            "note": (
+                "H0: mean(step-wise diff)=0; paired steps only. "
+                "Low n ⇒ low power; interpret with care."
+            ),
+        }
+    else:
+        tinfo = {
+            "statistic": None,
+            "pvalue_two_sided": None,
+            "note": "Need n>=2 steps for t-test.",
+        }
+    return {
+        "n_paired": n,
+        "diff_mean": mean,
+        "diff_variance_population": var_pop,
+        "diff_variance_sample": var_sam,
+        "diff_std_sample": std_sam,
+        "paired_ttest_vs_zero": tinfo,
+    }
+
+
+def compute_group_contrasts(
+    rows: list[dict[str, Any]],
+    *,
+    include_per_step_series: bool = False,
+) -> dict[str, Any]:
+    r"""A vs D and A vs B for each metric; JSON-serializable."""
+    out: dict[str, Any] = {
+        "description": (
+            "Per metric: at each step, diff = group_left - group_right. "
+            "Then mean / variance of diff across steps; one-sample t-test H0: mean(diff)=0 "
+            "(same as paired t-test on left vs right)."
+        ),
+        "pairs": {},
+    }
+    for pair_name, g1, g2 in (
+        ("A_vs_D", "A", "D"),
+        ("A_vs_B", "A", "B"),
+    ):
+        metrics_out: dict[str, Any] = {}
+        for field, stat in _CONTRAST_METRICS:
+            diffs, step_list = _paired_diff_series(rows, g1, g2, field, stat)
+            key = f"{field}_{stat}"
+            block: dict[str, Any] = {
+                "group_left": g1,
+                "group_right": g2,
+                "definition": f"({g1}.{field}.{stat} - {g2}.{field}.{stat}) per step",
+                **_summarize_diffs(diffs),
+            }
+            if include_per_step_series:
+                block["steps"] = step_list
+                block["diff_per_step"] = diffs
+            metrics_out[key] = block
+        out["pairs"][pair_name] = {
+            "group_left": g1,
+            "group_right": g2,
+            "metrics": metrics_out,
+        }
+    return out
 
 
 def plot_and_save_separate(
@@ -261,6 +383,49 @@ def plot_and_save_separate(
     return written
 
 
+def _print_contrast_summary(contrast: dict[str, Any]) -> None:
+    r"""Short human-readable summary (mean diff, var, p-value) for key metrics."""
+
+    def _fmt(x: Any) -> str:
+        if x is None:
+            return "n/a"
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return "n/a"
+        try:
+            return f"{float(x):.6g}"
+        except (TypeError, ValueError):
+            return str(x)
+
+    pairs = contrast.get("pairs") or {}
+    headline = (
+        "Contrast summary (A−D, A−B): diff = left_group − right_group per step; "
+        "mean/var of diff; t-test H0: mean(diff)=0"
+    )
+    print(headline)
+    for pname in ("A_vs_D", "A_vs_B"):
+        block = pairs.get(pname)
+        if not block:
+            continue
+        print(f"\n[{pname}] {block.get('group_left')} vs {block.get('group_right')}")
+        metrics = block.get("metrics") or {}
+        for mkey in (
+            "delta_entropy_mean_abs",
+            "delta_max_logit_mean_abs",
+            "delta_max_cosine_mean_abs",
+        ):
+            m = metrics.get(mkey)
+            if not m:
+                continue
+            tt = m.get("paired_ttest_vs_zero") or {}
+            pval = tt.get("pvalue_two_sided")
+            sig = tt.get("significant_at_0.05")
+            print(
+                f"  {mkey}: n={m.get('n_paired')} mean_diff={_fmt(m.get('diff_mean'))} "
+                f"var_pop={_fmt(m.get('diff_variance_population'))} "
+                f"p_two_sided={pval if pval is not None else 'n/a'} sig_0.05={sig}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Merge all jsonl records under a directory and plot vs step; save each subplot as its own PNG."
@@ -299,6 +464,16 @@ def main() -> None:
         help="Glob under input_dir (default: *.jsonl).",
     )
     parser.add_argument("--dpi", type=int, default=150, help="PNG resolution (default: 150).")
+    parser.add_argument(
+        "--no_contrast",
+        action="store_true",
+        help="Do not write {basename}_contrast_stats.json or print A vs D / A vs B stats.",
+    )
+    parser.add_argument(
+        "--contrast_full",
+        action="store_true",
+        help="Include steps and diff_per_step arrays in contrast JSON (large).",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir).resolve()
@@ -339,6 +514,18 @@ def main() -> None:
     for p in paths:
         print(p)
     print(f"done. {len(paths)} PNGs → {out_dir}")
+
+    if not args.no_contrast:
+        contrast = compute_group_contrasts(
+            rows,
+            include_per_step_series=args.contrast_full,
+        )
+        contrast_path = out_dir / f"{basename}_contrast_stats.json"
+        contrast_path.parent.mkdir(parents=True, exist_ok=True)
+        with contrast_path.open("w", encoding="utf-8") as f:
+            json.dump(contrast, f, ensure_ascii=False, indent=2)
+        print(contrast_path)
+        _print_contrast_summary(contrast)
 
 
 if __name__ == "__main__":
