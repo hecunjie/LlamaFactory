@@ -331,17 +331,29 @@ class LogitsAnalysisCallback(TrainerCallback):
 
         Returns ``logits`` and final-norm ``hidden`` (for fp32 LM-head dot checks vs bf16 ``outputs.logits``).
         """
-        # Use the same unwrapped module as ``on_train_begin`` (hook on ``norm``): forwarding
-        # ``trainer.model`` can hit ``torch.compile`` / wrappers so submodule hooks or weight
-        # reads diverge from eager params, producing identical pre/post logits despite updates.
+        # Always forward through the *wrapped* model (trainer.model), not the bare inner module.
+        #
+        # Reason: framework wrappers (DeepSpeed, FSDP) own the "live" parameter tensors.
+        #   • With DeepSpeed ZeRO, gradients are stored internally (p.grad is set to None after
+        #     accumulation) and optimizer.step() writes back to the module through DS internals.
+        #     Calling unwrapped_inner(**fwd) bypasses DS, so the forward sees pre-step weights
+        #     BOTH before and after optimizer.step() → delta is always 0.
+        #   • With FSDP ZeRO-3, full parameters are only materialised during a forward that goes
+        #     through the FSDP wrapper; calling the bare model directly uses the local shard.
+        # The forward hook registered on norm_mod fires regardless because trainer.model internally
+        # calls through to the bare submodule where the hook lives.
+        #
+        # torch.compile: wrapped is the compiled model. Hooks on submodules still fire in eager
+        # fallback; compile mode generally preserves forward hooks unless the module is inlined.
+        # If hooks stop firing (hidden_cache["last_ln"] is None), this returns None and analysis
+        # is skipped for that step (no crash).
         wrapped = self._trainer.model
         was_training = wrapped.training
         wrapped.eval()
-        inner = self._trainer.accelerator.unwrap_model(wrapped, keep_torch_compile=False)
         try:
             self._hidden_cache.clear()
             with torch.no_grad():
-                outputs = inner(**fwd)
+                outputs = wrapped(**fwd)
                 logits = outputs.logits
                 logits_fp64_sum = float(logits.detach().double().sum().item())
                 logits_fp64_absmax = float(logits.detach().double().abs().max().item())
@@ -624,10 +636,15 @@ class LogitsAnalysisCallback(TrainerCallback):
             "diag_direct_param_fp32_after": _direct_param_fp32_after,
             "diag_direct_param_fp32_delta": _direct_param_fp32_delta,
             "diag_note": (
-                "KEY DIAGNOSTIC: if diag_direct_param_fp32_delta == 0.0 at LR > 1e-4, "
-                "the optimizer is updating a DIFFERENT set of tensors than `inner` uses for "
-                "forward (FSDP/ZeRO3 shard mismatch, compile aliasing, etc). "
-                "If delta != 0 but |delta| < diag_bf16_ulp_estimate, it is a bf16 precision issue."
+                "KEY DIAGNOSTIC: "
+                "(A) diag_sample_grad_norm=null → p.grad is None for all checked params. "
+                "Normal with DeepSpeed/ZeRO (DS stores grads internally); abnormal for single-GPU vanilla PyTorch. "
+                "(B) diag_direct_param_fp32_delta=0.0 at LR>1e-4 → the optimizer did NOT update the bare-model "
+                "parameter tensors (e.g. ZeRO-3 fp32 masters are separate; DS step writes back to shards but "
+                "the shard element [0] belongs to a different rank). "
+                "(C) If delta!=0 but |delta|<diag_bf16_ulp_estimate → pure bf16 precision floor. "
+                "Analysis forwards now go through trainer.model (wrapped, DeepSpeed-aware) to ensure "
+                "correct parameter gathering; logits_fp64_sum_delta is the most reliable change indicator."
             ),
             "mean_abs_delta_logit_masked": mean_abs_dl,
             "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
