@@ -126,9 +126,38 @@ class LogitsAnalysisCallback(TrainerCallback):
         self._hidden_cache: dict[str, "torch.Tensor"] = {}
         self._metrics_before: Optional[dict[str, "torch.Tensor"]] = None
         self._warned_no_norm: bool = False
+        self._param_snapshot: Optional["torch.Tensor"] = None
+        self._optimizer_lr_before_step: Optional[float] = None
 
     def attach_trainer(self, trainer: Any) -> None:
         self._trainer = trainer
+
+    def _run_analysis_forward(
+        self,
+        fwd: dict[str, Any],
+        lm_w: "torch.Tensor",
+    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]]:
+        r"""Eval + no_grad: deterministic in weight (no dropout), then restore train mode."""
+        model = self._trainer.model
+        was_training = model.training
+        model.eval()
+        try:
+            self._hidden_cache.clear()
+            with torch.no_grad():
+                outputs = model(**fwd)
+                logits = outputs.logits
+                hidden = self._hidden_cache.get("last_ln")
+                if hidden is None:
+                    return None
+                max_cos = _max_cosine_vs_vocab(
+                    hidden,
+                    lm_w,
+                    seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
+                )
+                return _compute_metrics(logits, max_cos)
+        finally:
+            if was_training:
+                model.train()
 
     def _hook_fn(self, module: Any, inp: Any, output: Any) -> None:
         if isinstance(output, tuple):
@@ -183,6 +212,13 @@ class LogitsAnalysisCallback(TrainerCallback):
         batch = getattr(self._trainer, "_logits_analysis_batch", None)
         if batch is None:
             return control
+
+        opt = getattr(self._trainer, "optimizer", None)
+        if opt is not None and len(opt.param_groups) > 0:
+            self._optimizer_lr_before_step = float(opt.param_groups[0]["lr"])
+        else:
+            self._optimizer_lr_before_step = None
+
         model = self._trainer.accelerator.unwrap_model(self._trainer.model, keep_torch_compile=False)
         unwrapped = _unwrap_model(model)
         out_emb = unwrapped.get_output_embeddings()
@@ -190,24 +226,21 @@ class LogitsAnalysisCallback(TrainerCallback):
             return control
         lm_w = out_emb.weight
 
-        self._hidden_cache.clear()
+        self._param_snapshot = None
+        for p in unwrapped.parameters():
+            if p.requires_grad:
+                self._param_snapshot = p.detach().clone()
+                break
+
         fwd: dict[str, Any] = {
             "input_ids": batch["input_ids"],
             "attention_mask": batch["attention_mask"],
             "use_cache": False,
         }
-        with torch.no_grad():
-            outputs = self._trainer.model(**fwd)
-            logits = outputs.logits
-            hidden = self._hidden_cache.get("last_ln")
-            if hidden is None:
-                return control
-            max_cos = _max_cosine_vs_vocab(
-                hidden,
-                lm_w,
-                seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
-            )
-            H, mc, ml = _compute_metrics(logits, max_cos)
+        out = self._run_analysis_forward(fwd, lm_w)
+        if out is None:
+            return control
+        H, mc, ml = out
         self._metrics_before = {
             "H": H.detach().clone(),
             "max_cos": mc.detach().clone(),
@@ -244,24 +277,23 @@ class LogitsAnalysisCallback(TrainerCallback):
             return control
         lm_w = out_emb.weight
 
-        self._hidden_cache.clear()
+        param_delta_max: Optional[float] = None
+        if self._param_snapshot is not None:
+            for p in unwrapped.parameters():
+                if p.requires_grad:
+                    param_delta_max = (p.detach() - self._param_snapshot.to(p.device)).abs().max().item()
+                    break
+        self._param_snapshot = None
+
         fwd = {
             "input_ids": batch["input_ids"],
             "attention_mask": batch["attention_mask"],
             "use_cache": False,
         }
-        with torch.no_grad():
-            outputs = self._trainer.model(**fwd)
-            logits = outputs.logits
-            hidden = self._hidden_cache.get("last_ln")
-            if hidden is None:
-                return control
-            max_cos = _max_cosine_vs_vocab(
-                hidden,
-                lm_w,
-                seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
-            )
-            H_a, mc_a, ml_a = _compute_metrics(logits, max_cos)
+        out2 = self._run_analysis_forward(fwd, lm_w)
+        if out2 is None:
+            return control
+        H_a, mc_a, ml_a = out2
 
         H_b, mc_b, ml_b = before["H"], before["max_cos"], before["max_logit"]
         attn = batch["attention_mask"].bool()
@@ -273,6 +305,11 @@ class LogitsAnalysisCallback(TrainerCallback):
         dH = H_a - H_b
         dcos = mc_a - mc_b
         dl = ml_a - ml_b
+
+        if mask.any():
+            mean_abs_dl = float(dl[mask].float().abs().mean().item())
+        else:
+            mean_abs_dl = 0.0
 
         th_e = float(self.finetuning_args.logits_analysis_threshold_entropy)
         th_c = float(self.finetuning_args.logits_analysis_threshold_cosine)
@@ -290,13 +327,17 @@ class LogitsAnalysisCallback(TrainerCallback):
         if not self._trainer.is_world_process_zero():
             return control
 
-        record = {
+        record: dict[str, Any] = {
             "step": completed_step,
+            "optimizer_lr": self._optimizer_lr_before_step,
+            "sample_max_abs_param_delta": param_delta_max,
+            "mean_abs_delta_logit_masked": round(mean_abs_dl, 8),
             "group_A": _group_stats(dH, dcos, dl, g_a),
             "group_B": _group_stats(dH, dcos, dl, g_b),
             "group_C": _group_stats(dH, dcos, dl, g_c),
             "group_D": _group_stats(dH, dcos, dl, g_d),
         }
+        self._optimizer_lr_before_step = None
         out_dir = self.finetuning_args.logits_analysis_output_path
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"analysis_step_{completed_step}_{completed_step}.jsonl")
