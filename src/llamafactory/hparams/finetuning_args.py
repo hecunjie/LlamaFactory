@@ -790,7 +790,10 @@ class FinetuningArguments(
                 "forward per batch and append jsonl lines under ``logits_analysis_output_path/eval/``. "
                 "Eval has no optimizer step, so records use analysis=eval_cluster_snapshot (static H / max_cos / "
                 "max_logit per A–D cluster, not train-time Δ). Requires LogitsAnalysisCallback — enable "
-                "logits_analysis_in_sft or logits_analysis_on_eval."
+                "logits_analysis_in_sft or logits_analysis_on_eval. "
+                "Multiple eval splits (``eval_dataset`` as a dict, e.g. ``validation_a`` / ``validation_b``) are "
+                "supported: HuggingFace passes a distinct ``metric_key_prefix`` per split (e.g. "
+                "``eval_validation_a``), which is stored in each jsonl line and used in the output filename."
             )
         },
     )

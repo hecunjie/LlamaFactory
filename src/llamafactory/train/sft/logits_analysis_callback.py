@@ -33,6 +33,14 @@ def _logits_analysis_phase_dir(base: str, phase: str) -> str:
     return os.path.join(root, phase)
 
 
+def _safe_logits_analysis_filename_component(s: str) -> str:
+    r"""Sanitize ``metric_key_prefix`` for use in jsonl filenames (multi-eval keys stay unique)."""
+    out = str(s)
+    for c in (os.sep, "/", "\\", ":", "*", "?", "\"", "<", ">", "|"):
+        out = out.replace(c, "_")
+    return out.strip() or "eval"
+
+
 def _ordered_trainable_named_params(unwrapped: "torch.nn.Module") -> list[tuple[str, "torch.nn.Parameter"]]:
     r"""LoRA / adapter tensors first so snapshot budget is not eaten by huge embeddings."""
     named = [(n, p) for n, p in unwrapped.named_parameters() if p.requires_grad]
@@ -751,8 +759,9 @@ class LogitsAnalysisCallback(TrainerCallback):
         r"""Single eval forward: static H / max_cos / max_logit by A–D (no optimizer step ⇒ no train-style Δ).
 
         Called from ``CustomSeq2SeqTrainer.prediction_step`` for standard loss eval (not ``predict_with_generate``).
-        Appends one line under ``logits_analysis_output_path/eval/`` to
-        ``eval_logits_analysis_{metric_key_prefix}_step_{global_step}.jsonl``.
+        Appends one line under ``logits_analysis_output_path/eval/`` to a file named
+        ``eval_logits_analysis_{sanitized_prefix}_step_{global_step}.jsonl`` (one file per
+        ``metric_key_prefix``; multiple ``eval_dataset`` dict keys ⇒ distinct prefixes / files).
         """
         if self._trainer is None:
             return
@@ -829,9 +838,10 @@ class LogitsAnalysisCallback(TrainerCallback):
         }
         out_dir = _logits_analysis_phase_dir(self.finetuning_args.logits_analysis_output_path, "eval")
         os.makedirs(out_dir, exist_ok=True)
+        safe_pfx = _safe_logits_analysis_filename_component(metric_key_prefix)
         path = os.path.join(
             out_dir,
-            f"eval_logits_analysis_{metric_key_prefix}_step_{global_step}.jsonl",
+            f"eval_logits_analysis_{safe_pfx}_step_{global_step}.jsonl",
         )
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
