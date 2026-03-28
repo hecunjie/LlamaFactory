@@ -3,18 +3,21 @@
 #
 # Licensed under the Apache License, Version 2.0.
 
-r"""Read logits-analysis jsonl files (clustered_token_deltas) and plot metrics vs step.
+r"""Merge all logits-analysis jsonl under a directory and plot metrics vs ``step``.
+
+Each file may contain only one JSON line (one record per file). All lines are collected,
+merged, sorted by ``step``, and drawn on a **single** figure with ``step`` on the x-axis.
 
 Example::
 
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs --output_dir ./analysis_plots
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs --output ./analysis_plots/curves.png
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,16 +33,38 @@ def _get(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return cur
 
 
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+def _load_all_records(input_dir: Path, pattern: str) -> list[dict[str, Any]]:
+    r"""Read every non-empty line from every matching jsonl file."""
+    files = sorted(input_dir.glob(pattern))
+    if not files:
+        return []
     rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    rows.sort(key=lambda r: int(r.get("step", 0)))
+    for fp in files:
+        with fp.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
     return rows
+
+
+def _merge_sort_by_step(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    r"""Sort by ``step`` ascending; duplicate ``step`` keeps the **last** record (with warning)."""
+    by_step: dict[int, dict[str, Any]] = {}
+    dup = 0
+    for r in rows:
+        s = int(r.get("step", -1))
+        if s in by_step:
+            dup += 1
+        by_step[s] = r
+    if dup:
+        warnings.warn(
+            f"Merged {dup} duplicate step value(s); kept last occurrence per step.",
+            stacklevel=2,
+        )
+    ordered = [by_step[k] for k in sorted(by_step.keys())]
+    return ordered
 
 
 def _series_masked(rows: list[dict[str, Any]], sub: str, stat: str) -> list[Optional[float]]:
@@ -66,7 +91,15 @@ def _steps(rows: list[dict[str, Any]]) -> list[int]:
     return [int(r.get("step", 0)) for r in rows]
 
 
-def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
+def _group_label(rows: list[dict[str, Any]], gid: str) -> str:
+    for r in rows:
+        g = _get(r, "groups", gid)
+        if isinstance(g, dict) and g.get("name"):
+            return f'{gid}: {g["name"]}'
+    return gid
+
+
+def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
     if not rows:
@@ -79,7 +112,7 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     fig.suptitle(title, fontsize=12)
 
     ax = axes[0, 0]
-    ax.plot(steps, lr, color="C0", linewidth=1.2)
+    ax.plot(steps, lr, color="C0", linewidth=1.2, marker="o", markersize=3)
     ax.set_ylabel("optimizer_lr")
     ax.set_xlabel("step")
     ax.set_yscale("log")
@@ -92,7 +125,7 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
         ("|Δmax_logit| (masked)", "delta_max_logit", "C2"),
     ]:
         y = _series_masked(rows, sub, "mean_abs")
-        ax.plot(steps, y, label=name, color=color, linewidth=1.0)
+        ax.plot(steps, y, label=name, color=color, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=8)
@@ -104,10 +137,9 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
 
     ax = axes[1, 0]
     for gid, c in zip(group_ids, colors):
-        g = _get(rows[0], "groups", gid) or {}
-        label = f'{gid}: {g.get("name", gid)}'
+        label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_entropy", "mean_abs")
-        ax.plot(steps, y, label=label, color=c, linewidth=1.0)
+        ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
@@ -116,10 +148,9 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
 
     ax = axes[1, 1]
     for gid, c in zip(group_ids, colors):
-        g = _get(rows[0], "groups", gid) or {}
-        label = f'{gid}: {g.get("name", gid)}'
+        label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_max_logit", "mean_abs")
-        ax.plot(steps, y, label=label, color=c, linewidth=1.0)
+        ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
@@ -128,10 +159,9 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
 
     ax = axes[2, 0]
     for gid, c in zip(group_ids, colors):
-        g = _get(rows[0], "groups", gid) or {}
-        label = f'{gid}: {g.get("name", gid)}'
+        label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_max_cosine", "mean_abs")
-        ax.plot(steps, y, label=label, color=c, linewidth=1.0)
+        ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
@@ -143,15 +173,15 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     pmax_f = [float(x) if x is not None else float("nan") for x in pmax]
     mean_ml = [r.get("mean_abs_delta_max_logit_masked") for r in rows]
     mean_ml_f = [float(x) if x is not None else float("nan") for x in mean_ml]
-    ax.plot(steps, pmax_f, label="max_abs_trainable_param_delta", color="C0", linewidth=1.0)
+    ax.plot(steps, pmax_f, label="max_abs_trainable_param_delta", color="C0", linewidth=1.0, marker="o", markersize=3)
     ax2 = ax.twinx()
-    ax2.plot(steps, mean_ml_f, label="mean_abs_delta_max_logit_masked", color="C1", linewidth=1.0, alpha=0.85)
+    ax2.plot(steps, mean_ml_f, label="mean_abs_delta_max_logit_masked", color="C1", linewidth=1.0, alpha=0.85, marker="s", markersize=3)
     ax.set_ylabel("param_delta", color="C0")
     ax2.set_ylabel("mean_abs_Δmax_logit", color="C1")
     ax.set_xlabel("step")
     ax.tick_params(axis="y", labelcolor="C0")
     ax2.tick_params(axis="y", labelcolor="C1")
-    if all(x == x and x > 0 for x in pmax_f):  # finite and positive
+    if all(x == x and x > 0 for x in pmax_f):
         ax.set_yscale("log")
     lines, labels = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -159,23 +189,26 @@ def plot_file(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.grid(True, alpha=0.3)
     ax.set_title("param / logit delta diagnostics")
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot logits analysis jsonl (clustered_token_deltas) vs step.")
+    parser = argparse.ArgumentParser(
+        description="Merge all jsonl records under a directory and plot vs step (x-axis = step)."
+    )
     parser.add_argument(
         "--input_dir",
         type=str,
         required=True,
-        help="Directory containing *.jsonl from logits_analysis_output_path.",
+        help="Directory containing *.jsonl (one or more lines per file).",
     )
     parser.add_argument(
-        "--output_dir",
+        "--output",
         type=str,
         default=None,
-        help="Directory for output PNGs (default: <input_dir>/plots).",
+        help="Output PNG path (default: <input_dir>/plots/logits_analysis_by_step.png).",
     )
     parser.add_argument(
         "--pattern",
@@ -189,24 +222,22 @@ def main() -> None:
     if not input_dir.is_dir():
         raise SystemExit(f"Not a directory: {input_dir}")
 
-    out_dir = Path(args.output_dir).resolve() if args.output_dir else input_dir / "plots"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = _load_all_records(input_dir, args.pattern)
+    if not raw:
+        raise SystemExit(f"No JSON lines found under {input_dir!s} with pattern {args.pattern!r}")
 
-    files = sorted(input_dir.glob(args.pattern))
-    if not files:
-        raise SystemExit(f"No files matching {args.pattern!r} under {input_dir}")
+    rows = _merge_sort_by_step(raw)
+    n_files = len(list(input_dir.glob(args.pattern)))
 
-    for fp in files:
-        rows = _load_jsonl(fp)
-        if not rows:
-            print(f"skip empty: {fp}")
-            continue
-        safe_stem = fp.stem.replace(" ", "_")
-        png = out_dir / f"{safe_stem}.png"
-        plot_file(rows, title=f"{fp.name} ({len(rows)} points)", out_path=png)
-        print(f"wrote {png}")
+    out_path = (
+        Path(args.output).resolve()
+        if args.output
+        else input_dir / "plots" / "logits_analysis_by_step.png"
+    )
 
-    print(f"done. {len(files)} file(s) -> {out_dir}")
+    title = f"logits analysis (merged {len(rows)} points from {n_files} files, step ∈ [{rows[0].get('step')}, {rows[-1].get('step')}])"
+    plot_merged(rows, title=title, out_path=out_path)
+    print(f"wrote {out_path} ({len(rows)} steps, {n_files} jsonl files)")
 
 
 if __name__ == "__main__":
