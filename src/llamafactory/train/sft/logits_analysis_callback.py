@@ -152,6 +152,95 @@ def _stat_mean_std(t: "torch.Tensor") -> dict[str, float]:
     return {"mean": m, "std": s}
 
 
+def _select_focus_token_ids(
+    logits_row: "torch.Tensor",
+    mode: str,
+    topk: int,
+    prob_threshold: float,
+    max_tokens: int,
+) -> "torch.Tensor":
+    r"""Return vocab ids to track at one position: top-k by prob or prob >= threshold (capped)."""
+    logits_fp = logits_row.float()
+    probs = F.softmax(logits_fp, dim=-1)
+    v = int(probs.numel())
+    if mode == "topk":
+        k = max(1, min(int(topk), v))
+        _, ids = probs.topk(k)
+        return ids.long()
+    # prob_threshold
+    mask = probs >= prob_threshold
+    ids = mask.nonzero(as_tuple=True)[0]
+    if ids.numel() == 0:
+        _, j = probs.max(dim=-1)
+        return j.long().unsqueeze(0)
+    if ids.numel() > max_tokens:
+        sub = probs[ids]
+        _, order = sub.topk(max_tokens)
+        ids = ids[order]
+    return ids.long()
+
+
+def _build_logits_focus_snapshot(
+    logits: "torch.Tensor",
+    mask: "torch.Tensor",
+    finetuning_args: Any,
+) -> list[dict[str, Any]]:
+    r"""Per masked position: pick token ids (topk or prob threshold), store logits_before."""
+    max_pos = int(getattr(finetuning_args, "logits_analysis_max_positions", 256))
+    mode = str(getattr(finetuning_args, "logits_analysis_focus_mode", "topk"))
+    topk = int(getattr(finetuning_args, "logits_analysis_focus_topk", 10))
+    pth = float(getattr(finetuning_args, "logits_analysis_focus_prob_threshold", 0.01))
+    max_tok = int(getattr(finetuning_args, "logits_analysis_focus_max_tokens", 32))
+    idx = mask.nonzero(as_tuple=False)
+    if max_pos > 0 and idx.size(0) > max_pos:
+        idx = idx[:max_pos]
+    out: list[dict[str, Any]] = []
+    for i in range(idx.size(0)):
+        b, s = int(idx[i, 0].item()), int(idx[i, 1].item())
+        row = logits[b, s, :]
+        ids = _select_focus_token_ids(row, mode, topk, pth, max_tok)
+        lb = row[ids].detach().float().cpu()
+        out.append(
+            {
+                "b": b,
+                "s": s,
+                "token_ids": ids.cpu().tolist(),
+                "logits_before": lb.tolist(),
+            }
+        )
+    return out
+
+
+def _complete_logits_focus_after(
+    logits_after: "torch.Tensor",
+    focus_before: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], Optional[float], Optional[float]]:
+    r"""Fill logits_after and delta_logits; return (per_position list, mean_abs, max_abs)."""
+    per: list[dict[str, Any]] = []
+    flat_abs: list["torch.Tensor"] = []
+    for ent in focus_before:
+        b, s = ent["b"], ent["s"]
+        ids = torch.tensor(ent["token_ids"], device=logits_after.device, dtype=torch.long)
+        la = logits_after[b, s, ids].detach().float().cpu()
+        lb = torch.tensor(ent["logits_before"], dtype=torch.float32)
+        delta = la - lb
+        flat_abs.append(delta.abs())
+        per.append(
+            {
+                "b": b,
+                "s": s,
+                "token_ids": ent["token_ids"],
+                "logits_before": ent["logits_before"],
+                "logits_after": la.tolist(),
+                "delta_logits": delta.tolist(),
+            }
+        )
+    if not flat_abs:
+        return per, None, None
+    cat = torch.cat([x.flatten() for x in flat_abs])
+    return per, float(cat.mean().item()), float(cat.max().item())
+
+
 def _group_stats(
     delta_h: "torch.Tensor",
     delta_cos: "torch.Tensor",
@@ -191,11 +280,11 @@ class LogitsAnalysisCallback(TrainerCallback):
         self,
         fwd: dict[str, Any],
         lm_w: "torch.Tensor",
-    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float, float]]:
+    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float, float, "torch.Tensor"]]:
         r"""Eval + no_grad: deterministic in weight (no dropout), then restore train mode.
 
-        Also returns fp64 logits fingerprints (sum, max abs) to verify weight updates are visible
-        even when bf16 weights round-trip identically.
+        Returns ``logits`` tensor for optional row-sampled |Δlogit| (full vocab per token).
+        Note: ``logits_fp64_sum`` can stay 0 when positive/negative logit changes cancel across vocab.
         """
         model = self._trainer.model
         was_training = model.training
@@ -216,7 +305,7 @@ class LogitsAnalysisCallback(TrainerCallback):
                     seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
                 )
                 H, mc, ml = _compute_metrics(logits, max_cos)
-                return H, mc, ml, logits_fp64_sum, logits_fp64_absmax
+                return H, mc, ml, logits_fp64_sum, logits_fp64_absmax, logits
         finally:
             if was_training:
                 model.train()
@@ -299,13 +388,21 @@ class LogitsAnalysisCallback(TrainerCallback):
         out = self._run_analysis_forward(fwd, lm_w)
         if out is None:
             return control
-        H, mc, ml, ls0, lmx0 = out
+        H, mc, ml, ls0, lmx0, logits = out
+        attn = batch["attention_mask"].bool()
+        labels = batch.get("labels")
+        mask = attn
+        if labels is not None:
+            mask = mask & labels.ne(IGNORE_INDEX)
+        logits_focus = _build_logits_focus_snapshot(logits, mask, self.finetuning_args)
+
         self._metrics_before = {
             "H": H.detach().clone(),
             "max_cos": mc.detach().clone(),
             "max_logit": ml.detach().clone(),
             "logits_fp64_sum": ls0,
             "logits_fp64_absmax": lmx0,
+            "logits_focus": logits_focus,
         }
         return control
 
@@ -352,7 +449,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         out2 = self._run_analysis_forward(fwd, lm_w)
         if out2 is None:
             return control
-        H_a, mc_a, ml_a, ls1, lmx1 = out2
+        H_a, mc_a, ml_a, ls1, lmx1, logits_a = out2
 
         H_b, mc_b, ml_b = before["H"], before["max_cos"], before["max_logit"]
         ls0 = float(before["logits_fp64_sum"])
@@ -362,6 +459,15 @@ class LogitsAnalysisCallback(TrainerCallback):
         mask = attn
         if labels is not None:
             mask = mask & labels.ne(IGNORE_INDEX)
+
+        focus_before = before.get("logits_focus") or []
+        logits_focus_per_position: list[dict[str, Any]] = []
+        logits_focus_mean_abs: Optional[float] = None
+        logits_focus_max_abs: Optional[float] = None
+        if focus_before:
+            logits_focus_per_position, logits_focus_mean_abs, logits_focus_max_abs = _complete_logits_focus_after(
+                logits_a, focus_before
+            )
 
         dH = H_a - H_b
         dcos = mc_a - mc_b
@@ -396,12 +502,18 @@ class LogitsAnalysisCallback(TrainerCallback):
             "param_snapshot_tensor_count": n_param_snapshots,
             "max_abs_trainable_param_delta": param_delta_max,
             "mean_abs_delta_logit_masked": mean_abs_dl,
+            "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
+            "logits_focus_positions_n": len(logits_focus_per_position),
+            "logits_focus_mean_abs_delta": logits_focus_mean_abs,
+            "logits_focus_max_abs_delta": logits_focus_max_abs,
+            "logits_focus_per_position": logits_focus_per_position,
             "logits_fp64_sum_before": ls0,
             "logits_fp64_sum_after": ls1,
             "logits_fp64_sum_delta": ls1 - ls0,
             "logits_fp64_absmax_before": lmx0,
             "logits_fp64_absmax_after": lmx1,
             "logits_fp64_absmax_delta": lmx1 - lmx0,
+            "note_logits_fp64_sum_can_cancel": True,
             "group_A": _group_stats(dH, dcos, dl, g_a),
             "group_B": _group_stats(dH, dcos, dl, g_b),
             "group_C": _group_stats(dH, dcos, dl, g_c),

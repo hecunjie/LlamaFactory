@@ -732,6 +732,42 @@ class FinetuningArguments(
         default=512,
         metadata={"help": "Sequence chunk size for max-cosine matmul to limit peak memory."},
     )
+    logits_analysis_max_positions: int = field(
+        default=256,
+        metadata={
+            "help": (
+                "Max number of supervised (masked) token positions per step for which to track "
+                "focused logits (top-k or prob threshold). 0 means all masked positions."
+            )
+        },
+    )
+    logits_analysis_focus_mode: Literal["topk", "prob_threshold"] = field(
+        default="topk",
+        metadata={
+            "help": (
+                "How to pick vocabulary ids per position before optimizer.step: "
+                "'topk' = top logits_analysis_focus_topk probs; "
+                "'prob_threshold' = all tokens with prob >= logits_analysis_focus_prob_threshold "
+                "(capped by logits_analysis_focus_max_tokens)."
+            )
+        },
+    )
+    logits_analysis_focus_topk: int = field(
+        default=10,
+        metadata={"help": "When focus_mode=topk, number of highest-probability tokens per position."},
+    )
+    logits_analysis_focus_prob_threshold: float = field(
+        default=0.01,
+        metadata={"help": "When focus_mode=prob_threshold, minimum softmax probability to include."},
+    )
+    logits_analysis_focus_max_tokens: int = field(
+        default=32,
+        metadata={
+            "help": (
+                "When focus_mode=prob_threshold, max tokens per position if many exceed the threshold."
+            )
+        },
+    )
     add_think_token: bool = field(
         default=False,
         metadata={
