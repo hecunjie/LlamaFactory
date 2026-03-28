@@ -5,12 +5,20 @@
 
 r"""Merge all logits-analysis jsonl under a directory and plot metrics vs ``step``.
 
-Each file may contain only one JSON line (one record per file). All lines are collected,
-merged, sorted by ``step``, and drawn on a **single** figure with ``step`` on the x-axis.
+Each file may contain only one JSON line. All lines are merged, sorted by ``step``.
+**Each subplot is saved as its own PNG** (6 files by default).
 
 Example::
 
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs --output ./analysis_plots/curves.png
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs
+
+    # Custom directory and file name prefix
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs \\
+        --output_dir ./figures --basename run1_curves
+
+    # Legacy: --output path/to/name.png → saves as path/to/name_01_*.png ...
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs \\
+        --output ./analysis_plots/curves.png
 """
 
 from __future__ import annotations
@@ -63,8 +71,7 @@ def _merge_sort_by_step(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             f"Merged {dup} duplicate step value(s); kept last occurrence per step.",
             stacklevel=2,
         )
-    ordered = [by_step[k] for k in sorted(by_step.keys())]
-    return ordered
+    return [by_step[k] for k in sorted(by_step.keys())]
 
 
 def _series_masked(rows: list[dict[str, Any]], sub: str, stat: str) -> list[Optional[float]]:
@@ -99,26 +106,54 @@ def _group_label(rows: list[dict[str, Any]], gid: str) -> str:
     return gid
 
 
-def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
+def _save_figure(path: Path, dpi: int) -> None:
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+
+
+def plot_and_save_separate(
+    rows: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    basename: str,
+    subtitle: str,
+    dpi: int = 150,
+) -> list[Path]:
+    r"""Save 6 PNGs: ``{basename}_01_...png`` … ``{basename}_06_...png``."""
     import matplotlib.pyplot as plt
 
     if not rows:
-        return
+        return []
 
     steps = _steps(rows)
     lr = [float(r.get("optimizer_lr") or 0.0) for r in rows]
+    group_ids = ["A", "B", "C", "D"]
+    colors = ["C0", "C1", "C2", "C3"]
+    written: list[Path] = []
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
-    fig.suptitle(title, fontsize=12)
+    def _name(suffix: str) -> Path:
+        return output_dir / f"{basename}_{suffix}.png"
 
-    ax = axes[0, 0]
+    # 01 optimizer lr
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     ax.plot(steps, lr, color="C0", linewidth=1.2, marker="o", markersize=3)
     ax.set_ylabel("optimizer_lr")
     ax.set_xlabel("step")
     ax.set_yscale("log")
+    ax.set_title("optimizer learning rate")
     ax.grid(True, alpha=0.3)
+    p = _name("01_optimizer_lr")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    ax = axes[0, 1]
+    # 02 masked summary
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     for name, sub, color in [
         ("|Δentropy| (masked)", "delta_entropy", "C0"),
         ("|Δmax_cos| (masked)", "delta_max_cosine", "C1"),
@@ -131,11 +166,14 @@ def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
     ax.set_title("masked_summary (mean_abs)")
+    p = _name("02_masked_summary")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    group_ids = ["A", "B", "C", "D"]
-    colors = ["C0", "C1", "C2", "C3"]
-
-    ax = axes[1, 0]
+    # 03 groups entropy
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_entropy", "mean_abs")
@@ -145,8 +183,14 @@ def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: |Δentropy| mean_abs")
+    p = _name("03_groups_entropy")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    ax = axes[1, 1]
+    # 04 groups max logit
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_max_logit", "mean_abs")
@@ -156,8 +200,14 @@ def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: |Δmax_logit| mean_abs")
+    p = _name("04_groups_max_logit")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    ax = axes[2, 0]
+    # 05 groups max cosine
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
         y = _series_group(rows, gid, "delta_max_cosine", "mean_abs")
@@ -167,15 +217,30 @@ def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: |Δmax_cosine| mean_abs")
+    p = _name("05_groups_max_cosine")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    ax = axes[2, 1]
+    # 06 param / logit diagnostics
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
     pmax = [r.get("max_abs_trainable_param_delta") for r in rows]
     pmax_f = [float(x) if x is not None else float("nan") for x in pmax]
     mean_ml = [r.get("mean_abs_delta_max_logit_masked") for r in rows]
     mean_ml_f = [float(x) if x is not None else float("nan") for x in mean_ml]
     ax.plot(steps, pmax_f, label="max_abs_trainable_param_delta", color="C0", linewidth=1.0, marker="o", markersize=3)
     ax2 = ax.twinx()
-    ax2.plot(steps, mean_ml_f, label="mean_abs_delta_max_logit_masked", color="C1", linewidth=1.0, alpha=0.85, marker="s", markersize=3)
+    ax2.plot(
+        steps,
+        mean_ml_f,
+        label="mean_abs_delta_max_logit_masked",
+        color="C1",
+        linewidth=1.0,
+        alpha=0.85,
+        marker="s",
+        markersize=3,
+    )
     ax.set_ylabel("param_delta", color="C0")
     ax2.set_ylabel("mean_abs_Δmax_logit", color="C1")
     ax.set_xlabel("step")
@@ -188,15 +253,17 @@ def plot_merged(rows: list[dict[str, Any]], title: str, out_path: Path) -> None:
     ax.legend(lines + lines2, labels + labels2, loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
     ax.set_title("param / logit delta diagnostics")
+    p = _name("06_param_logit_diagnostics")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+    return written
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Merge all jsonl records under a directory and plot vs step (x-axis = step)."
+        description="Merge all jsonl records under a directory and plot vs step; save each subplot as its own PNG."
     )
     parser.add_argument(
         "--input_dir",
@@ -205,10 +272,25 @@ def main() -> None:
         help="Directory containing *.jsonl (one or more lines per file).",
     )
     parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory for PNG files (overrides --output if both set).",
+    )
+    parser.add_argument(
+        "--basename",
+        type=str,
+        default="logits_analysis_by_step",
+        help="Filename prefix for outputs: {basename}_01_....png (default: logits_analysis_by_step).",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output PNG path (default: <input_dir>/plots/logits_analysis_by_step.png).",
+        help=(
+            "Legacy: path ending in .png → PNGs go next to it with stem as basename "
+            "(e.g. curves.png → curves_01_....png). Non-.png treated as output directory."
+        ),
     )
     parser.add_argument(
         "--pattern",
@@ -216,6 +298,7 @@ def main() -> None:
         default="*.jsonl",
         help="Glob under input_dir (default: *.jsonl).",
     )
+    parser.add_argument("--dpi", type=int, default=150, help="PNG resolution (default: 150).")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir).resolve()
@@ -229,15 +312,33 @@ def main() -> None:
     rows = _merge_sort_by_step(raw)
     n_files = len(list(input_dir.glob(args.pattern)))
 
-    out_path = (
-        Path(args.output).resolve()
-        if args.output
-        else input_dir / "plots" / "logits_analysis_by_step.png"
-    )
+    if args.output_dir is not None:
+        out_dir = Path(args.output_dir).resolve()
+        basename = args.basename
+    elif args.output is not None:
+        op = Path(args.output).resolve()
+        if op.suffix.lower() == ".png":
+            out_dir, basename = op.parent, op.stem
+        else:
+            out_dir, basename = op, args.basename
+    else:
+        out_dir = (input_dir / "plots").resolve()
+        basename = args.basename
 
-    title = f"logits analysis (merged {len(rows)} points from {n_files} files, step ∈ [{rows[0].get('step')}, {rows[-1].get('step')}])"
-    plot_merged(rows, title=title, out_path=out_path)
-    print(f"wrote {out_path} ({len(rows)} steps, {n_files} jsonl files)")
+    subtitle = (
+        f"merged n={len(rows)} steps, files={n_files}, "
+        f"step∈[{rows[0].get('step')}, {rows[-1].get('step')}]"
+    )
+    paths = plot_and_save_separate(
+        rows,
+        output_dir=out_dir,
+        basename=basename,
+        subtitle=subtitle,
+        dpi=args.dpi,
+    )
+    for p in paths:
+        print(p)
+    print(f"done. {len(paths)} PNGs → {out_dir}")
 
 
 if __name__ == "__main__":
