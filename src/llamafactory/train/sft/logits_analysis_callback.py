@@ -180,12 +180,28 @@ def _select_focus_token_ids(
     return ids.long()
 
 
+def _fp32_logits_dots_at_ids(
+    h: "torch.Tensor",
+    W: "torch.Tensor",
+    ids: "torch.Tensor",
+    bias: Optional["torch.Tensor"],
+) -> "torch.Tensor":
+    r"""Replicate LM head at token ids: dot(h, W[k]) + bias[k] in float32 (no bf16 matmul rounding)."""
+    dots = (W[ids].float() * h.float().unsqueeze(0)).sum(dim=-1)
+    if bias is not None:
+        dots = dots + bias[ids].float()
+    return dots
+
+
 def _build_logits_focus_snapshot(
     logits: "torch.Tensor",
     mask: "torch.Tensor",
+    hidden: "torch.Tensor",
+    lm_w: "torch.Tensor",
+    bias: Optional["torch.Tensor"],
     finetuning_args: Any,
 ) -> list[dict[str, Any]]:
-    r"""Per masked position: pick token ids (topk or prob threshold), store logits_before."""
+    r"""Per masked position: pick token ids, store model logits and fp32 LM-head dots (pre-step h, W)."""
     max_pos = int(getattr(finetuning_args, "logits_analysis_max_positions", 256))
     mode = str(getattr(finetuning_args, "logits_analysis_focus_mode", "topk"))
     topk = int(getattr(finetuning_args, "logits_analysis_focus_topk", 10))
@@ -199,13 +215,17 @@ def _build_logits_focus_snapshot(
         b, s = int(idx[i, 0].item()), int(idx[i, 1].item())
         row = logits[b, s, :]
         ids = _select_focus_token_ids(row, mode, topk, pth, max_tok)
-        lb = row[ids].detach().float().cpu()
+        ids_d = ids.to(device=logits.device)
+        lb_model = row[ids_d].detach().float().cpu()
+        h_vec = hidden[b, s]
+        dots_b = _fp32_logits_dots_at_ids(h_vec, lm_w, ids_d, bias).detach().cpu()
         out.append(
             {
                 "b": b,
                 "s": s,
                 "token_ids": ids.cpu().tolist(),
-                "logits_before": lb.tolist(),
+                "logits_model_before": lb_model.tolist(),
+                "logits_fp32_dot_before": dots_b.tolist(),
             }
         )
     return out
@@ -213,32 +233,53 @@ def _build_logits_focus_snapshot(
 
 def _complete_logits_focus_after(
     logits_after: "torch.Tensor",
+    hidden_after: "torch.Tensor",
+    lm_w: "torch.Tensor",
+    bias: Optional["torch.Tensor"],
     focus_before: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], Optional[float], Optional[float]]:
-    r"""Fill logits_after and delta_logits; return (per_position list, mean_abs, max_abs)."""
+) -> tuple[list[dict[str, Any]], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    r"""After step: model logits + fp32 dots; compare to stored before. Returns (per, mean_abs_model, max_abs_model, mean_abs_fp32, max_abs_fp32)."""
     per: list[dict[str, Any]] = []
-    flat_abs: list["torch.Tensor"] = []
+    flat_abs_model: list["torch.Tensor"] = []
+    flat_abs_fp32: list["torch.Tensor"] = []
     for ent in focus_before:
         b, s = ent["b"], ent["s"]
         ids = torch.tensor(ent["token_ids"], device=logits_after.device, dtype=torch.long)
-        la = logits_after[b, s, ids].detach().float().cpu()
-        lb = torch.tensor(ent["logits_before"], dtype=torch.float32)
-        delta = la - lb
-        flat_abs.append(delta.abs())
+        la_model = logits_after[b, s, ids].detach().float()
+        lb_model = torch.tensor(ent["logits_model_before"], dtype=torch.float32, device=logits_after.device)
+        delta_model = la_model - lb_model
+        flat_abs_model.append(delta_model.abs())
+
+        h_a = hidden_after[b, s]
+        dots_a = _fp32_logits_dots_at_ids(h_a, lm_w, ids, bias)
+        dots_b = torch.tensor(ent["logits_fp32_dot_before"], dtype=torch.float32, device=logits_after.device)
+        delta_fp32 = dots_a - dots_b
+        flat_abs_fp32.append(delta_fp32.abs())
+
         per.append(
             {
                 "b": b,
                 "s": s,
                 "token_ids": ent["token_ids"],
-                "logits_before": ent["logits_before"],
-                "logits_after": la.tolist(),
-                "delta_logits": delta.tolist(),
+                "logits_model_before": ent["logits_model_before"],
+                "logits_model_after": la_model.cpu().tolist(),
+                "delta_logits_model": delta_model.cpu().tolist(),
+                "logits_fp32_dot_before": ent["logits_fp32_dot_before"],
+                "logits_fp32_dot_after": dots_a.detach().cpu().tolist(),
+                "delta_logits_fp32_dot": delta_fp32.detach().cpu().tolist(),
             }
         )
-    if not flat_abs:
-        return per, None, None
-    cat = torch.cat([x.flatten() for x in flat_abs])
-    return per, float(cat.mean().item()), float(cat.max().item())
+    if not flat_abs_model:
+        return per, None, None, None, None
+    cat_m = torch.cat([x.flatten() for x in flat_abs_model])
+    cat_f = torch.cat([x.flatten() for x in flat_abs_fp32])
+    return (
+        per,
+        float(cat_m.mean().item()),
+        float(cat_m.max().item()),
+        float(cat_f.mean().item()),
+        float(cat_f.max().item()),
+    )
 
 
 def _group_stats(
@@ -280,11 +321,10 @@ class LogitsAnalysisCallback(TrainerCallback):
         self,
         fwd: dict[str, Any],
         lm_w: "torch.Tensor",
-    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float, float, "torch.Tensor"]]:
+    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float, float, "torch.Tensor", "torch.Tensor"]]:
         r"""Eval + no_grad: deterministic in weight (no dropout), then restore train mode.
 
-        Returns ``logits`` tensor for optional row-sampled |Δlogit| (full vocab per token).
-        Note: ``logits_fp64_sum`` can stay 0 when positive/negative logit changes cancel across vocab.
+        Returns ``logits`` and final-norm ``hidden`` (for fp32 LM-head dot checks vs bf16 ``outputs.logits``).
         """
         model = self._trainer.model
         was_training = model.training
@@ -305,7 +345,7 @@ class LogitsAnalysisCallback(TrainerCallback):
                     seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
                 )
                 H, mc, ml = _compute_metrics(logits, max_cos)
-                return H, mc, ml, logits_fp64_sum, logits_fp64_absmax, logits
+                return H, mc, ml, logits_fp64_sum, logits_fp64_absmax, logits, hidden
         finally:
             if was_training:
                 model.train()
@@ -376,6 +416,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         if out_emb is None:
             return control
         lm_w = out_emb.weight
+        lm_bias: Optional["torch.Tensor"] = getattr(out_emb, "bias", None)
 
         ordered = _ordered_trainable_named_params(unwrapped)
         self._param_snapshot_pairs = _build_param_snapshot_pairs(ordered)
@@ -388,13 +429,13 @@ class LogitsAnalysisCallback(TrainerCallback):
         out = self._run_analysis_forward(fwd, lm_w)
         if out is None:
             return control
-        H, mc, ml, ls0, lmx0, logits = out
+        H, mc, ml, ls0, lmx0, logits, hidden = out
         attn = batch["attention_mask"].bool()
         labels = batch.get("labels")
         mask = attn
         if labels is not None:
             mask = mask & labels.ne(IGNORE_INDEX)
-        logits_focus = _build_logits_focus_snapshot(logits, mask, self.finetuning_args)
+        logits_focus = _build_logits_focus_snapshot(logits, mask, hidden, lm_w, lm_bias, self.finetuning_args)
 
         self._metrics_before = {
             "H": H.detach().clone(),
@@ -434,6 +475,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         if out_emb is None:
             return control
         lm_w = out_emb.weight
+        lm_bias = getattr(out_emb, "bias", None)
 
         n_param_snapshots = len(self._param_snapshot_pairs)
         param_delta_max: Optional[float] = None
@@ -449,7 +491,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         out2 = self._run_analysis_forward(fwd, lm_w)
         if out2 is None:
             return control
-        H_a, mc_a, ml_a, ls1, lmx1, logits_a = out2
+        H_a, mc_a, ml_a, ls1, lmx1, logits_a, hidden_a = out2
 
         H_b, mc_b, ml_b = before["H"], before["max_cos"], before["max_logit"]
         ls0 = float(before["logits_fp64_sum"])
@@ -464,10 +506,16 @@ class LogitsAnalysisCallback(TrainerCallback):
         logits_focus_per_position: list[dict[str, Any]] = []
         logits_focus_mean_abs: Optional[float] = None
         logits_focus_max_abs: Optional[float] = None
+        logits_focus_fp32_mean_abs: Optional[float] = None
+        logits_focus_fp32_max_abs: Optional[float] = None
         if focus_before:
-            logits_focus_per_position, logits_focus_mean_abs, logits_focus_max_abs = _complete_logits_focus_after(
-                logits_a, focus_before
-            )
+            (
+                logits_focus_per_position,
+                logits_focus_mean_abs,
+                logits_focus_max_abs,
+                logits_focus_fp32_mean_abs,
+                logits_focus_fp32_max_abs,
+            ) = _complete_logits_focus_after(logits_a, hidden_a, lm_w, lm_bias, focus_before)
 
         dH = H_a - H_b
         dcos = mc_a - mc_b
@@ -504,8 +552,14 @@ class LogitsAnalysisCallback(TrainerCallback):
             "mean_abs_delta_logit_masked": mean_abs_dl,
             "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
             "logits_focus_positions_n": len(logits_focus_per_position),
-            "logits_focus_mean_abs_delta": logits_focus_mean_abs,
-            "logits_focus_max_abs_delta": logits_focus_max_abs,
+            "logits_focus_mean_abs_delta_model": logits_focus_mean_abs,
+            "logits_focus_max_abs_delta_model": logits_focus_max_abs,
+            "logits_focus_mean_abs_delta_fp32_dot": logits_focus_fp32_mean_abs,
+            "logits_focus_max_abs_delta_fp32_dot": logits_focus_fp32_max_abs,
+            "note_bf16_model_logits_can_match": (
+                "Model logits are often bf16 matmul-rounded; compare delta_logits_fp32_dot when "
+                "delta_logits_model is all zeros."
+            ),
             "logits_focus_per_position": logits_focus_per_position,
             "logits_fp64_sum_before": ls0,
             "logits_fp64_sum_after": ls1,
