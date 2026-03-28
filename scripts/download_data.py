@@ -3,6 +3,7 @@
 下载四个数学推理数据集到指定路径，并统一为 GSM 风格格式：
 - instruction: 问题
 - output: 推理过程 + "The answer is <答案>"
+- response: 原始答案字段（answer_raw），便于与格式化后的 output 对照
 
 运行前：pip install datasets
 """
@@ -69,7 +70,7 @@ def _build_gsm_style_output(answer_raw: str, rationale: str = "") -> str:
 def normalize_example(example, dataset_name: str):
     """
     统一转换为:
-        {"instruction": "...", "output": "..."}
+        {"instruction": "...", "output": "...", "response": "<answer_raw>"}
     """
     instruction = _pick_first(
         example,
@@ -93,7 +94,7 @@ def normalize_example(example, dataset_name: str):
     )
     output = _build_gsm_style_output(answer_raw=answer_raw, rationale=rationale)
 
-    return {"instruction": instruction, "output": output}
+    return {"instruction": instruction, "output": output, "response": answer_raw}
 
 
 def convert_dataset_to_gsm_style(ds, dataset_name: str):
