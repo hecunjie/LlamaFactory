@@ -3,28 +3,29 @@
 #
 # Licensed under the Apache License, Version 2.0.
 
-r"""Merge all logits-analysis jsonl under a directory and plot metrics vs ``step``.
+r"""Merge logits-analysis jsonl under a directory and plot metrics vs ``step``.
 
-Each file may contain only one JSON line. All lines are merged, sorted by ``step``.
-**Each subplot is saved as its own PNG** (6 files by default).
+**Dataset grouping**: All ``*.jsonl`` under ``--input_dir`` (recursive) are grouped by filename stem
+before the last ``_step_<digits>`` segment, e.g. ``eval_logits_analysis_eval_x_step_10`` → key
+``eval_logits_analysis_eval_x``; ``analysis_step_100_100`` → ``analysis_step_train``. Each group is
+processed and written with a distinct output basename.
 
-Also writes ``{basename}_contrast_stats.json`` with **paired contrast stats** (A vs D, A vs B):
-per-step difference ``group_left - group_right``, then mean / variance of that difference and a
-**one-sample t-test** vs 0 (``scipy.stats.ttest_1samp``). Use ``--no_contrast`` to skip;
-``--contrast_full`` adds per-step arrays (large).
+**Multi-line files (eval)**: Multiple jsonl lines with the same ``step`` (batched eval) are merged
+into one per-step record using count-weighted means for group / masked statistics.
+
+**Plots** (train): 01–06 as before; **07** A–D token-count fractions; **08–09** A vs D and A vs B
+for ``delta_max_cosine.mean``. **Eval** snapshots use ``max_cosine.mean`` instead of deltas where
+applicable.
+
+Also writes ``{basename}_contrast_stats.json`` (train delta records only) with paired contrast stats.
+Use ``--no_contrast`` to skip; ``--contrast_full`` adds per-step arrays (large).
 
 Example::
 
-    # Training delta logs are under ``logits_analysis_output_path/train/`` (eval snapshots use ``.../eval/``).
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train
+    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs
 
-    # Custom directory and file name prefix
     python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train \\
         --output_dir ./figures --basename run1_curves
-
-    # Legacy: --output path/to/name.png → saves as path/to/name_01_*.png ...
-    python scripts/plot_logits_analysis_jsonl.py --input_dir ./analysis_logs/train \\
-        --output ./analysis_plots/curves.png
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import warnings
 from pathlib import Path
 from typing import Any, Optional
@@ -50,37 +52,170 @@ def _get(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return cur
 
 
-def _load_all_records(input_dir: Path, pattern: str) -> list[dict[str, Any]]:
-    r"""Read every non-empty line from every matching jsonl file."""
-    files = sorted(input_dir.glob(pattern))
-    if not files:
-        return []
-    rows: list[dict[str, Any]] = []
+def _safe_dataset_basename_key(key: str) -> str:
+    r"""Filesystem-safe suffix for output basename."""
+    s = re.sub(r"[^\w\-.]+", "_", key.strip()).strip("_")
+    return s[:200] if s else "dataset"
+
+
+def dataset_group_key_from_path(path: Path) -> str:
+    r"""Group jsonl files: stem without trailing ``_step_<digits>``; train ``analysis_step_N_N`` → one bucket."""
+    stem = path.stem
+    m_ev = re.match(r"^(eval_logits_analysis_.+)_step_(\d+)$", stem)
+    if m_ev:
+        return m_ev.group(1)
+    m_tr = re.match(r"^analysis_step_(\d+)_(\d+)$", stem)
+    if m_tr and m_tr.group(1) == m_tr.group(2):
+        return "analysis_step_train"
+    if stem.startswith("analysis_step_"):
+        return "analysis_step_train"
+    m_gen = re.match(r"^(.*)_step_(\d+)$", stem)
+    if m_gen:
+        return m_gen.group(1)
+    return stem
+
+
+def discover_jsonl_by_dataset(input_dir: Path, pattern: str) -> dict[str, list[Path]]:
+    r"""All matching jsonl under ``input_dir`` (recursive), grouped by :func:`dataset_group_key_from_path`."""
+    files = sorted(input_dir.rglob(pattern))
+    groups: dict[str, list[Path]] = {}
+    for fp in files:
+        if not fp.is_file():
+            continue
+        key = dataset_group_key_from_path(fp)
+        groups.setdefault(key, []).append(fp)
+    for k in groups:
+        groups[k].sort(key=lambda p: str(p))
+    return groups
+
+
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    sw = float(sum(weights))
+    if sw <= 0 or not values:
+        return float("nan")
+    return float(sum(v * w for v, w in zip(values, weights)) / sw)
+
+
+def _merge_group_cluster_dicts(parts: list[dict[str, Any]], metric_keys: tuple[str, ...]) -> dict[str, Any]:
+    r"""Merge A/B/C/D group dicts across eval batches (count-weighted mean / mean_abs / std)."""
+    count = sum(int(p.get("count") or 0) for p in parts)
+    out: dict[str, Any] = {
+        "count": count,
+        "name": parts[0].get("name"),
+        "description": parts[0].get("description"),
+    }
+    for mk in metric_keys:
+        sub_list: list[dict[str, Any]] = []
+        ws: list[float] = []
+        for p in parts:
+            d = p.get(mk)
+            if not isinstance(d, dict):
+                continue
+            w = float(p.get("count") or 0)
+            sub_list.append(d)
+            ws.append(w)
+        if not sub_list:
+            continue
+        sw = sum(ws)
+        if sw <= 0:
+            out[mk] = dict(sub_list[0])
+            continue
+        mean_v = _weighted_mean([float(d.get("mean") or 0) for d in sub_list], ws)
+        mean_abs_v = _weighted_mean([float(d.get("mean_abs") or 0) for d in sub_list], ws)
+        std_v = _weighted_mean([float(d.get("std") or 0) for d in sub_list], ws)
+        out[mk] = {"mean": mean_v, "std": std_v, "mean_abs": mean_abs_v}
+    return out
+
+
+def _merge_masked_summary_parts(
+    parts: list[dict[str, Any]], summary_keys: tuple[str, ...]
+) -> dict[str, Any]:
+    tc = sum(int(p.get("token_count") or 0) for p in parts)
+    out: dict[str, Any] = {"token_count": tc}
+    for sk in summary_keys:
+        sub_list: list[dict[str, Any]] = []
+        ws: list[float] = []
+        for p in parts:
+            d = p.get(sk)
+            if not isinstance(d, dict):
+                continue
+            w = float(p.get("token_count") or 0)
+            sub_list.append(d)
+            ws.append(w)
+        if not sub_list:
+            continue
+        sw = sum(ws)
+        if sw <= 0:
+            out[sk] = dict(sub_list[0])
+            continue
+        out[sk] = {
+            "mean": _weighted_mean([float(d.get("mean") or 0) for d in sub_list], ws),
+            "mean_abs": _weighted_mean([float(d.get("mean_abs") or 0) for d in sub_list], ws),
+            "std": _weighted_mean([float(d.get("std") or 0) for d in sub_list], ws),
+        }
+    return out
+
+
+def _merge_records_for_one_step(lines: list[dict[str, Any]]) -> dict[str, Any]:
+    r"""Merge multiple jsonl lines (eval batches) sharing the same ``step``."""
+    if len(lines) == 1:
+        return lines[0]
+    kind = lines[0].get("analysis")
+    train_keys = ("delta_entropy", "delta_max_cosine", "delta_max_logit")
+    eval_keys = ("entropy", "max_cosine", "max_logit")
+    if kind == "eval_cluster_snapshot":
+        mkeys = eval_keys
+        sk_keys = eval_keys
+    else:
+        mkeys = train_keys
+        sk_keys = train_keys
+    base = dict(lines[0])
+    base["step"] = int(lines[0].get("step", 0))
+    groups_m: dict[str, Any] = {}
+    for gid in ("A", "B", "C", "D"):
+        gp = [_get(ln, "groups", gid) for ln in lines]
+        gp = [g for g in gp if isinstance(g, dict)]
+        if gp:
+            groups_m[gid] = _merge_group_cluster_dicts(gp, mkeys)
+    base["groups"] = groups_m
+    ms_parts = [ln["masked_summary"] for ln in lines if isinstance(ln.get("masked_summary"), dict)]
+    if ms_parts:
+        base["masked_summary"] = _merge_masked_summary_parts(ms_parts, sk_keys)
+    return base
+
+
+def load_merge_dataset_group(files: list[Path]) -> list[dict[str, Any]]:
+    r"""Load all lines from files, merge lines that share the same ``step``, sort by step."""
+    raw: list[dict[str, Any]] = []
     for fp in files:
         with fp.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
-    return rows
-
-
-def _merge_sort_by_step(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    r"""Sort by ``step`` ascending; duplicate ``step`` keeps the **last** record (with warning)."""
-    by_step: dict[int, dict[str, Any]] = {}
-    dup = 0
-    for r in rows:
+                raw.append(json.loads(line))
+    if not raw:
+        return []
+    by_step: dict[int, list[dict[str, Any]]] = {}
+    for r in raw:
         s = int(r.get("step", -1))
-        if s in by_step:
-            dup += 1
-        by_step[s] = r
-    if dup:
-        warnings.warn(
-            f"Merged {dup} duplicate step value(s); kept last occurrence per step.",
-            stacklevel=2,
-        )
-    return [by_step[k] for k in sorted(by_step.keys())]
+        by_step.setdefault(s, []).append(r)
+    merged: list[dict[str, Any]] = []
+    for s in sorted(by_step.keys()):
+        chunk = by_step[s]
+        if len(chunk) > 1:
+            merged.append(_merge_records_for_one_step(chunk))
+        else:
+            merged.append(chunk[0])
+    return merged
+
+
+def _rows_analysis_kind(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "train"
+    if rows[0].get("analysis") == "eval_cluster_snapshot":
+        return "eval"
+    return "train"
 
 
 def _series_masked(rows: list[dict[str, Any]], sub: str, stat: str) -> list[Optional[float]]:
@@ -113,6 +248,34 @@ def _group_label(rows: list[dict[str, Any]], gid: str) -> str:
         if isinstance(g, dict) and g.get("name"):
             return f'{gid}: {g["name"]}'
     return gid
+
+
+def _series_group_count_fraction(rows: list[dict[str, Any]], gid: str) -> list[Optional[float]]:
+    r"""Fraction of supervised tokens in cluster ``gid`` (count / sum_A-D counts)."""
+    out: list[Optional[float]] = []
+    idx = {"A": 0, "B": 1, "C": 2, "D": 3}[gid]
+    for r in rows:
+        counts = [float(_get(r, "groups", g, "count") or 0) for g in ("A", "B", "C", "D")]
+        t = sum(counts)
+        if t <= 0:
+            out.append(None)
+        else:
+            out.append(counts[idx] / t)
+    return out
+
+
+def _series_group_cosine_mean(rows: list[dict[str, Any]], kind: str, gid: str) -> list[Optional[float]]:
+    r"""``delta_max_cosine.mean`` (train) or ``max_cosine.mean`` (eval)."""
+    sub = "max_cosine" if kind == "eval" else "delta_max_cosine"
+    out: list[Optional[float]] = []
+    for r in rows:
+        v = _get(r, "groups", gid, sub, "mean")
+        if v is None:
+            out.append(None)
+            continue
+        fv = float(v)
+        out.append(fv if fv == fv else None)
+    return out
 
 
 # (field under each group, stat key) — same metrics as in plots.
@@ -245,14 +408,14 @@ def plot_and_save_separate(
     subtitle: str,
     dpi: int = 150,
 ) -> list[Path]:
-    r"""Save 6 PNGs: ``{basename}_01_...png`` … ``{basename}_06_...png``."""
+    r"""Save PNGs: ``01``–``06`` (train-centric; eval skips 01/06), ``07``–``09`` (fractions + cosine mean)."""
     import matplotlib.pyplot as plt
 
     if not rows:
         return []
 
+    kind = _rows_analysis_kind(rows)
     steps = _steps(rows)
-    lr = [float(r.get("optimizer_lr") or 0.0) for r in rows]
     group_ids = ["A", "B", "C", "D"]
     colors = ["C0", "C1", "C2", "C3"]
     written: list[Path] = []
@@ -260,35 +423,48 @@ def plot_and_save_separate(
     def _name(suffix: str) -> Path:
         return output_dir / f"{basename}_{suffix}.png"
 
-    # 01 optimizer lr
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.suptitle(subtitle, fontsize=10, y=1.02)
-    ax.plot(steps, lr, color="C0", linewidth=1.2, marker="o", markersize=3)
-    ax.set_ylabel("optimizer_lr")
-    ax.set_xlabel("step")
-    ax.set_yscale("log")
-    ax.set_title("optimizer learning rate")
-    ax.grid(True, alpha=0.3)
-    p = _name("01_optimizer_lr")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
-    written.append(p)
+    train = kind == "train"
+    # 01 optimizer lr (train only)
+    if train and any(r.get("optimizer_lr") is not None for r in rows):
+        lr = [float(r.get("optimizer_lr") or 0.0) for r in rows]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        fig.suptitle(subtitle, fontsize=10, y=1.02)
+        ax.plot(steps, lr, color="C0", linewidth=1.2, marker="o", markersize=3)
+        ax.set_ylabel("optimizer_lr")
+        ax.set_xlabel("step")
+        ax.set_yscale("log")
+        ax.set_title("optimizer learning rate")
+        ax.grid(True, alpha=0.3)
+        p = _name("01_optimizer_lr")
+        plt.savefig(p, dpi=dpi, bbox_inches="tight")
+        plt.close()
+        written.append(p)
 
     # 02 masked summary
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
-    for name, sub, color in [
-        ("|Δentropy| (masked)", "delta_entropy", "C0"),
-        ("|Δmax_cos| (masked)", "delta_max_cosine", "C1"),
-        ("|Δmax_logit| (masked)", "delta_max_logit", "C2"),
-    ]:
+    if train:
+        series = [
+            ("|Δentropy| (masked)", "delta_entropy", "C0"),
+            ("|Δmax_cos| (masked)", "delta_max_cosine", "C1"),
+            ("|Δmax_logit| (masked)", "delta_max_logit", "C2"),
+        ]
+        ttl = "masked_summary (mean_abs, train Δ)"
+    else:
+        series = [
+            ("|entropy| (masked)", "entropy", "C0"),
+            ("|max_cos| (masked)", "max_cosine", "C1"),
+            ("|max_logit| (masked)", "max_logit", "C2"),
+        ]
+        ttl = "masked_summary (mean_abs, eval snapshot)"
+    for name, sub, color in series:
         y = _series_masked(rows, sub, "mean_abs")
         ax.plot(steps, y, label=name, color=color, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
-    ax.set_title("masked_summary (mean_abs)")
+    ax.set_title(ttl)
     p = _name("02_masked_summary")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
@@ -297,15 +473,16 @@ def plot_and_save_separate(
     # 03 groups entropy
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
+    ent_sub, ent_abs = ("delta_entropy", "mean_abs") if train else ("entropy", "mean_abs")
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
-        y = _series_group(rows, gid, "delta_entropy", "mean_abs")
+        y = _series_group(rows, gid, ent_sub, ent_abs)
         ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.set_title("groups: |Δentropy| mean_abs")
+    ax.set_title("groups: entropy |Δ| (train) or |value| (eval)" if train else "groups: |entropy| mean_abs (eval)")
     p = _name("03_groups_entropy")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
@@ -314,15 +491,16 @@ def plot_and_save_separate(
     # 04 groups max logit
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
+    ml_sub = "delta_max_logit" if train else "max_logit"
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
-        y = _series_group(rows, gid, "delta_max_logit", "mean_abs")
+        y = _series_group(rows, gid, ml_sub, "mean_abs")
         ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.set_title("groups: |Δmax_logit| mean_abs")
+    ax.set_title("groups: |Δmax_logit| mean_abs" if train else "groups: |max_logit| mean_abs")
     p = _name("04_groups_max_logit")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
@@ -331,52 +509,107 @@ def plot_and_save_separate(
     # 05 groups max cosine
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
+    mc_sub = "delta_max_cosine" if train else "max_cosine"
     for gid, c in zip(group_ids, colors):
         label = _group_label(rows, gid)
-        y = _series_group(rows, gid, "delta_max_cosine", "mean_abs")
+        y = _series_group(rows, gid, mc_sub, "mean_abs")
         ax.plot(steps, y, label=label, color=c, linewidth=1.0, marker="o", markersize=3)
     ax.set_ylabel("mean_abs")
     ax.set_xlabel("step")
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.set_title("groups: |Δmax_cosine| mean_abs")
+    ax.set_title("groups: |Δmax_cosine| mean_abs" if train else "groups: |max_cosine| mean_abs")
     p = _name("05_groups_max_cosine")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
     written.append(p)
 
-    # 06 param / logit diagnostics
+    # 06 param / logit diagnostics (train only)
+    if train:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        fig.suptitle(subtitle, fontsize=10, y=1.02)
+        pmax = [r.get("max_abs_trainable_param_delta") for r in rows]
+        pmax_f = [float(x) if x is not None else float("nan") for x in pmax]
+        mean_ml = [r.get("mean_abs_delta_max_logit_masked") for r in rows]
+        mean_ml_f = [float(x) if x is not None else float("nan") for x in mean_ml]
+        ax.plot(steps, pmax_f, label="max_abs_trainable_param_delta", color="C0", linewidth=1.0, marker="o", markersize=3)
+        ax2 = ax.twinx()
+        ax2.plot(
+            steps,
+            mean_ml_f,
+            label="mean_abs_delta_max_logit_masked",
+            color="C1",
+            linewidth=1.0,
+            alpha=0.85,
+            marker="s",
+            markersize=3,
+        )
+        ax.set_ylabel("param_delta", color="C0")
+        ax2.set_ylabel("mean_abs_Δmax_logit", color="C1")
+        ax.set_xlabel("step")
+        ax.tick_params(axis="y", labelcolor="C0")
+        ax2.tick_params(axis="y", labelcolor="C1")
+        if all(x == x and x > 0 for x in pmax_f):
+            ax.set_yscale("log")
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc="best", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.set_title("param / logit delta diagnostics")
+        p = _name("06_param_logit_diagnostics")
+        plt.savefig(p, dpi=dpi, bbox_inches="tight")
+        plt.close()
+        written.append(p)
+
+    # 07 A–D token count fractions
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.suptitle(subtitle, fontsize=10, y=1.02)
-    pmax = [r.get("max_abs_trainable_param_delta") for r in rows]
-    pmax_f = [float(x) if x is not None else float("nan") for x in pmax]
-    mean_ml = [r.get("mean_abs_delta_max_logit_masked") for r in rows]
-    mean_ml_f = [float(x) if x is not None else float("nan") for x in mean_ml]
-    ax.plot(steps, pmax_f, label="max_abs_trainable_param_delta", color="C0", linewidth=1.0, marker="o", markersize=3)
-    ax2 = ax.twinx()
-    ax2.plot(
-        steps,
-        mean_ml_f,
-        label="mean_abs_delta_max_logit_masked",
-        color="C1",
-        linewidth=1.0,
-        alpha=0.85,
-        marker="s",
-        markersize=3,
-    )
-    ax.set_ylabel("param_delta", color="C0")
-    ax2.set_ylabel("mean_abs_Δmax_logit", color="C1")
+    for gid, c in zip(group_ids, colors):
+        label = _group_label(rows, gid)
+        y = _series_group_count_fraction(rows, gid)
+        ax.plot(steps, y, label=label, color=c, linewidth=1.2, marker="o", markersize=3)
+    ax.set_ylabel("fraction of A–D tokens")
     ax.set_xlabel("step")
-    ax.tick_params(axis="y", labelcolor="C0")
-    ax2.tick_params(axis="y", labelcolor="C1")
-    if all(x == x and x > 0 for x in pmax_f):
-        ax.set_yscale("log")
-    lines, labels = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines + lines2, labels + labels2, loc="best", fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.set_title("param / logit delta diagnostics")
-    p = _name("06_param_logit_diagnostics")
+    ax.set_title("cluster token count share (A–D) vs step")
+    p = _name("07_group_count_fractions")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
+
+    ylab_cm = "delta_max_cosine.mean (train)" if train else "max_cosine.mean (eval)"
+    # 08 A vs D: cosine mean (Δ or static)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
+    y_a = _series_group_cosine_mean(rows, kind, "A")
+    y_d = _series_group_cosine_mean(rows, kind, "D")
+    ax.plot(steps, y_a, label="A", color="C0", linewidth=1.2, marker="o", markersize=3)
+    ax.plot(steps, y_d, label="D", color="C3", linewidth=1.2, marker="s", markersize=3)
+    ax.set_ylabel(ylab_cm)
+    ax.set_xlabel("step")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_title("A vs D: cosine mean vs step")
+    p = _name("08_cosine_mean_A_vs_D")
+    plt.savefig(p, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    written.append(p)
+
+    # 09 A vs B: cosine mean
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle(subtitle, fontsize=10, y=1.02)
+    y_a2 = _series_group_cosine_mean(rows, kind, "A")
+    y_b = _series_group_cosine_mean(rows, kind, "B")
+    ax.plot(steps, y_a2, label="A", color="C0", linewidth=1.2, marker="o", markersize=3)
+    ax.plot(steps, y_b, label="B", color="C1", linewidth=1.2, marker="s", markersize=3)
+    ax.set_ylabel(ylab_cm)
+    ax.set_xlabel("step")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_title("A vs B: cosine mean vs step")
+    p = _name("09_cosine_mean_A_vs_B")
     plt.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close()
     written.append(p)
@@ -435,7 +668,7 @@ def main() -> None:
         "--input_dir",
         type=str,
         required=True,
-        help="Directory containing *.jsonl (one or more lines per file).",
+        help="Root directory; all matching jsonl files are found recursively and grouped by dataset (filename).",
     )
     parser.add_argument(
         "--output_dir",
@@ -447,7 +680,7 @@ def main() -> None:
         "--basename",
         type=str,
         default="logits_analysis_by_step",
-        help="Filename prefix for outputs: {basename}_01_....png (default: logits_analysis_by_step).",
+        help="Filename prefix; each dataset group gets {basename}_{dataset_key}_01_....png.",
     )
     parser.add_argument(
         "--output",
@@ -462,7 +695,7 @@ def main() -> None:
         "--pattern",
         type=str,
         default="*.jsonl",
-        help="Glob under input_dir (default: *.jsonl).",
+        help="Glob under input_dir, recursive (default: *.jsonl).",
     )
     parser.add_argument("--dpi", type=int, default=150, help="PNG resolution (default: 150).")
     parser.add_argument(
@@ -481,12 +714,9 @@ def main() -> None:
     if not input_dir.is_dir():
         raise SystemExit(f"Not a directory: {input_dir}")
 
-    raw = _load_all_records(input_dir, args.pattern)
-    if not raw:
-        raise SystemExit(f"No JSON lines found under {input_dir!s} with pattern {args.pattern!r}")
-
-    rows = _merge_sort_by_step(raw)
-    n_files = len(list(input_dir.glob(args.pattern)))
+    groups_map = discover_jsonl_by_dataset(input_dir, args.pattern)
+    if not groups_map:
+        raise SystemExit(f"No jsonl files under {input_dir!s} matching {args.pattern!r} (recursive)")
 
     if args.output_dir is not None:
         out_dir = Path(args.output_dir).resolve()
@@ -501,32 +731,47 @@ def main() -> None:
         out_dir = (input_dir / "plots").resolve()
         basename = args.basename
 
-    subtitle = (
-        f"merged n={len(rows)} steps, files={n_files}, "
-        f"step∈[{rows[0].get('step')}, {rows[-1].get('step')}]"
-    )
-    paths = plot_and_save_separate(
-        rows,
-        output_dir=out_dir,
-        basename=basename,
-        subtitle=subtitle,
-        dpi=args.dpi,
-    )
-    for p in paths:
-        print(p)
-    print(f"done. {len(paths)} PNGs → {out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.no_contrast:
-        contrast = compute_group_contrasts(
-            rows,
-            include_per_step_series=args.contrast_full,
+    for group_key in sorted(groups_map.keys()):
+        files = groups_map[group_key]
+        rows = load_merge_dataset_group(files)
+        if not rows:
+            warnings.warn(f"Skipping empty dataset group {group_key!r}", stacklevel=2)
+            continue
+        kind = _rows_analysis_kind(rows)
+        base = f"{basename}_{_safe_dataset_basename_key(group_key)}"
+        subtitle = (
+            f"{group_key} | kind={kind} | n_steps={len(rows)} | n_files={len(files)} | "
+            f"step∈[{rows[0].get('step')}, {rows[-1].get('step')}]"
         )
-        contrast_path = out_dir / f"{basename}_contrast_stats.json"
-        contrast_path.parent.mkdir(parents=True, exist_ok=True)
-        with contrast_path.open("w", encoding="utf-8") as f:
-            json.dump(contrast, f, ensure_ascii=False, indent=2)
-        print(contrast_path)
-        _print_contrast_summary(contrast)
+        paths = plot_and_save_separate(
+            rows,
+            output_dir=out_dir,
+            basename=base,
+            subtitle=subtitle,
+            dpi=args.dpi,
+        )
+        for p in paths:
+            print(p)
+        print(f"done [{group_key}]. {len(paths)} PNGs → {out_dir}")
+
+        if not args.no_contrast:
+            if kind == "train":
+                contrast = compute_group_contrasts(
+                    rows,
+                    include_per_step_series=args.contrast_full,
+                )
+                contrast_path = out_dir / f"{base}_contrast_stats.json"
+                with contrast_path.open("w", encoding="utf-8") as f:
+                    json.dump(contrast, f, ensure_ascii=False, indent=2)
+                print(contrast_path)
+                _print_contrast_summary(contrast)
+            else:
+                print(
+                    f"[{group_key}] skip contrast_stats.json (eval_cluster_snapshot has no Δ metrics; "
+                    "contrast requires train clustered_token_deltas)."
+                )
 
 
 if __name__ == "__main__":
