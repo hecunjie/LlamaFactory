@@ -25,6 +25,69 @@ from llamafactory.hparams import get_infer_args
 from llamafactory.model import load_tokenizer
 
 
+def _legacy_prompt_to_messages(prompt: str, system: str | None) -> list[dict[str, str]]:
+    """Turn export-style ``user\\n\\n...assistant`` text into chat ``messages`` (user content only)."""
+    messages: list[dict[str, str]] = []
+    if system and str(system).strip():
+        messages.append({"role": "system", "content": str(system).strip()})
+    p = prompt.strip()
+    m = re.search(r"(?is)^\s*user\s*\n+(.*?)(?:\n\s*assistant\s*)$", p)
+    if m:
+        messages.append({"role": "user", "content": m.group(1).strip()})
+    else:
+        messages.append({"role": "user", "content": p})
+    return messages
+
+
+def _encode_batch_with_chat_template(
+    tokenizer: AutoTokenizer,
+    rows: list[dict[str, Any]],
+    default_system: str | None,
+    device: torch.device | str,
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """Left-pad token ids from ``apply_chat_template(..., add_generation_prompt=True)``."""
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    seqs: list[list[int]] = []
+    display_prompts: list[str] = []
+    for r in rows:
+        if "messages" in r and r["messages"] is not None:
+            messages = r["messages"]
+            if not isinstance(messages, list):
+                raise ValueError("Each row's 'messages' must be a list of {role, content} dicts.")
+        else:
+            sys = r.get("system", default_system)
+            if isinstance(sys, str) and not sys.strip():
+                sys = None
+            messages = _legacy_prompt_to_messages(str(r.get("prompt", "")), sys)
+
+        out = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors=None,
+        )
+        if isinstance(out, torch.Tensor):
+            ids = out.squeeze(0).tolist()
+        else:
+            ids = list(out)
+        seqs.append(ids)
+        display_prompts.append(tokenizer.decode(ids, skip_special_tokens=True))
+
+    max_len = max(len(s) for s in seqs)
+    batch_n = len(seqs)
+    input_ids = torch.full((batch_n, max_len), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((batch_n, max_len), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        L = len(s)
+        input_ids[i, -L:] = torch.tensor(s, dtype=torch.long)
+        attention_mask[i, -L:] = 1
+    enc = {"input_ids": input_ids, "attention_mask": attention_mask}
+    enc = {k: v.to(device) for k, v in enc.items()}
+    return enc, display_prompts
+
+
 def _unwrap_causal_lm(model: torch.nn.Module) -> torch.nn.Module:
     unwrapped = model
     while hasattr(unwrapped, "module"):
@@ -168,7 +231,7 @@ def build_rows_from_llamafactory(
     max_samples: int | None,
     default_system: str | None,
     enable_thinking: bool,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     model_args, data_args, _, _ = get_infer_args(
         dict(
             model_name_or_path=model_name_or_path,
@@ -189,7 +252,7 @@ def build_rows_from_llamafactory(
     dataset_module = get_dataset(template_obj, model_args, data_args, training_args, "sft", **tokenizer_module)
     hf_ds = dataset_module["train_dataset"]
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for i in range(len(hf_ds)):
         input_ids = hf_ds[i]["input_ids"]
         labels = hf_ds[i]["labels"]
@@ -198,8 +261,6 @@ def build_rows_from_llamafactory(
         n = min(len(ids_list), len(lab_list))
         ids_list = ids_list[:n]
         lab_list = lab_list[:n]
-        # SFT packs prompt+answer in input_ids; labels are IGNORE_INDEX on the prompt span.
-        # Decoding full input_ids leaks the first answer tokens (e.g. "18") into the "prompt".
         first_sup = next((j for j in range(n) if lab_list[j] != IGNORE_INDEX), n)
         prompt = tokenizer.decode(ids_list[:first_sup], skip_special_tokens=True)
         label = tokenizer.decode(
@@ -208,11 +269,6 @@ def build_rows_from_llamafactory(
         )
         rows.append({"prompt": prompt, "label": label})
     return rows
-
-
-def _strip_leaked_numeric_after_assistant(text: str) -> str:
-    """If prompt ends with assistant header + only digits, drop the digits (common JSONL export bug)."""
-    return re.sub(r"(?i)(assistant\s*\n\s*)\d+\s*$", r"\1", text.rstrip()).rstrip()
 
 
 def patch_rgha_forward(
@@ -378,8 +434,10 @@ def _run_data_parallel_inference(args: argparse.Namespace, rows: list[dict[str, 
                 cmd.append("--do_sample")
             if args.use_rgha:
                 cmd.append("--use_rgha")
-            if args.no_strip_leaked_answer_tail:
-                cmd.append("--no_strip_leaked_answer_tail")
+            if args.no_chat_template:
+                cmd.append("--no_chat_template")
+            if args.default_system is not None:
+                cmd.extend(["--default_system", args.default_system])
 
             procs.append(subprocess.Popen(cmd, env=env))
 
@@ -443,12 +501,18 @@ def main() -> None:
     parser.add_argument("--rgha_sim_beta", type=float, default=0.6)
     parser.add_argument("--rgha_threshold", type=float, default=0.58)
     parser.add_argument(
-        "--no_strip_leaked_answer_tail",
+        "--no_chat_template",
         action="store_true",
         help=(
-            "For --data JSONL only: disable stripping when prompt ends with "
-            "'assistant' + whitespace + digits-only (bad exports often leak the first answer token)."
+            "Do not use tokenizer.apply_chat_template; tokenize raw 'prompt' strings as before "
+            "(legacy; breaks alignment with LlamaFactory llama3 / Llama 3 chat training)."
         ),
+    )
+    parser.add_argument(
+        "--default_system",
+        type=str,
+        default=None,
+        help="Optional system message when using chat template and a row has no 'system' field.",
     )
     args = parser.parse_args()
 
@@ -553,23 +617,38 @@ def main() -> None:
     else:
         print("[RGHA] disabled.")
 
+    use_chat_template = not args.no_chat_template
+    if use_chat_template and getattr(tokenizer, "chat_template", None) is None:
+        print(
+            "[chat] Tokenizer has no chat_template; falling back to raw prompt tokenization "
+            "(pass --no_chat_template to silence this)."
+        )
+        use_chat_template = False
+    elif use_chat_template:
+        print(
+            "[chat] Using tokenizer.apply_chat_template(add_generation_prompt=True) — aligned with "
+            "HF Llama 3 / LlamaFactory 'llama3' (special tokens + assistant header)."
+        )
+
     with output_path.open("w", encoding="utf-8") as fout:
         pbar = tqdm(range(0, len(rows), args.batch_size), desc="Infer", total=(len(rows) + args.batch_size - 1) // args.batch_size)
-        strip_tail = not args.no_strip_leaked_answer_tail
         for st in pbar:
             batch = rows[st : st + args.batch_size]
-            prompts = [str(r.get("prompt", "")) for r in batch]
             labels = [str(r.get("label", "")) for r in batch]
-            if strip_tail:
-                prompts = [_strip_leaked_numeric_after_assistant(p) for p in prompts]
 
-            enc = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=False,
-                add_special_tokens=False,
-            ).to(input_device)
+            if use_chat_template:
+                enc, prompts_for_out = _encode_batch_with_chat_template(
+                    tokenizer, batch, args.default_system, input_device
+                )
+            else:
+                prompts_for_out = [str(r.get("prompt", "")) for r in batch]
+                enc = tokenizer(
+                    prompts_for_out,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=False,
+                    add_special_tokens=False,
+                ).to(input_device)
 
             with torch.no_grad():
                 out_ids = model.generate(
@@ -599,7 +678,7 @@ def main() -> None:
                     pred_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
                     pred_list.append(pred_text)
                 rec = {
-                    "prompt": prompts[i],
+                    "prompt": prompts_for_out[i],
                     "predict": pred_list[0],
                     "predicts": pred_list,
                     "label": labels[i],
