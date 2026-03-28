@@ -436,8 +436,8 @@ def _run_data_parallel_inference(args: argparse.Namespace, rows: list[dict[str, 
                 cmd.append("--use_rgha")
             if args.no_chat_template:
                 cmd.append("--no_chat_template")
-            if args.default_system is not None:
-                cmd.extend(["--default_system", args.default_system])
+            if args.chat_default_system is not None:
+                cmd.extend(["--chat_default_system", args.chat_default_system])
 
             procs.append(subprocess.Popen(cmd, env=env))
 
@@ -509,7 +509,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--default_system",
+        "--chat_default_system",
         type=str,
         default=None,
         help="Optional system message when using chat template and a row has no 'system' field.",
@@ -638,7 +638,7 @@ def main() -> None:
 
             if use_chat_template:
                 enc, prompts_for_out = _encode_batch_with_chat_template(
-                    tokenizer, batch, args.default_system, input_device
+                    tokenizer, batch, args.chat_default_system, input_device
                 )
             else:
                 prompts_for_out = [str(r.get("prompt", "")) for r in batch]
