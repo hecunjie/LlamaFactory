@@ -44,18 +44,18 @@ python3 scripts/stat_add_think_top5_by_case.py /mnt/tidal-alsh01/dataset/zeus/he
 
 ## 推理
 python scripts/rgha_infer.py \
-  --model_name_or_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_maxcos_thre_3_epoch/checkpoint-1404 \
-  --dataset gsm_nl_test \
+  --model_name_or_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_maxcos_thre/checkpoint-936 \
+  --dataset multiarith_test \
   --dataset_dir data \
   --template llama3 \
-  --output /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_maxcos_thre_3_epoch/vllm_infer/gsm_nl/last_ckp_rgha_preds.jsonl \
+  --output /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_rgha_maxcos_thre/vllm_infer/multiarith/last_ckp_rgha_preds.jsonl \
   --do_sample \
   --temperature 1 \
   --top_p 0.95 \
   --num_generations 4 \
   --batch_size 32 \
-  --use_rgha \
   --data_parallel_gpus 8
+# --use_rgha \
 
 python -m train_sae.train \
   --data_path /mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/gsm8k/zeroshot_16_samples_qwen2.5-3b_instruct_on_math_train_full.jsonl \

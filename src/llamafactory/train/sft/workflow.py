@@ -25,6 +25,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
+from .logits_analysis_callback import LogitsAnalysisCallback
 from .metric import ComputeAccuracy, ComputeExactMatch, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
 
@@ -178,6 +179,14 @@ def run_sft(
         gen_kwargs["eos_token_id"] = [i for i in eos_ids if i != add_think_id]
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
+    logits_analysis_cb: Optional[LogitsAnalysisCallback] = None
+    if getattr(finetuning_args, "logits_analysis_in_sft", False):
+        if model_args.use_kt:
+            logger.warning_rank0("`logits_analysis_in_sft` is not supported with KTrainer; skipping callback.")
+        else:
+            logits_analysis_cb = LogitsAnalysisCallback(finetuning_args)
+            callbacks = (callbacks or []) + [logits_analysis_cb]
+
     # Initialize our Trainer
     if model_args.use_kt:
         from ktransformers.sft.lora import KTrainer  # type: ignore
@@ -210,6 +219,9 @@ def run_sft(
             **tokenizer_module,
             **metric_module,
         )
+
+    if logits_analysis_cb is not None:
+        logits_analysis_cb.attach_trainer(trainer)
 
     # Training
     if training_args.do_train:

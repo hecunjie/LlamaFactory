@@ -1002,6 +1002,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         """
         model.train()
 
+        if getattr(self.finetuning_args, "logits_analysis_in_sft", False):
+            self._logits_analysis_batch = None
+
         # Pop reasoning fields
         reasoning_input_ids = inputs.pop("reasoning_input_ids", None)
         reasoning_labels = inputs.pop("reasoning_labels", None)
@@ -1181,6 +1184,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             del outputs
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
             total_loss = loss_answer + self.align_loss_weight * align_loss
+            if getattr(self.finetuning_args, "logits_analysis_in_sft", False):
+                self._logits_analysis_batch = {
+                    "input_ids": inputs["input_ids"],
+                    "attention_mask": inputs["attention_mask"],
+                    "labels": inputs.get("labels"),
+                }
 
         if self.use_ortho_loss:
             ortho_loss = self.compute_orthogonal_loss(model)

@@ -702,6 +702,36 @@ class FinetuningArguments(
             )
         },
     )
+    logits_analysis_in_sft: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, during standard SFT record per-token entropy, max cosine (LN hidden vs lm_head), "
+                "and max logit before/after each optimizer step and append grouped stats to jsonl "
+                "(requires CustomSeq2SeqTrainer standard branch)."
+            )
+        },
+    )
+    logits_analysis_threshold_entropy: float = field(
+        default=1.0,
+        metadata={"help": "High-entropy threshold H > this value counts as high-entropy positions."},
+    )
+    logits_analysis_threshold_cosine: float = field(
+        default=0.5,
+        metadata={"help": "Low max-cosine threshold: max_k cos(h, w_k) < this counts as low-cosine."},
+    )
+    logits_analysis_log_every_n_steps: int = field(
+        default=100,
+        metadata={"help": "Write one jsonl record every N completed optimizer steps."},
+    )
+    logits_analysis_output_path: str = field(
+        default="./analysis_logs/",
+        metadata={"help": "Directory for logits analysis jsonl files."},
+    )
+    logits_analysis_cosine_seq_chunk: int = field(
+        default=512,
+        metadata={"help": "Sequence chunk size for max-cosine matmul to limit peak memory."},
+    )
     add_think_token: bool = field(
         default=False,
         metadata={
