@@ -463,18 +463,23 @@ class LogitsAnalysisCallback(TrainerCallback):
                 _sample_grad_norm = float(p.grad.detach().float().norm().item())
                 _sample_param_mean_abs = float(p.detach().float().abs().mean().item())
 
-        # Probe DeepSpeed engine structure to find fp32 master weights
+        # Probe DeepSpeed engine structure to find fp32 master weights.
+        # HF Trainer: self.model = bare model, self.model_wrapped = DS engine.
         _ds_fp32_before: Optional[float] = None
         _ds_engine_type: Optional[str] = None
         _ds_optimizer_type: Optional[str] = None
         _ds_fp32_attr_found: Optional[str] = None
-        _ds_engine = self._trainer.model
+        _model_wrapped_type: Optional[str] = None
+        _model_is_model_wrapped: Optional[bool] = None
+
+        _ds_engine = getattr(self._trainer, "model_wrapped", self._trainer.model)
         _ds_engine_type = type(_ds_engine).__name__
+        _model_wrapped_type = _ds_engine_type
+        _model_is_model_wrapped = (_ds_engine is self._trainer.model)
 
         ds_opt = getattr(_ds_engine, "optimizer", None)
         if ds_opt is not None:
             _ds_optimizer_type = type(ds_opt).__name__
-            # Try multiple known attribute names for fp32 master weights
             for attr_name in [
                 "fp32_partitioned_groups_flat",
                 "single_partition_of_fp32_groups",
@@ -503,6 +508,8 @@ class LogitsAnalysisCallback(TrainerCallback):
             "ds_engine_type": _ds_engine_type,
             "ds_optimizer_type": _ds_optimizer_type,
             "ds_fp32_attr_found": _ds_fp32_attr_found,
+            "model_wrapped_type": _model_wrapped_type,
+            "model_is_model_wrapped": _model_is_model_wrapped,
         }
 
         # CRITICAL: Do NOT run a forward pass here (before optimizer.step).
@@ -594,12 +601,12 @@ class LogitsAnalysisCallback(TrainerCallback):
                     "delta": val_after - val_before,
                 })
 
-        # DeepSpeed fp32 master weight check
+        # DeepSpeed fp32 master weight check — use model_wrapped (the real DS engine)
         _ds_fp32_before = diag.get("ds_fp32_before")
         _ds_fp32_attr_found = diag.get("ds_fp32_attr_found")
         _ds_fp32_after: Optional[float] = None
         _ds_fp32_delta: Optional[float] = None
-        _ds_engine = self._trainer.model
+        _ds_engine = getattr(self._trainer, "model_wrapped", self._trainer.model)
         if _ds_fp32_attr_found is not None:
             ds_opt = getattr(_ds_engine, "optimizer", None)
             if ds_opt is not None:
@@ -647,6 +654,8 @@ class LogitsAnalysisCallback(TrainerCallback):
             "diag_direct_param_fp32_after": _direct_param_fp32_after,
             "diag_direct_param_fp32_delta": _direct_param_fp32_delta,
             "diag_multi_param_deltas": _multi_deltas[:10],
+            "diag_model_wrapped_type": diag.get("model_wrapped_type"),
+            "diag_model_is_model_wrapped": diag.get("model_is_model_wrapped"),
             "diag_ds_engine_type": diag.get("ds_engine_type"),
             "diag_ds_optimizer_type": diag.get("ds_optimizer_type"),
             "diag_ds_fp32_attr_found": diag.get("ds_fp32_attr_found"),
