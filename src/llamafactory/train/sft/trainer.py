@@ -324,6 +324,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         refined = refined * (pre_norm / post_norm)
         return refined, gate
 
+    def _get_logits_analysis_callback(self) -> Any:
+        r"""Return the LogitsAnalysisCallback instance if registered, else None."""
+        from .logits_analysis_callback import LogitsAnalysisCallback
+
+        for cb in self.callback_handler.callbacks:
+            if isinstance(cb, LogitsAnalysisCallback):
+                return cb
+        return None
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -1210,10 +1219,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
             total_loss = total_loss / self.args.gradient_accumulation_steps
 
+        # Logits analysis: snapshot BEFORE backward.
+        # Under DeepSpeed + Accelerate, accelerator.backward() internally calls
+        # engine.step() which runs the optimizer and zeros gradients.  So the
+        # parameter update happens INSIDE backward(), not at the later
+        # optimizer.step() call.  We must capture before/after around backward().
+        _la_batch = getattr(self, "_logits_analysis_batch", None)
+        _la_cb = self._get_logits_analysis_callback() if _la_batch is not None else None
+        if _la_cb is not None:
+            _la_cb.snapshot_before_backward(_la_batch)
+
         kwargs = {}
         if hasattr(self, "_grad_norm_kwargs"):
             kwargs = self._grad_norm_kwargs
         self.accelerator.backward(total_loss, **kwargs)
+
+        # Logits analysis: analyze AFTER backward (params already updated by DS engine.step).
+        if _la_cb is not None and _la_batch is not None:
+            _la_cb.analyze_after_backward(_la_batch)
 
         # Log split losses — store GA-scaled values to match HF Trainer's _tr_loss
         # accumulation logic exactly. HF stores `loss/GA` per micro-batch, sums them,

@@ -412,20 +412,25 @@ class LogitsAnalysisCallback(TrainerCallback):
             self._hook_handle = None
         return control
 
-    def on_pre_optimizer_step(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs: Any,
-    ) -> TrainerControl:
-        self._metrics_before = None
-        if self._trainer is None:
-            return control
-        batch = getattr(self._trainer, "_logits_analysis_batch", None)
-        if batch is None:
-            return control
+    # ── Public API called from training_step (NOT from HF callbacks) ──────────
+    #
+    # With DeepSpeed + Accelerate, ``accelerator.backward(loss)`` internally calls
+    # ``engine.step()`` which runs the optimizer AND zeros gradients.  By the time
+    # HF Trainer's ``on_pre_optimizer_step`` / ``on_optimizer_step`` fire, the
+    # parameter update has ALREADY happened.  So those callbacks always see
+    # identical before/after values.
+    #
+    # Fix: call ``snapshot_before_backward`` right before ``accelerator.backward``
+    # and ``analyze_after_backward`` right after it, directly from
+    # ``CustomSeq2SeqTrainer.training_step``.
 
+    def snapshot_before_backward(self, batch: dict[str, Any]) -> None:
+        r"""Run the "before" analysis forward and snapshot parameters.
+
+        Must be called **before** ``accelerator.backward(loss)`` in ``training_step``.
+        """
+        if self._trainer is None:
+            return
         _sync_device_after_optimizer(batch["input_ids"].device)
 
         opt = getattr(self._trainer, "optimizer", None)
@@ -438,110 +443,52 @@ class LogitsAnalysisCallback(TrainerCallback):
         unwrapped = _unwrap_model(model)
         out_emb = unwrapped.get_output_embeddings()
         if out_emb is None:
-            return control
+            return
         lm_w = out_emb.weight
         lm_bias: Optional["torch.Tensor"] = getattr(out_emb, "bias", None)
 
         ordered = _ordered_trainable_named_params(unwrapped)
         self._param_snapshot_pairs = _build_param_snapshot_pairs(ordered)
 
-        # ── Diagnostics: snapshot multiple param elements in fp32 before step ──
-        _sample_grad_norm: Optional[float] = None
-        _sample_param_mean_abs: Optional[float] = None
-        _direct_param_name: Optional[str] = None
-        _direct_param_fp32_before: Optional[float] = None
-        _multi_param_fp32_before: list[tuple[str, int, float]] = []
-        for name, p in ordered[:min(5, len(ordered))]:
-            if _direct_param_name is None:
-                _direct_param_name = name
-                _direct_param_fp32_before = float(p.detach().float().flatten()[0].item())
-            n_elem = min(3, p.numel())
-            flat = p.detach().float().flatten()
-            for ei in range(n_elem):
-                _multi_param_fp32_before.append((name, ei, float(flat[ei].item())))
-            if p.grad is not None and _sample_grad_norm is None:
-                _sample_grad_norm = float(p.grad.detach().float().norm().item())
-                _sample_param_mean_abs = float(p.detach().float().abs().mean().item())
+        fwd: dict[str, Any] = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "use_cache": False,
+        }
+        out = self._run_analysis_forward(fwd, lm_w)
+        if out is None:
+            self._metrics_before = None
+            return
+        H, mc, ml, ls0, lmx0, logits, hidden = out
+        attn = batch["attention_mask"].bool()
+        labels = batch.get("labels")
+        mask = attn
+        if labels is not None:
+            mask = mask & labels.ne(IGNORE_INDEX)
+        logits_focus = _build_logits_focus_snapshot(logits, mask, hidden, lm_w, lm_bias, self.finetuning_args)
 
-        # Probe DeepSpeed engine structure to find fp32 master weights.
-        # HF Trainer: self.model = bare model, self.model_wrapped = DS engine.
-        _ds_fp32_before: Optional[float] = None
-        _ds_engine_type: Optional[str] = None
-        _ds_optimizer_type: Optional[str] = None
-        _ds_fp32_attr_found: Optional[str] = None
-        _model_wrapped_type: Optional[str] = None
-        _model_is_model_wrapped: Optional[bool] = None
-
-        _ds_engine = getattr(self._trainer, "model_wrapped", self._trainer.model)
-        _ds_engine_type = type(_ds_engine).__name__
-        _model_wrapped_type = _ds_engine_type
-        _model_is_model_wrapped = (_ds_engine is self._trainer.model)
-
-        ds_opt = getattr(_ds_engine, "optimizer", None)
-        if ds_opt is not None:
-            _ds_optimizer_type = type(ds_opt).__name__
-            for attr_name in [
-                "fp32_partitioned_groups_flat",
-                "single_partition_of_fp32_groups",
-                "_fp32_partitioned_groups_flat",
-                "fp32_groups_flat",
-                "bit16_groups",
-                "fp32_groups",
-                "param_groups_fp32",
-            ]:
-                obj = getattr(ds_opt, attr_name, None)
-                if obj is not None:
-                    _ds_fp32_attr_found = attr_name
-                    if isinstance(obj, (list, tuple)) and len(obj) > 0:
-                        first = obj[0]
-                        if hasattr(first, "flatten"):
-                            _ds_fp32_before = float(first.flatten()[0].item())
-                    break
-
-        self._pre_step_diag = {
-            "sample_grad_norm": _sample_grad_norm,
-            "sample_param_mean_abs": _sample_param_mean_abs,
-            "direct_param_name": _direct_param_name,
-            "direct_param_fp32_before": _direct_param_fp32_before,
-            "multi_param_fp32_before": _multi_param_fp32_before,
-            "ds_fp32_before": _ds_fp32_before,
-            "ds_engine_type": _ds_engine_type,
-            "ds_optimizer_type": _ds_optimizer_type,
-            "ds_fp32_attr_found": _ds_fp32_attr_found,
-            "model_wrapped_type": _model_wrapped_type,
-            "model_is_model_wrapped": _model_is_model_wrapped,
+        self._metrics_before = {
+            "H": H.detach().clone(),
+            "max_cos": mc.detach().clone(),
+            "max_logit": ml.detach().clone(),
+            "logits_fp64_sum": ls0,
+            "logits_fp64_absmax": lmx0,
+            "logits_focus": logits_focus,
         }
 
-        # CRITICAL: Do NOT run a forward pass here (before optimizer.step).
-        # Under DeepSpeed, calling engine.forward() in on_pre_optimizer_step
-        # resets internal gradient buffers, causing optimizer.step() to see
-        # zero gradients and produce zero parameter updates.
-        # Instead, we only snapshot parameters here and run BOTH "before" and
-        # "after" forward passes in on_optimizer_step (after the step is done).
-        # The "before" forward uses the param snapshot to reconstruct logits
-        # via fp32 dot products; the "after" forward uses live (updated) params.
-        self._metrics_before = {"placeholder": True}
-        return control
+    def analyze_after_backward(self, batch: dict[str, Any]) -> None:
+        r"""Run the "after" analysis forward, compare with snapshot, and write JSON.
 
-    def on_optimizer_step(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs: Any,
-    ) -> TrainerControl:
+        Must be called **after** ``accelerator.backward(loss)`` in ``training_step``.
+        Under DeepSpeed, ``accelerator.backward`` also runs ``engine.step()`` so
+        parameters are already updated when this method executes.
+        """
         if self._trainer is None:
-            return control
-        if getattr(self._trainer.accelerator, "optimizer_step_was_skipped", False):
-            self._metrics_before = None
-            return control
+            return
         before = self._metrics_before
         self._metrics_before = None
         if before is None:
-            return control
-        batch = getattr(self._trainer, "_logits_analysis_batch", None)
-        if batch is None:
-            return control
+            return
 
         _sync_device_after_optimizer(batch["input_ids"].device)
 
@@ -549,7 +496,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         unwrapped = _unwrap_model(model)
         out_emb = unwrapped.get_output_embeddings()
         if out_emb is None:
-            return control
+            return
         lm_w = out_emb.weight
         lm_bias = getattr(out_emb, "bias", None)
 
@@ -559,86 +506,67 @@ class LogitsAnalysisCallback(TrainerCallback):
             param_delta_max = _max_abs_param_delta(unwrapped, self._param_snapshot_pairs)
         self._param_snapshot_pairs = []
 
-        completed_step = int(state.global_step) + 1
-        log_every = max(1, int(self.finetuning_args.logits_analysis_log_every_n_steps))
-        if completed_step % log_every != 0:
-            return control
-        if not self._trainer.is_world_process_zero():
-            return control
-
-        trainable_n = sum(1 for _, p in unwrapped.named_parameters() if p.requires_grad)
-
-        diag = self._pre_step_diag
-        sample_grad_norm = diag.get("sample_grad_norm")
-        sample_param_mean_abs = diag.get("sample_param_mean_abs")
-        bf16_ulp_estimate: Optional[float] = None
-        if sample_param_mean_abs is not None:
-            bf16_ulp_estimate = sample_param_mean_abs / 128.0
-
-        # ── Re-read params after optimizer.step() and compare ──────────────────
-        _direct_param_name = diag.get("direct_param_name")
-        _direct_param_fp32_before = diag.get("direct_param_fp32_before")
-        _name_to_p = dict(unwrapped.named_parameters())
-
-        _direct_param_fp32_after: Optional[float] = None
-        if _direct_param_name is not None:
-            _p_direct = _name_to_p.get(_direct_param_name)
-            if _p_direct is not None:
-                _direct_param_fp32_after = float(_p_direct.detach().float().flatten()[0].item())
-        _direct_param_fp32_delta: Optional[float] = None
-        if _direct_param_fp32_before is not None and _direct_param_fp32_after is not None:
-            _direct_param_fp32_delta = _direct_param_fp32_after - _direct_param_fp32_before
-
-        _multi_before = diag.get("multi_param_fp32_before", [])
-        _multi_deltas: list[dict[str, Any]] = []
-        for pname, eidx, val_before in _multi_before:
-            _pp = _name_to_p.get(pname)
-            if _pp is not None and eidx < _pp.numel():
-                val_after = float(_pp.detach().float().flatten()[eidx].item())
-                _multi_deltas.append({
-                    "name": pname, "idx": eidx,
-                    "before": val_before, "after": val_after,
-                    "delta": val_after - val_before,
-                })
-
-        # DeepSpeed fp32 master weight check — use model_wrapped (the real DS engine)
-        _ds_fp32_before = diag.get("ds_fp32_before")
-        _ds_fp32_attr_found = diag.get("ds_fp32_attr_found")
-        _ds_fp32_after: Optional[float] = None
-        _ds_fp32_delta: Optional[float] = None
-        _ds_engine = getattr(self._trainer, "model_wrapped", self._trainer.model)
-        if _ds_fp32_attr_found is not None:
-            ds_opt = getattr(_ds_engine, "optimizer", None)
-            if ds_opt is not None:
-                obj = getattr(ds_opt, _ds_fp32_attr_found, None)
-                if obj is not None and isinstance(obj, (list, tuple)) and len(obj) > 0:
-                    first = obj[0]
-                    if hasattr(first, "flatten"):
-                        _ds_fp32_after = float(first.flatten()[0].item())
-        if _ds_fp32_before is not None and _ds_fp32_after is not None:
-            _ds_fp32_delta = _ds_fp32_after - _ds_fp32_before
-
-        _callback_called_at = {
-            "pre_optimizer_step": True,
-            "optimizer_step": True,
-            "global_step_at_post": int(state.global_step),
-            "no_pre_step_forward": True,
-        }
-
-        # Run a single "after" forward to get post-step logits (no before/after comparison
-        # this round — we first need to confirm params actually change without the extra forward).
         fwd = {
             "input_ids": batch["input_ids"],
             "attention_mask": batch["attention_mask"],
             "use_cache": False,
         }
-        out_after = self._run_analysis_forward(fwd, lm_w)
-        ls1: Optional[float] = None
-        lmx1: Optional[float] = None
-        if out_after is not None:
-            _, _, _, ls1, lmx1, _, _ = out_after
+        out2 = self._run_analysis_forward(fwd, lm_w)
+        if out2 is None:
+            return
+        H_a, mc_a, ml_a, ls1, lmx1, logits_a, hidden_a = out2
 
-        self._pre_step_diag = {}
+        H_b, mc_b, ml_b = before["H"], before["max_cos"], before["max_logit"]
+        ls0 = float(before["logits_fp64_sum"])
+        lmx0 = float(before["logits_fp64_absmax"])
+        attn = batch["attention_mask"].bool()
+        labels = batch.get("labels")
+        mask = attn
+        if labels is not None:
+            mask = mask & labels.ne(IGNORE_INDEX)
+
+        focus_before = before.get("logits_focus") or []
+        logits_focus_per_position: list[dict[str, Any]] = []
+        logits_focus_mean_abs: Optional[float] = None
+        logits_focus_max_abs: Optional[float] = None
+        logits_focus_fp32_mean_abs: Optional[float] = None
+        logits_focus_fp32_max_abs: Optional[float] = None
+        if focus_before:
+            (
+                logits_focus_per_position,
+                logits_focus_mean_abs,
+                logits_focus_max_abs,
+                logits_focus_fp32_mean_abs,
+                logits_focus_fp32_max_abs,
+            ) = _complete_logits_focus_after(logits_a, hidden_a, lm_w, lm_bias, focus_before)
+
+        dH = H_a - H_b
+        dcos = mc_a - mc_b
+        dl = ml_a - ml_b
+
+        if mask.any():
+            mean_abs_dl = float(dl[mask].float().abs().mean().item())
+        else:
+            mean_abs_dl = 0.0
+
+        th_e = float(self.finetuning_args.logits_analysis_threshold_entropy)
+        th_c = float(self.finetuning_args.logits_analysis_threshold_cosine)
+        high_H = H_b > th_e
+        low_cos = mc_b < th_c
+        g_a = high_H & low_cos & mask
+        g_b = high_H & (~low_cos) & mask
+        g_c = (~high_H) & low_cos & mask
+        g_d = (~high_H) & (~low_cos) & mask
+
+        state = self._trainer.state
+        completed_step = int(state.global_step) + 1
+        log_every = max(1, int(self.finetuning_args.logits_analysis_log_every_n_steps))
+        if completed_step % log_every != 0:
+            return
+        if not self._trainer.is_world_process_zero():
+            return
+
+        trainable_n = sum(1 for _, p in unwrapped.named_parameters() if p.requires_grad)
 
         record: dict[str, Any] = {
             "step": completed_step,
@@ -646,31 +574,29 @@ class LogitsAnalysisCallback(TrainerCallback):
             "trainable_named_param_count": trainable_n,
             "param_snapshot_tensor_count": n_param_snapshots,
             "max_abs_trainable_param_delta": param_delta_max,
-            "diag_sample_grad_norm": sample_grad_norm,
-            "diag_sample_param_mean_abs": sample_param_mean_abs,
-            "diag_bf16_ulp_estimate": bf16_ulp_estimate,
-            "diag_direct_param_name": _direct_param_name,
-            "diag_direct_param_fp32_before": _direct_param_fp32_before,
-            "diag_direct_param_fp32_after": _direct_param_fp32_after,
-            "diag_direct_param_fp32_delta": _direct_param_fp32_delta,
-            "diag_multi_param_deltas": _multi_deltas[:10],
-            "diag_model_wrapped_type": diag.get("model_wrapped_type"),
-            "diag_model_is_model_wrapped": diag.get("model_is_model_wrapped"),
-            "diag_ds_engine_type": diag.get("ds_engine_type"),
-            "diag_ds_optimizer_type": diag.get("ds_optimizer_type"),
-            "diag_ds_fp32_attr_found": diag.get("ds_fp32_attr_found"),
-            "diag_ds_fp32_master_before": _ds_fp32_before,
-            "diag_ds_fp32_master_after": _ds_fp32_after,
-            "diag_ds_fp32_master_delta": _ds_fp32_delta,
-            "diag_callback_timing": _callback_called_at,
-            "diag_note": (
-                "HYPOTHESIS TEST: pre-step forward REMOVED. If multi_param_deltas now show "
-                "non-zero values, the extra engine.forward() in on_pre_optimizer_step was "
-                "destroying DeepSpeed's accumulated gradients before optimizer.step(). "
-                "If deltas are STILL 0.0, the problem is elsewhere."
+            "mean_abs_delta_logit_masked": mean_abs_dl,
+            "logits_focus_mode": getattr(self.finetuning_args, "logits_analysis_focus_mode", "topk"),
+            "logits_focus_positions_n": len(logits_focus_per_position),
+            "logits_focus_mean_abs_delta_model": logits_focus_mean_abs,
+            "logits_focus_max_abs_delta_model": logits_focus_max_abs,
+            "logits_focus_mean_abs_delta_fp32_dot": logits_focus_fp32_mean_abs,
+            "logits_focus_max_abs_delta_fp32_dot": logits_focus_fp32_max_abs,
+            "note_bf16_model_logits_can_match": (
+                "Model logits are often bf16 matmul-rounded; compare delta_logits_fp32_dot when "
+                "delta_logits_model is all zeros."
             ),
+            "logits_focus_per_position": logits_focus_per_position,
+            "logits_fp64_sum_before": ls0,
             "logits_fp64_sum_after": ls1,
+            "logits_fp64_sum_delta": ls1 - ls0,
+            "logits_fp64_absmax_before": lmx0,
             "logits_fp64_absmax_after": lmx1,
+            "logits_fp64_absmax_delta": lmx1 - lmx0,
+            "note_logits_fp64_sum_can_cancel": True,
+            "group_A": _group_stats(dH, dcos, dl, g_a),
+            "group_B": _group_stats(dH, dcos, dl, g_b),
+            "group_C": _group_stats(dH, dcos, dl, g_c),
+            "group_D": _group_stats(dH, dcos, dl, g_d),
         }
         self._optimizer_lr_before_step = None
         out_dir = self.finetuning_args.logits_analysis_output_path
@@ -678,4 +604,23 @@ class LogitsAnalysisCallback(TrainerCallback):
         path = os.path.join(out_dir, f"analysis_step_{completed_step}_{completed_step}.jsonl")
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # ── HF Trainer callbacks (kept as no-ops for compatibility) ─────────────
+
+    def on_pre_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: Any,
+    ) -> TrainerControl:
+        return control
+
+    def on_optimizer_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: Any,
+    ) -> TrainerControl:
         return control
