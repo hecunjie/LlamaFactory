@@ -23,6 +23,46 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Cap total elements cloned for param delta (avoid OOM on full finetuning).
+_MAX_PARAM_SNAPSHOT_NUMEL = 150_000_000
+
+
+def _ordered_trainable_named_params(unwrapped: "torch.nn.Module") -> list[tuple[str, "torch.nn.Parameter"]]:
+    r"""LoRA / adapter tensors first so snapshot budget is not eaten by huge embeddings."""
+    named = [(n, p) for n, p in unwrapped.named_parameters() if p.requires_grad]
+    lora = [(n, p) for n, p in named if "lora" in n.lower()]
+    non = [(n, p) for n, p in named if "lora" not in n.lower()]
+    return lora + non
+
+
+def _build_param_snapshot_pairs(
+    ordered: list[tuple[str, "torch.nn.Parameter"]],
+) -> list[tuple[str, "torch.Tensor"]]:
+    pairs: list[tuple[str, "torch.Tensor"]] = []
+    total_numel = 0
+    for name, p in ordered:
+        n = p.numel()
+        if total_numel + n > _MAX_PARAM_SNAPSHOT_NUMEL:
+            break
+        pairs.append((name, p.detach().cpu().clone()))
+        total_numel += n
+    return pairs
+
+
+def _max_abs_param_delta(
+    unwrapped: "torch.nn.Module",
+    snapshot_pairs: list[tuple[str, "torch.Tensor"]],
+) -> float:
+    name_to_p = dict(unwrapped.named_parameters())
+    mx = 0.0
+    for name, cold in snapshot_pairs:
+        p = name_to_p.get(name)
+        if p is None:
+            continue
+        d = (p.detach().float() - cold.float().to(device=p.device)).abs().max().item()
+        mx = max(mx, float(d))
+    return mx
+
 
 def _sync_device_after_optimizer(device: "torch.device") -> None:
     r"""Ensure optimizer.step() has finished updating parameters before the next forward.
@@ -97,6 +137,13 @@ def _max_cosine_vs_vocab(
     return out
 
 
+def _stat_mean_std(t: "torch.Tensor") -> dict[str, float]:
+    r"""Serialize mean/std without squashing tiny updates: round(..., 6) was turning ~1e-7 into 0.0."""
+    m = float(t.mean().item())
+    s = float(t.std(unbiased=False).item())
+    return {"mean": m, "std": s}
+
+
 def _group_stats(
     delta_h: "torch.Tensor",
     delta_cos: "torch.Tensor",
@@ -110,9 +157,9 @@ def _group_stats(
     dl = delta_logit[group_mask].float()
     return {
         "count": int(group_mask.sum().item()),
-        "delta_H": {"mean": round(dh.mean().item(), 6), "std": round(dh.std(unbiased=False).item(), 6)},
-        "delta_cos": {"mean": round(dc.mean().item(), 6), "std": round(dc.std(unbiased=False).item(), 6)},
-        "delta_logit": {"mean": round(dl.mean().item(), 6), "std": round(dl.std(unbiased=False).item(), 6)},
+        "delta_H": _stat_mean_std(dh),
+        "delta_cos": _stat_mean_std(dc),
+        "delta_logit": _stat_mean_std(dl),
     }
 
 
@@ -126,7 +173,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         self._hidden_cache: dict[str, "torch.Tensor"] = {}
         self._metrics_before: Optional[dict[str, "torch.Tensor"]] = None
         self._warned_no_norm: bool = False
-        self._param_snapshot: Optional["torch.Tensor"] = None
+        self._param_snapshot_pairs: list[tuple[str, "torch.Tensor"]] = []
         self._optimizer_lr_before_step: Optional[float] = None
 
     def attach_trainer(self, trainer: Any) -> None:
@@ -136,8 +183,12 @@ class LogitsAnalysisCallback(TrainerCallback):
         self,
         fwd: dict[str, Any],
         lm_w: "torch.Tensor",
-    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]]:
-        r"""Eval + no_grad: deterministic in weight (no dropout), then restore train mode."""
+    ) -> Optional[tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", float, float]]:
+        r"""Eval + no_grad: deterministic in weight (no dropout), then restore train mode.
+
+        Also returns fp64 logits fingerprints (sum, max abs) to verify weight updates are visible
+        even when bf16 weights round-trip identically.
+        """
         model = self._trainer.model
         was_training = model.training
         model.eval()
@@ -146,6 +197,8 @@ class LogitsAnalysisCallback(TrainerCallback):
             with torch.no_grad():
                 outputs = model(**fwd)
                 logits = outputs.logits
+                logits_fp64_sum = float(logits.detach().double().sum().item())
+                logits_fp64_absmax = float(logits.detach().double().abs().max().item())
                 hidden = self._hidden_cache.get("last_ln")
                 if hidden is None:
                     return None
@@ -154,7 +207,8 @@ class LogitsAnalysisCallback(TrainerCallback):
                     lm_w,
                     seq_chunk=max(1, int(self.finetuning_args.logits_analysis_cosine_seq_chunk)),
                 )
-                return _compute_metrics(logits, max_cos)
+                H, mc, ml = _compute_metrics(logits, max_cos)
+                return H, mc, ml, logits_fp64_sum, logits_fp64_absmax
         finally:
             if was_training:
                 model.train()
@@ -226,11 +280,8 @@ class LogitsAnalysisCallback(TrainerCallback):
             return control
         lm_w = out_emb.weight
 
-        self._param_snapshot = None
-        for p in unwrapped.parameters():
-            if p.requires_grad:
-                self._param_snapshot = p.detach().clone()
-                break
+        ordered = _ordered_trainable_named_params(unwrapped)
+        self._param_snapshot_pairs = _build_param_snapshot_pairs(ordered)
 
         fwd: dict[str, Any] = {
             "input_ids": batch["input_ids"],
@@ -240,11 +291,13 @@ class LogitsAnalysisCallback(TrainerCallback):
         out = self._run_analysis_forward(fwd, lm_w)
         if out is None:
             return control
-        H, mc, ml = out
+        H, mc, ml, ls0, lmx0 = out
         self._metrics_before = {
             "H": H.detach().clone(),
             "max_cos": mc.detach().clone(),
             "max_logit": ml.detach().clone(),
+            "logits_fp64_sum": ls0,
+            "logits_fp64_absmax": lmx0,
         }
         return control
 
@@ -278,12 +331,9 @@ class LogitsAnalysisCallback(TrainerCallback):
         lm_w = out_emb.weight
 
         param_delta_max: Optional[float] = None
-        if self._param_snapshot is not None:
-            for p in unwrapped.parameters():
-                if p.requires_grad:
-                    param_delta_max = (p.detach() - self._param_snapshot.to(p.device)).abs().max().item()
-                    break
-        self._param_snapshot = None
+        if self._param_snapshot_pairs:
+            param_delta_max = _max_abs_param_delta(unwrapped, self._param_snapshot_pairs)
+        self._param_snapshot_pairs = []
 
         fwd = {
             "input_ids": batch["input_ids"],
@@ -293,9 +343,11 @@ class LogitsAnalysisCallback(TrainerCallback):
         out2 = self._run_analysis_forward(fwd, lm_w)
         if out2 is None:
             return control
-        H_a, mc_a, ml_a = out2
+        H_a, mc_a, ml_a, ls1, lmx1 = out2
 
         H_b, mc_b, ml_b = before["H"], before["max_cos"], before["max_logit"]
+        ls0 = float(before["logits_fp64_sum"])
+        lmx0 = float(before["logits_fp64_absmax"])
         attn = batch["attention_mask"].bool()
         labels = batch.get("labels")
         mask = attn
@@ -327,11 +379,19 @@ class LogitsAnalysisCallback(TrainerCallback):
         if not self._trainer.is_world_process_zero():
             return control
 
+        trainable_n = sum(1 for _, p in unwrapped.named_parameters() if p.requires_grad)
         record: dict[str, Any] = {
             "step": completed_step,
             "optimizer_lr": self._optimizer_lr_before_step,
-            "sample_max_abs_param_delta": param_delta_max,
-            "mean_abs_delta_logit_masked": round(mean_abs_dl, 8),
+            "trainable_named_param_count": trainable_n,
+            "max_abs_trainable_param_delta": param_delta_max,
+            "mean_abs_delta_logit_masked": mean_abs_dl,
+            "logits_fp64_sum_before": ls0,
+            "logits_fp64_sum_after": ls1,
+            "logits_fp64_sum_delta": ls1 - ls0,
+            "logits_fp64_absmax_before": lmx0,
+            "logits_fp64_absmax_after": lmx1,
+            "logits_fp64_absmax_delta": lmx1 - lmx0,
             "group_A": _group_stats(dH, dcos, dl, g_a),
             "group_B": _group_stats(dH, dcos, dl, g_b),
             "group_C": _group_stats(dH, dcos, dl, g_c),
