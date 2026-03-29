@@ -267,6 +267,138 @@ def _save_lse_threshold_summary(agg: dict[str, Any], out_path: Path) -> None:
         out_path.write_text(text, encoding="utf-8")
 
 
+def _resolve_final_norm(model: Any) -> Any:
+    """与 CausalLM 在 logits 前使用的 final norm 对齐（Llama: model.model.norm）。"""
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        for name in ("norm", "final_layernorm", "ln_f"):
+            if hasattr(inner, name):
+                return getattr(inner, name)
+    tr = getattr(model, "transformer", None)
+    if tr is not None and hasattr(tr, "ln_f"):
+        return tr.ln_f
+    return None
+
+
+def _logsumexp_logits_from_pre_norm_hidden(
+    hidden_2d: torch.Tensor,
+    final_norm: Any,
+    lm_head: Any,
+) -> np.ndarray:
+    """hidden 为某层输出（与 HF hidden_states[k] 一致，未经 final norm）；先 final_norm 再 lm_head，与 base logits 公平可比。"""
+    h = final_norm(hidden_2d.float())
+    logits = lm_head(h)
+    logits_fp32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    return torch.logsumexp(logits_fp32, dim=-1).detach().cpu().numpy()
+
+
+def _layer_probe_extend_deltas(
+    out: Any,
+    batch_i: int,
+    pred_start: int,
+    pred_end: int,
+    npos: int,
+    lse_base: np.ndarray,
+    mask: np.ndarray,
+    final_norm: Any,
+    lm_head: Any,
+    delta_by_layer: list[list[float]],
+    lse_by_layer: list[list[float]],
+) -> None:
+    """在 mask 为 True 的位置上，对各层 hidden 经同一 final_norm+lm_head 算 log_sum_exp，并记录与 base 的差。"""
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return
+    base_sel = lse_base[idx]
+    hs = out.hidden_states
+    for ell in range(len(hs)):
+        h_full = hs[ell][batch_i, pred_start:pred_end, :][:npos].float()
+        h_sel = h_full[idx]
+        lse_ell = _logsumexp_logits_from_pre_norm_hidden(h_sel, final_norm, lm_head)
+        delta = lse_ell - base_sel
+        while len(delta_by_layer) <= ell:
+            delta_by_layer.append([])
+            lse_by_layer.append([])
+        delta_by_layer[ell].extend(delta.astype(np.float64).tolist())
+        lse_by_layer[ell].extend(lse_ell.astype(np.float64).tolist())
+
+
+def _finalize_layer_probe_stats(
+    delta_by_layer: list[list[float]],
+    lse_by_layer: list[list[float]],
+    *,
+    variant_tag: str,
+    filter_mode: str,
+    filter_payload: dict[str, Any],
+    n_model_hidden_states: int,
+) -> dict[str, Any]:
+    per_layer: list[dict[str, Any]] = []
+    for ell in range(len(delta_by_layer)):
+        d = np.array(delta_by_layer[ell], dtype=np.float64)
+        le = np.array(lse_by_layer[ell], dtype=np.float64) if ell < len(lse_by_layer) else np.array([])
+        row: dict[str, Any] = {
+            "hidden_state_index": ell,
+            "n_positions": int(d.size),
+        }
+        if d.size > 0:
+            row["mean_delta_lse_minus_base"] = float(np.mean(d))
+            row["std_delta_lse_minus_base"] = float(np.std(d, ddof=0))
+            row["mean_log_sum_exp_at_layer"] = float(np.mean(le)) if le.size == d.size else None
+        else:
+            row["mean_delta_lse_minus_base"] = None
+            row["std_delta_lse_minus_base"] = None
+            row["mean_log_sum_exp_at_layer"] = None
+        per_layer.append(row)
+    return {
+        "description": (
+            "各层：对 hidden_states[ℓ] 先经与 logits 相同的 final LayerNorm/RMSNorm，再过 lm_head 得到 log_sum_exp；"
+            "delta = 该值 − base（模型输出 logits 的 log_sum_exp）。最后一层应与 0 接近。"
+        ),
+        "variant": variant_tag,
+        "filter_mode": filter_mode,
+        "filter": filter_payload,
+        "n_hidden_states_tuple": int(n_model_hidden_states),
+        "per_layer": per_layer,
+    }
+
+
+def _plot_lse_layer_probe(summary: dict[str, Any], output_path: Path, title_suffix: str = "") -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    per_layer = summary.get("per_layer") or []
+    xs: list[int] = []
+    means: list[float] = []
+    stds: list[float] = []
+    for row in per_layer:
+        ell = int(row["hidden_state_index"])
+        m = row.get("mean_delta_lse_minus_base")
+        s = row.get("std_delta_lse_minus_base")
+        if m is None:
+            continue
+        xs.append(ell)
+        means.append(float(m))
+        stds.append(float(s) if s is not None and not (isinstance(s, float) and math.isnan(s)) else 0.0)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if not xs:
+        ax.text(0.5, 0.5, "无层探测数据", ha="center", va="center", transform=ax.transAxes)
+    else:
+        ax.errorbar(xs, means, yerr=stds, fmt="-o", capsize=3, color="tab:blue", ecolor="tab:gray", linewidth=1.2)
+        ax.axhline(0.0, color="k", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.set_xlabel("hidden_states 索引（0 常为 embedding 后，末层为最后一层 block 输出）")
+        ax.set_ylabel("Δ log_sum_exp = LSE( LN(h_ℓ)→lm_head ) − LSE(base logits)")
+        ttl = "各层与 base 的 log_sum_exp 差（仅低 base LSE 位置）"
+        if title_suffix:
+            ttl = f"{ttl} ({title_suffix})"
+        ax.set_title(ttl)
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, format="png")
+    plt.close(fig)
+
+
 def _plot_results(
     all_high_rows: list[dict[str, Any]],
     output_plot: Path,
@@ -437,10 +569,43 @@ def main() -> None:
         default=None,
         help="阈值汇总输出路径（.json 或单行 .jsonl）；默认 {stem}_lse_threshold_report.json。",
     )
+    parser.add_argument(
+        "--lse_layer_probe",
+        action="store_true",
+        help=(
+            "在 base log_sum_exp 较低的位置，对各层 hidden_states[ℓ] 先经与 logits 相同的 final LayerNorm/RMSNorm，"
+            "再过 lm_head 计算 log_sum_exp，并保存 Δ=LSE_ℓ−LSE_base，汇总并画图。"
+        ),
+    )
+    parser.add_argument(
+        "--lse_layer_probe_max_base_lse",
+        type=float,
+        default=float("nan"),
+        help="选中「base LSE ≤ 该值」的 token（与 --lse_layer_probe_bottom_quantile 二选一）。",
+    )
+    parser.add_argument(
+        "--lse_layer_probe_bottom_quantile",
+        type=float,
+        default=None,
+        help="在全集 response token 的 base LSE 上取该分位数为界，≤ 界者为「低」（如 0.2；将额外跑一遍 forward）。与 max_base 二选一。",
+    )
     args = parser.parse_args()
 
     if args.lse_threshold_report and not math.isfinite(args.log_sum_exp_threshold):
         raise ValueError("使用 --lse_threshold_report 时必须指定有限的 --log_sum_exp_threshold")
+
+    if args.lse_layer_probe:
+        has_max = math.isfinite(args.lse_layer_probe_max_base_lse)
+        has_q = (
+            args.lse_layer_probe_bottom_quantile is not None
+            and 0 < args.lse_layer_probe_bottom_quantile < 1
+        )
+        if not has_max and not has_q:
+            raise ValueError(
+                "--lse_layer_probe 需要指定 --lse_layer_probe_max_base_lse 或 --lse_layer_probe_bottom_quantile（0~1 之间）"
+            )
+        if has_max and has_q:
+            raise ValueError("--lse_layer_probe：请勿同时指定 max_base_lse 与 bottom_quantile")
 
     if args.only_correct and args.all_samples:
         raise ValueError("--only_correct 与 --all_samples 不能同时设置")
@@ -509,6 +674,13 @@ def main() -> None:
 
     tied = bool(model.lm_head.weight is model.model.embed_tokens.weight)
     print(f"[check] tied embedding: {tied}")
+    final_norm = _resolve_final_norm(model)
+    if args.lse_layer_probe:
+        if final_norm is None:
+            raise RuntimeError(
+                "未找到 final LayerNorm/RMSNorm（model.model.norm 等），无法进行 --lse_layer_probe；请换支持的 CausalLM 结构。"
+            )
+        print(f"[check] final norm for fair LSE probe: {type(final_norm).__name__}")
     embed_matrix = model.model.embed_tokens.weight
     embed_norm = F.normalize(embed_matrix.detach(), dim=1)
     embed_norm_t = embed_norm.transpose(0, 1).contiguous()
@@ -576,6 +748,16 @@ def main() -> None:
                 lse_thr_out_path = Path(args.output_lse_threshold_jsonl)
             else:
                 lse_thr_out_path = output_plot_path.parent / f"{output_plot_path.stem}_lse_threshold_report.json"
+
+        layer_probe_pass1: list[tuple[int, int, float]] = []
+        layer_delta_by_layer: list[list[float]] = []
+        layer_lse_by_layer: list[list[float]] = []
+        layer_probe_summary: dict[str, Any] | None = None
+        use_lse_layer_q = (
+            args.lse_layer_probe
+            and args.lse_layer_probe_bottom_quantile is not None
+            and 0 < float(args.lse_layer_probe_bottom_quantile) < 1
+        )
 
         all_entropies_local: list[float] = []
         all_max_sims_local: list[float] = []
@@ -708,6 +890,26 @@ def main() -> None:
                         lse_thr_min_lse,
                         lse_thr_pos_ratio,
                     )
+                if args.lse_layer_probe and final_norm is not None:
+                    if use_lse_layer_q:
+                        for t in range(npos):
+                            layer_probe_pass1.append((st + i, t, float(lse_vec[t])))
+                    elif math.isfinite(args.lse_layer_probe_max_base_lse):
+                        mask_probe = lse_vec <= float(args.lse_layer_probe_max_base_lse)
+                        if np.any(mask_probe):
+                            _layer_probe_extend_deltas(
+                                out,
+                                i,
+                                pred_start,
+                                pred_end,
+                                npos,
+                                lse_vec,
+                                mask_probe,
+                                final_norm,
+                                model.lm_head,
+                                layer_delta_by_layer,
+                                layer_lse_by_layer,
+                            )
                 probs = torch.softmax(logits_i_fp32, dim=-1)
                 log_probs = torch.log(probs.clamp_min(1e-12))
                 entropy = -(probs * log_probs).sum(dim=-1)
@@ -927,6 +1129,110 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if args.lse_layer_probe and final_norm is not None and use_lse_layer_q and layer_probe_pass1:
+            qv = float(args.lse_layer_probe_bottom_quantile)
+            arr_p1 = np.array([x[2] for x in layer_probe_pass1], dtype=np.float64)
+            thr_q = float(np.quantile(arr_p1, qv))
+            qualify = {(a, b) for a, b, c in layer_probe_pass1 if c <= thr_q}
+            for st in tqdm(
+                range(0, len(rows_selected_local), args.batch_size),
+                desc=f"lse_layer_probe_p2({variant_tag})",
+            ):
+                batch_rows = rows_selected_local[st : st + args.batch_size]
+                full_texts = [str(r.get("prompt", "")) + str(r.get("predict", "")) for r in batch_rows]
+                prompts = [str(r.get("prompt", "")) for r in batch_rows]
+                enc = tokenizer(
+                    full_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=False,
+                    add_special_tokens=False,
+                )
+                input_ids = enc["input_ids"].to(model.lm_head.weight.device)
+                attention_mask = enc["attention_mask"].to(model.lm_head.weight.device)
+                prompt_lens_p2: list[int] = []
+                for p in prompts:
+                    p_ids = tokenizer(p, add_special_tokens=False)["input_ids"]
+                    prompt_lens_p2.append(len(p_ids))
+                with torch.no_grad():
+                    out_p2 = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                    )
+                logits_p2 = out_p2.logits
+                bsz_p2 = logits_p2.shape[0]
+                for ii in range(bsz_p2):
+                    attn_len = int(attention_mask[ii].sum().item())
+                    prompt_len = int(prompt_lens_p2[ii])
+                    if attn_len <= 1 or prompt_len >= attn_len:
+                        continue
+                    pred_start = max(prompt_len - 1, 0)
+                    pred_end = attn_len - 1
+                    if pred_start >= pred_end:
+                        continue
+                    logits_i = logits_p2[ii, pred_start:pred_end, :]
+                    target_ids = input_ids[ii, prompt_len:attn_len]
+                    npos = int(min(logits_i.shape[0], target_ids.shape[0]))
+                    if npos <= 0:
+                        continue
+                    logits_i = logits_i[:npos]
+                    logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                    lse_vec_p2 = torch.logsumexp(logits_i_fp32, dim=-1).float().cpu().numpy()
+                    mask = np.array([(st + ii, t) in qualify for t in range(npos)], dtype=bool)
+                    if np.any(mask):
+                        _layer_probe_extend_deltas(
+                            out_p2,
+                            ii,
+                            pred_start,
+                            pred_end,
+                            npos,
+                            lse_vec_p2,
+                            mask,
+                            final_norm,
+                            model.lm_head,
+                            layer_delta_by_layer,
+                            layer_lse_by_layer,
+                        )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        if args.lse_layer_probe and final_norm is not None:
+            if use_lse_layer_q and layer_probe_pass1:
+                arr_p1 = np.array([x[2] for x in layer_probe_pass1], dtype=np.float64)
+                thr_q = float(np.quantile(arr_p1, float(args.lse_layer_probe_bottom_quantile)))
+                filter_payload_lp: dict[str, Any] = {
+                    "mode": "bottom_quantile",
+                    "quantile": float(args.lse_layer_probe_bottom_quantile),
+                    "threshold_base_lse": thr_q,
+                    "n_response_tokens_total": int(arr_p1.size),
+                }
+            else:
+                filter_payload_lp = {
+                    "mode": "max_base_lse",
+                    "max_base_lse": float(args.lse_layer_probe_max_base_lse),
+                }
+            n_hs_tuple = len(layer_delta_by_layer) if layer_delta_by_layer else 0
+            layer_probe_summary = _finalize_layer_probe_stats(
+                layer_delta_by_layer,
+                layer_lse_by_layer,
+                variant_tag=variant_tag,
+                filter_mode=filter_mode,
+                filter_payload=filter_payload_lp,
+                n_model_hidden_states=n_hs_tuple,
+            )
+            probe_json = output_plot_path.parent / f"{output_plot_path.stem}_lse_layer_probe.json"
+            probe_png = output_plot_path.parent / f"{output_plot_path.stem}_lse_layer_probe.png"
+            probe_json.write_text(json.dumps(layer_probe_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            _plot_lse_layer_probe(layer_probe_summary, probe_png, title_suffix=variant_tag)
+            print(f"\n[lse_layer_probe] JSON: {probe_json.resolve()}")
+            print(f"[lse_layer_probe] PNG:  {probe_png.resolve()}")
+            pl = layer_probe_summary.get("per_layer") or []
+            if pl:
+                last_mean = pl[-1].get("mean_delta_lse_minus_base")
+                n0 = pl[0].get("n_positions", 0)
+                print(f"[lse_layer_probe] 末层 mean Δ（应≈0）: {last_mean} | 每层采样位置数（以第 0 层计）: {n0}")
+
         all_ent_arr = np.asarray(all_entropies_local, dtype=np.float64)
         all_sim_arr = np.asarray(all_max_sims_local, dtype=np.float64)
         all_ent_arr = all_ent_arr[np.isfinite(all_ent_arr)]
@@ -1029,6 +1335,8 @@ def main() -> None:
         out_ret: dict[str, Any] = {**summary, "log_sum_exp": lse_stats_payload}
         if lse_thr_agg is not None:
             out_ret["lse_threshold_report"] = lse_thr_agg
+        if layer_probe_summary is not None:
+            out_ret["lse_layer_probe"] = layer_probe_summary
         return out_ret
 
     # 1) 原始输出分析
