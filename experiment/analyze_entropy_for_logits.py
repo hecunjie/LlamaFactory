@@ -107,12 +107,13 @@ def classify_case(
     entropy_threshold: float,
     sim_threshold: float,
 ) -> str:
+    # 先 B：隐藏状态与词嵌入相似度过低
+    if max_cosine_sim < sim_threshold:
+        return CASE_B
     if entropy <= entropy_threshold:
         return CASE_NORMAL
     if top5_mass >= 0.6 and top1_prob < 0.4:
         return CASE_A
-    if max_cosine_sim < sim_threshold:
-        return CASE_B
     return CASE_AMBIGUOUS
 
 
@@ -122,10 +123,11 @@ def classify_high_case(
     max_cosine_sim: float,
     sim_threshold: float,
 ) -> str:
-    if top5_mass >= 0.6 and top1_prob < 0.4:
-        return CASE_A
+    # 与 classify_case 一致：先 B，再 A，其余 ambiguous（高熵子集不写 normal）
     if max_cosine_sim < sim_threshold:
         return CASE_B
+    if top5_mass >= 0.6 and top1_prob < 0.4:
+        return CASE_A
     return CASE_AMBIGUOUS
 
 
