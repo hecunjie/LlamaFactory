@@ -1457,6 +1457,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._eval_loss_buffer["sft"].append(loss_answer.detach().float().cpu())
         self._eval_loss_buffer["reasoning"].append(loss_reasoning.detach().float().cpu())
 
+        # Skip returning logits when nothing needs gathered predictions: HF evaluation_loop does
+        # all_preds.add(logits) per batch, which OOMs on large [B,T,V] or full-run [B,T] tensors.
+        if getattr(self, "compute_metrics", None) is None or prediction_loss_only:
+            return total_loss.detach(), None, labels
+
         return total_loss.detach(), logits, labels
 
     @override
