@@ -137,6 +137,57 @@ def _summarize(arr: np.ndarray, keys: list[float]) -> dict[float, float]:
     return {k: float(np.quantile(arr, k)) for k in keys}
 
 
+def _plot_log_sum_exp_quantiles(values: np.ndarray, output_path: Path, title_suffix: str = "") -> None:
+    """经验分位数曲线：横轴为百分位，纵轴为 log_sum_exp。"""
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No log_sum_exp values.", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return
+    qs = np.linspace(0.0, 1.0, 101)
+    y = np.quantile(values, qs)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(qs * 100.0, y, color="tab:blue", linewidth=1.5)
+    ax.fill_between(qs * 100.0, y, alpha=0.15, color="tab:blue")
+    ax.set_xlabel("分位数 (百分位)")
+    ax.set_ylabel("log_sum_exp")
+    ttl = "log_sum_exp 经验分位数曲线"
+    if title_suffix:
+        ttl = f"{ttl} ({title_suffix})"
+    ax.set_title(ttl)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def _save_log_sum_exp_stats(
+    all_lse: np.ndarray,
+    lse_group_a: np.ndarray,
+    output_json: Path,
+) -> dict[str, Any]:
+    preset_q = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+    out: dict[str, Any] = {
+        "n_positions_all": int(all_lse.size),
+        "n_positions_case_A": int(lse_group_a.size),
+        "mean_log_sum_exp_case_A": float(np.mean(lse_group_a)) if lse_group_a.size > 0 else None,
+        "quantiles_all": {},
+    }
+    if all_lse.size > 0:
+        a = all_lse[np.isfinite(all_lse)]
+        for p in preset_q:
+            pct = int(round(p * 100))
+            out["quantiles_all"][f"p{pct:02d}"] = float(np.quantile(a, p))
+    with output_json.open("w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    return out
+
+
 def _plot_results(
     all_high_rows: list[dict[str, Any]],
     output_plot: Path,
@@ -410,6 +461,8 @@ def main() -> None:
     ) -> dict[str, Any]:
         all_entropies_local: list[float] = []
         all_max_sims_local: list[float] = []
+        all_lse_local: list[float] = []
+        lse_case_a_local: list[float] = []
         # CASE_NORMAL 目前只用于统计，不参与高熵 token 的聚类输出
         case_counts_global_local = {CASE_NORMAL: 0, CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
         case_counts_high_local = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
@@ -525,6 +578,7 @@ def main() -> None:
 
                 # 数值稳定：在 fp32 上计算概率与熵，避免 fp16 下出现 NaN/Inf
                 logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+                lse_vec = torch.logsumexp(logits_i_fp32, dim=-1).float().cpu().numpy()
                 probs = torch.softmax(logits_i_fp32, dim=-1)
                 log_probs = torch.log(probs.clamp_min(1e-12))
                 entropy = -(probs * log_probs).sum(dim=-1)
@@ -568,6 +622,11 @@ def main() -> None:
                         entropy_threshold=args.entropy_threshold,
                         sim_threshold=args.sim_threshold,
                     )
+                    lse_t = float(lse_vec[t])
+                    if np.isfinite(lse_t):
+                        all_lse_local.append(lse_t)
+                        if case == CASE_A:
+                            lse_case_a_local.append(lse_t)
                     sample_case_counts[case] += 1
                     case_counts_global_local[case] += 1
                     if np.isfinite(e):
@@ -771,6 +830,23 @@ def main() -> None:
         else:
             print("\n最大余弦相似度统计：无数据")
 
+        all_lse_arr = np.asarray(all_lse_local, dtype=np.float64)
+        lse_a_arr = np.asarray(lse_case_a_local, dtype=np.float64)
+        lse_plot_path = output_plot_path.parent / f"{output_plot_path.stem}_log_sum_exp_quantiles.png"
+        lse_stats_path = output_plot_path.parent / f"{output_plot_path.stem}_log_sum_exp_stats.json"
+        _plot_log_sum_exp_quantiles(all_lse_arr, lse_plot_path, title_suffix=variant_tag)
+        lse_stats_payload = _save_log_sum_exp_stats(all_lse_arr, lse_a_arr, lse_stats_path)
+        print("\n[log_sum_exp] 全位置经验分位数图:", lse_plot_path.resolve())
+        print(f"[log_sum_exp] 统计 JSON: {lse_stats_path.resolve()}")
+        mean_a = lse_stats_payload["mean_log_sum_exp_case_A"]
+        if mean_a is not None:
+            print(
+                f"[log_sum_exp] CASE_A（A_multipeak）log_sum_exp 均值: {mean_a:.6f} "
+                f"(n={lse_stats_payload['n_positions_case_A']})"
+            )
+        else:
+            print("[log_sum_exp] CASE_A（A_multipeak）无位置，均值不可用。")
+
         if print_examples:
             examples = _collect_examples(all_high_rows_local, per_case=2)
             for c in [CASE_A, CASE_B, CASE_AMBIGUOUS]:
@@ -791,7 +867,7 @@ def main() -> None:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"[jsonl] saved: {output_jsonl_path.resolve()}")
 
-        return summary
+        return {**summary, "log_sum_exp": lse_stats_payload}
 
     # 1) 原始输出分析
     summary_original = run_for_rows(
