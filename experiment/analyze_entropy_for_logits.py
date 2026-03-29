@@ -286,7 +286,10 @@ def _logsumexp_logits_from_pre_norm_hidden(
     lm_head: Any,
 ) -> np.ndarray:
     """hidden 为某层输出（与 HF hidden_states[k] 一致，未经 final norm）；先 final_norm 再 lm_head，与 base logits 公平可比。"""
-    h = final_norm(hidden_2d.float())
+    # 与 lm_head.weight 对齐（常见为 fp16 + device_map 时），避免 matmul dtype 不一致
+    w_dtype = lm_head.weight.dtype
+    h = hidden_2d.to(dtype=w_dtype)
+    h = final_norm(h)
     logits = lm_head(h)
     logits_fp32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
     return torch.logsumexp(logits_fp32, dim=-1).detach().cpu().numpy()
@@ -312,7 +315,7 @@ def _layer_probe_extend_deltas(
     base_sel = lse_base[idx]
     hs = out.hidden_states
     for ell in range(len(hs)):
-        h_full = hs[ell][batch_i, pred_start:pred_end, :][:npos].float()
+        h_full = hs[ell][batch_i, pred_start:pred_end, :][:npos]
         h_sel = h_full[idx]
         lse_ell = _logsumexp_logits_from_pre_norm_hidden(h_sel, final_norm, lm_head)
         delta = lse_ell - base_sel
