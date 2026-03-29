@@ -188,103 +188,67 @@ def _save_log_sum_exp_stats(
     return out
 
 
-def _lse_threshold_sample_row(
-    *,
-    sample_idx: int,
-    variant_tag: str,
-    filter_mode: str,
-    threshold: float,
-    lse_vec: np.ndarray | None,
+def _accumulate_lse_threshold_one_response(
+    lse_vec: np.ndarray,
     npos: int,
-    is_correct: bool,
-    skip_reason: str | None = None,
-) -> dict[str, Any]:
-    """单条 response 路径上的 log_sum_exp 阈值统计（与 classify 的 token 范围一致）。"""
-    base: dict[str, Any] = {
-        "record_type": "sample",
-        "sample_idx": int(sample_idx),
-        "variant": variant_tag,
-        "filter_mode": filter_mode,
-        "log_sum_exp_threshold": float(threshold),
-        "is_correct": bool(is_correct),
-    }
-    if skip_reason is not None or lse_vec is None or npos <= 0:
-        base.update(
-            {
-                "response_length": 0,
-                "n_positions_lse_below_threshold": None,
-                "frac_positions_lse_below_threshold": None,
-                "min_log_sum_exp": None,
-                "min_lse_index_in_response_0based": None,
-                "min_lse_position_in_response_1based": None,
-                "min_lse_position_ratio_in_response": None,
-                "skip_reason": skip_reason or "empty_response_span",
-            }
-        )
-        return base
+    threshold: float,
+    out_rl: list[int],
+    out_below: list[int],
+    out_frac: list[float],
+    out_min_lse: list[float],
+    out_pos_ratio: list[float],
+) -> None:
+    """在有效 response 段上累积单样本标量（与 classify 的 token 范围一致）。"""
+    if npos <= 0:
+        return
     lse_np = np.asarray(lse_vec, dtype=np.float64)
     rl = int(npos)
     below = int(np.sum(lse_np < float(threshold)))
     frac = (below / rl) if rl > 0 else float("nan")
     min_lse = float(np.min(lse_np))
     argmin = int(np.argmin(lse_np))
-    pos_1 = argmin + 1
-    pos_ratio = (pos_1 / rl) if rl > 0 else float("nan")
-    base.update(
-        {
-            "response_length": rl,
-            "n_positions_lse_below_threshold": below,
-            "frac_positions_lse_below_threshold": frac,
-            "min_log_sum_exp": min_lse,
-            "min_lse_index_in_response_0based": argmin,
-            "min_lse_position_in_response_1based": pos_1,
-            "min_lse_position_ratio_in_response": pos_ratio,
-            "skip_reason": None,
-        }
-    )
-    return base
+    pos_ratio = ((argmin + 1) / rl) if rl > 0 else float("nan")
+    out_rl.append(rl)
+    out_below.append(below)
+    out_frac.append(frac)
+    out_min_lse.append(min_lse)
+    out_pos_ratio.append(pos_ratio)
 
 
-def _aggregate_lse_threshold_rows(sample_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    if not sample_rows:
-        return {
-            "record_type": "aggregate",
-            "variant": None,
-            "filter_mode": None,
-            "log_sum_exp_threshold": None,
-            "n_samples_total": 0,
-            "n_samples_with_response": 0,
-            "mean_response_length": None,
-            "mean_frac_positions_lse_below_threshold": None,
-            "global_frac_positions_lse_below_threshold": None,
-            "mean_min_lse_position_ratio_in_response": None,
-            "mean_min_log_sum_exp": None,
-        }
-    valid = [r for r in sample_rows if int(r.get("response_length") or 0) > 0 and r.get("skip_reason") is None]
-    thr = sample_rows[0].get("log_sum_exp_threshold")
-    variant = sample_rows[0].get("variant")
-    fmode = sample_rows[0].get("filter_mode")
+def _build_lse_threshold_aggregate(
+    *,
+    threshold: float,
+    variant_tag: str,
+    filter_mode: str,
+    n_samples_total: int,
+    response_lengths: list[int],
+    below_counts: list[int],
+    fracs_below: list[float],
+    min_lses: list[float],
+    min_pos_ratios: list[float],
+) -> dict[str, Any]:
+    """由全样本累积列表生成唯一汇总字典。"""
+    n_ok = len(response_lengths)
     out: dict[str, Any] = {
-        "record_type": "aggregate",
-        "variant": variant,
-        "filter_mode": fmode,
-        "log_sum_exp_threshold": thr,
-        "n_samples_total": len(sample_rows),
-        "n_samples_with_response": len(valid),
+        "variant": variant_tag,
+        "filter_mode": filter_mode,
+        "log_sum_exp_threshold": float(threshold),
+        "n_samples_total": int(n_samples_total),
+        "n_samples_with_response": int(n_ok),
         "mean_response_length": None,
         "mean_frac_positions_lse_below_threshold": None,
         "global_frac_positions_lse_below_threshold": None,
         "mean_min_lse_position_ratio_in_response": None,
         "mean_min_log_sum_exp": None,
     }
-    if not valid:
+    if n_ok == 0:
         return out
-    rl = np.array([int(r["response_length"]) for r in valid], dtype=np.float64)
-    fr = np.array([float(r["frac_positions_lse_below_threshold"]) for r in valid], dtype=np.float64)
-    mins = np.array([float(r["min_log_sum_exp"]) for r in valid], dtype=np.float64)
-    pr = np.array([float(r["min_lse_position_ratio_in_response"]) for r in valid], dtype=np.float64)
-    total_below = sum(int(r["n_positions_lse_below_threshold"]) for r in valid)
-    total_pos = sum(int(r["response_length"]) for r in valid)
+    rl = np.array(response_lengths, dtype=np.float64)
+    fr = np.array(fracs_below, dtype=np.float64)
+    mins = np.array(min_lses, dtype=np.float64)
+    pr = np.array(min_pos_ratios, dtype=np.float64)
+    total_below = int(sum(below_counts))
+    total_pos = int(sum(response_lengths))
     out["mean_response_length"] = float(np.mean(rl))
     out["mean_frac_positions_lse_below_threshold"] = float(np.mean(fr))
     out["global_frac_positions_lse_below_threshold"] = (total_below / total_pos) if total_pos > 0 else None
@@ -293,14 +257,14 @@ def _aggregate_lse_threshold_rows(sample_rows: list[dict[str, Any]]) -> dict[str
     return out
 
 
-def _write_lse_threshold_jsonl(sample_rows: list[dict[str, Any]], out_path: Path) -> dict[str, Any]:
-    agg = _aggregate_lse_threshold_rows(sample_rows)
+def _save_lse_threshold_summary(agg: dict[str, Any], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        for row in sample_rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        f.write(json.dumps(agg, ensure_ascii=False) + "\n")
-    return agg
+    text = json.dumps(agg, ensure_ascii=False, indent=2)
+    if out_path.suffix.lower() == ".jsonl":
+        with out_path.open("w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    else:
+        out_path.write_text(text, encoding="utf-8")
 
 
 def _plot_results(
@@ -457,8 +421,8 @@ def main() -> None:
         "--lse_threshold_report",
         action="store_true",
         help=(
-            "按样本统计：response 上 log_sum_exp 低于阈值的占比、response_length 均值、"
-            "最小 log_sum_exp 及其在 response 内位置占比等，写入一条 JSONL（末行为汇总）。"
+            "在全集上汇总：response 上低于阈值的占比、response_length 均值、"
+            "最小 log_sum_exp 及其位置占比等，写入单个 JSON（仅汇总，无逐样本行）。"
         ),
     )
     parser.add_argument(
@@ -471,7 +435,7 @@ def main() -> None:
         "--output_lse_threshold_jsonl",
         type=str,
         default=None,
-        help="阈值报告输出路径；默认与 entropy 图同目录，文件名 {stem}_lse_threshold_report.jsonl。",
+        help="阈值汇总输出路径（.json 或单行 .jsonl）；默认 {stem}_lse_threshold_report.json。",
     )
     args = parser.parse_args()
 
@@ -600,14 +564,18 @@ def main() -> None:
         print_examples: bool = True,
         filter_mode: str = "wrong",
     ) -> dict[str, Any]:
-        lse_threshold_sample_rows: list[dict[str, Any]] = []
-        lse_thr_jsonl_path: Path | None = None
+        lse_thr_rl: list[int] = []
+        lse_thr_below: list[int] = []
+        lse_thr_frac: list[float] = []
+        lse_thr_min_lse: list[float] = []
+        lse_thr_pos_ratio: list[float] = []
+        lse_thr_out_path: Path | None = None
         lse_thr_agg: dict[str, Any] | None = None
         if args.lse_threshold_report:
             if args.output_lse_threshold_jsonl:
-                lse_thr_jsonl_path = Path(args.output_lse_threshold_jsonl)
+                lse_thr_out_path = Path(args.output_lse_threshold_jsonl)
             else:
-                lse_thr_jsonl_path = output_plot_path.parent / f"{output_plot_path.stem}_lse_threshold_report.jsonl"
+                lse_thr_out_path = output_plot_path.parent / f"{output_plot_path.stem}_lse_threshold_report.json"
 
         all_entropies_local: list[float] = []
         all_max_sims_local: list[float] = []
@@ -666,19 +634,6 @@ def main() -> None:
                 sample_total_positions = 0
 
                 if attn_len <= 1 or prompt_len >= attn_len:
-                    if args.lse_threshold_report:
-                        lse_threshold_sample_rows.append(
-                            _lse_threshold_sample_row(
-                                sample_idx=st + i,
-                                variant_tag=variant_tag,
-                                filter_mode=filter_mode,
-                                threshold=float(args.log_sum_exp_threshold),
-                                lse_vec=None,
-                                npos=0,
-                                is_correct=is_correct,
-                                skip_reason="attn_len_or_prompt_span_invalid",
-                            )
-                        )
                     batch_sample_buffers.append(
                         {
                             "prompt_preview": prompts[i],
@@ -698,19 +653,6 @@ def main() -> None:
                 pred_start = max(prompt_len - 1, 0)
                 pred_end = attn_len - 1
                 if pred_start >= pred_end:
-                    if args.lse_threshold_report:
-                        lse_threshold_sample_rows.append(
-                            _lse_threshold_sample_row(
-                                sample_idx=st + i,
-                                variant_tag=variant_tag,
-                                filter_mode=filter_mode,
-                                threshold=float(args.log_sum_exp_threshold),
-                                lse_vec=None,
-                                npos=0,
-                                is_correct=is_correct,
-                                skip_reason="empty_prediction_span",
-                            )
-                        )
                     batch_sample_buffers.append(
                         {
                             "prompt_preview": prompts[i],
@@ -732,19 +674,6 @@ def main() -> None:
                 target_ids = input_ids[i, prompt_len:attn_len]
                 npos = int(min(logits_i.shape[0], target_ids.shape[0]))
                 if npos <= 0:
-                    if args.lse_threshold_report:
-                        lse_threshold_sample_rows.append(
-                            _lse_threshold_sample_row(
-                                sample_idx=st + i,
-                                variant_tag=variant_tag,
-                                filter_mode=filter_mode,
-                                threshold=float(args.log_sum_exp_threshold),
-                                lse_vec=None,
-                                npos=0,
-                                is_correct=is_correct,
-                                skip_reason="npos_zero",
-                            )
-                        )
                     batch_sample_buffers.append(
                         {
                             "prompt_preview": prompts[i],
@@ -769,17 +698,15 @@ def main() -> None:
                 logits_i_fp32 = torch.nan_to_num(logits_i.float(), nan=0.0, posinf=1e4, neginf=-1e4)
                 lse_vec = torch.logsumexp(logits_i_fp32, dim=-1).float().cpu().numpy()
                 if args.lse_threshold_report:
-                    lse_threshold_sample_rows.append(
-                        _lse_threshold_sample_row(
-                            sample_idx=st + i,
-                            variant_tag=variant_tag,
-                            filter_mode=filter_mode,
-                            threshold=float(args.log_sum_exp_threshold),
-                            lse_vec=lse_vec,
-                            npos=npos,
-                            is_correct=is_correct,
-                            skip_reason=None,
-                        )
+                    _accumulate_lse_threshold_one_response(
+                        lse_vec,
+                        npos,
+                        float(args.log_sum_exp_threshold),
+                        lse_thr_rl,
+                        lse_thr_below,
+                        lse_thr_frac,
+                        lse_thr_min_lse,
+                        lse_thr_pos_ratio,
                     )
                 probs = torch.softmax(logits_i_fp32, dim=-1)
                 log_probs = torch.log(probs.clamp_min(1e-12))
@@ -1049,9 +976,20 @@ def main() -> None:
         else:
             print("[log_sum_exp] CASE_A（A_multipeak）无位置，均值不可用。")
 
-        if args.lse_threshold_report and lse_thr_jsonl_path is not None:
-            lse_thr_agg = _write_lse_threshold_jsonl(lse_threshold_sample_rows, lse_thr_jsonl_path)
-            print(f"\n[lse_threshold_report] JSONL: {lse_thr_jsonl_path.resolve()}")
+        if args.lse_threshold_report and lse_thr_out_path is not None:
+            lse_thr_agg = _build_lse_threshold_aggregate(
+                threshold=float(args.log_sum_exp_threshold),
+                variant_tag=variant_tag,
+                filter_mode=filter_mode,
+                n_samples_total=len(rows_selected_local),
+                response_lengths=lse_thr_rl,
+                below_counts=lse_thr_below,
+                fracs_below=lse_thr_frac,
+                min_lses=lse_thr_min_lse,
+                min_pos_ratios=lse_thr_pos_ratio,
+            )
+            _save_lse_threshold_summary(lse_thr_agg, lse_thr_out_path)
+            print(f"\n[lse_threshold_report] 汇总已保存: {lse_thr_out_path.resolve()}")
             print(
                 f"[lse_threshold_report] threshold={float(args.log_sum_exp_threshold):.6g} | "
                 f"filter_mode={filter_mode} | variant={variant_tag}"
@@ -1066,7 +1004,7 @@ def main() -> None:
                     f"mean_min_log_sum_exp={lse_thr_agg['mean_min_log_sum_exp']:.6f}"
                 )
             else:
-                print("[lse_threshold_report] 无有效 response 片段，仅写入 sample 行与空汇总。")
+                print("[lse_threshold_report] 无有效 response 片段，汇总中各均值为空。")
 
         if print_examples:
             examples = _collect_examples(all_high_rows_local, per_case=2)
