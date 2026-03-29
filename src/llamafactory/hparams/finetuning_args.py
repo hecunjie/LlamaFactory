@@ -812,6 +812,29 @@ class FinetuningArguments(
             )
         },
     )
+    logits_analysis_eval_save_cluster_a_detail: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True (with logits_analysis_on_eval), append one jsonl line per supervised position in "
+                "cluster A to ``logits_analysis_output_path/eval/cluster_a_positions/``. Each line includes "
+                "sample_id, seq_pos, top-k token ids with prob, logit, and cosine(h, w_k). "
+                "Use scripts/stat_eval_cluster_a_positions.py to aggregate recurrence across trainer steps."
+            )
+        },
+    )
+    logits_analysis_eval_cluster_a_topk: int = field(
+        default=5,
+        metadata={"help": "Top-k vocabulary entries per A position when logits_analysis_eval_save_cluster_a_detail."},
+    )
+    logits_analysis_eval_cluster_a_max_positions_per_batch: int = field(
+        default=8192,
+        metadata={
+            "help": (
+                "Safety cap: max A positions written per eval batch when logits_analysis_eval_save_cluster_a_detail."
+            )
+        },
+    )
     add_think_token: bool = field(
         default=False,
         metadata={

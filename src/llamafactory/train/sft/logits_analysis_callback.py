@@ -402,6 +402,82 @@ def _masked_value_summary(
     }
 
 
+def _append_eval_cluster_a_positions_jsonl(
+    logits: "torch.Tensor",
+    hidden: "torch.Tensor",
+    lm_w: "torch.Tensor",
+    H: "torch.Tensor",
+    mc: "torch.Tensor",
+    g_a: "torch.Tensor",
+    *,
+    out_path: str,
+    global_step: int,
+    eval_batch_index: int,
+    batch_size: int,
+    metric_key_prefix: str,
+    topk: int,
+    max_positions: int,
+) -> int:
+    r"""Append one jsonl object per cluster-A position (top-k logits, prob, cosine vs lm_head row). Returns lines written."""
+    if not g_a.any():
+        return 0
+    logits_f = logits.float()
+    V = int(logits_f.size(-1))
+    k = max(1, min(int(topk), V))
+    W_norm = F.normalize(lm_w.float(), dim=-1, eps=1e-12)
+    nz = g_a.nonzero(as_tuple=False)
+    n_a = int(nz.size(0))
+    written = 0
+    trunc = 0
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "a", encoding="utf-8") as f:
+        for i in range(n_a):
+            if written >= max_positions:
+                trunc = n_a - i
+                break
+            b = int(nz[i, 0].item())
+            s = int(nz[i, 1].item())
+            row = logits_f[b, s]
+            probs = F.softmax(row, dim=-1)
+            prob_top, idx_top = probs.topk(k)
+            h_vec = hidden[b, s].float()
+            h_norm = F.normalize(h_vec.unsqueeze(0), dim=-1, eps=1e-12).squeeze(0)
+            top_list: list[dict[str, Any]] = []
+            for j in range(k):
+                tid = int(idx_top[j].item())
+                wrow = W_norm[tid]
+                cos = float((h_norm * wrow).sum().item())
+                top_list.append(
+                    {
+                        "token_id": tid,
+                        "prob": float(prob_top[j].item()),
+                        "logit": float(row[tid].item()),
+                        "cosine": cos,
+                    }
+                )
+            sample_id = int(eval_batch_index * batch_size + b)
+            rec: dict[str, Any] = {
+                "analysis": "eval_cluster_a_position",
+                "trainer_step": int(global_step),
+                "metric_key_prefix": metric_key_prefix,
+                "eval_batch_index": int(eval_batch_index),
+                "sample_id": sample_id,
+                "seq_pos": int(s),
+                "entropy": float(H[b, s].item()),
+                "max_cosine": float(mc[b, s].item()),
+                "topk": k,
+                "top_tokens": top_list,
+            }
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            written += 1
+    if trunc > 0:
+        logger.warning_rank0(
+            f"[logits_analysis] cluster A detail: truncated {trunc} position(s) "
+            f"(max_positions_per_batch={max_positions})."
+        )
+    return written
+
+
 # Cluster labels (high/low entropy × high/low max-cosine vs vocab), for jsonl output.
 _CLUSTER_DEFS: tuple[tuple[str, str, str], ...] = (
     ("A", "high_entropy_low_cos", "H > th_e AND max_cos < th_c (hard positions)"),
@@ -762,6 +838,10 @@ class LogitsAnalysisCallback(TrainerCallback):
         Appends one line under ``logits_analysis_output_path/eval/`` to a file named
         ``eval_logits_analysis_{sanitized_prefix}_step_{global_step}.jsonl`` (one file per
         ``metric_key_prefix``; multiple ``eval_dataset`` dict keys ⇒ distinct prefixes / files).
+
+        If ``logits_analysis_eval_save_cluster_a_detail`` is True, also appends per-position lines under
+        ``eval/cluster_a_positions/{prefix}_trainer_step_{global_step}.jsonl`` (see
+        ``_append_eval_cluster_a_positions_jsonl``).
         """
         if self._trainer is None:
             return
@@ -786,8 +866,7 @@ class LogitsAnalysisCallback(TrainerCallback):
         out = self._run_analysis_forward(fwd, lm_w)
         if out is None:
             return
-        H, mc, ml, ls0, lmx0, _logits, _hidden = out
-        del _logits, _hidden
+        H, mc, ml, ls0, lmx0, logits, hidden = out
 
         attn = batch["attention_mask"].bool()
         labels = batch.get("labels")
@@ -845,6 +924,29 @@ class LogitsAnalysisCallback(TrainerCallback):
         )
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        if bool(getattr(self.finetuning_args, "logits_analysis_eval_save_cluster_a_detail", False)):
+            ca_dir = os.path.join(out_dir, "cluster_a_positions")
+            os.makedirs(ca_dir, exist_ok=True)
+            detail_path = os.path.join(ca_dir, f"{safe_pfx}_trainer_step_{global_step}.jsonl")
+            topk_ca = max(1, int(getattr(self.finetuning_args, "logits_analysis_eval_cluster_a_topk", 5)))
+            max_pb = max(1, int(getattr(self.finetuning_args, "logits_analysis_eval_cluster_a_max_positions_per_batch", 8192)))
+            bs = int(batch["input_ids"].shape[0])
+            _append_eval_cluster_a_positions_jsonl(
+                logits,
+                hidden,
+                lm_w,
+                H,
+                mc,
+                g_a,
+                out_path=detail_path,
+                global_step=global_step,
+                eval_batch_index=eval_batch_index,
+                batch_size=bs,
+                metric_key_prefix=metric_key_prefix,
+                topk=topk_ca,
+                max_positions=max_pb,
+            )
 
     # ── HF Trainer callbacks (kept as no-ops for compatibility) ─────────────
 
