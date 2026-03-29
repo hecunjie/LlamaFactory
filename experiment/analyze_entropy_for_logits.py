@@ -529,6 +529,45 @@ def _build_prompt_prefix(tokenizer: Any, prompt_text: str, token_strs: list[str]
     return prompt_text + response_prefix
 
 
+def _filter_low_entropy_lse_by_quantiles(
+    buffer: list[dict[str, Any]],
+    q_entropy: float,
+    q_lse: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """在全集 token 上取熵、LSE 的分位 cutoff，仅保留同时 ≤ 各自 cutoff 的记录。"""
+    if not buffer:
+        meta = {
+            "mode": "quantile",
+            "entropy_quantile": q_entropy,
+            "lse_quantile": q_lse,
+            "entropy_cutoff": None,
+            "lse_cutoff": None,
+            "n_pool_tokens": 0,
+            "n_exported": 0,
+        }
+        return [], meta
+    ents = np.array([float(r["entropy"]) for r in buffer], dtype=np.float64)
+    lses = np.array([float(r["log_sum_exp"]) for r in buffer], dtype=np.float64)
+    ent_cut = float(np.quantile(ents, q_entropy))
+    lse_cut = float(np.quantile(lses, q_lse))
+    meta = {
+        "mode": "quantile",
+        "entropy_quantile": q_entropy,
+        "lse_quantile": q_lse,
+        "entropy_cutoff": ent_cut,
+        "lse_cutoff": lse_cut,
+        "n_pool_tokens": len(buffer),
+    }
+    out: list[dict[str, Any]] = []
+    for r in buffer:
+        if float(r["entropy"]) <= ent_cut and float(r["log_sum_exp"]) <= lse_cut:
+            out.append(dict(r))
+    meta["n_exported"] = len(out)
+    for rr in out:
+        rr["criteria"] = dict(meta)
+    return out, meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze logits entropy and hidden-state confidence.")
     parser.add_argument("--data", type=str, required=True, help="Input JSONL path")
@@ -564,7 +603,7 @@ def main() -> None:
         "--log_sum_exp_threshold",
         type=float,
         default=float("nan"),
-        help="与 --lse_threshold_report 联用：低于该值的 token 计入占比。",
+        help="低于该值的 token 视为低 log_sum_exp（仅用于 --lse_threshold_report）。",
     )
     parser.add_argument(
         "--output_lse_threshold_jsonl",
@@ -592,10 +631,43 @@ def main() -> None:
         default=None,
         help="在全集 response token 的 base LSE 上取该分位数为界，≤ 界者为「低」（如 0.2；将额外跑一遍 forward）。与 max_base 二选一。",
     )
+    parser.add_argument(
+        "--export_low_entropy_lse",
+        action="store_true",
+        help=(
+            "在本轮全部 response token 上，用分位数定义「低熵」「低 LSE」："
+            "entropy ≤ entropy 的 q 分位、且 log_sum_exp ≤ LSE 的 q 分位时导出为 JSONL（含上下文与 top5）。"
+            "分位数由 --export_low_entropy_quantile / --export_low_lse_quantile 指定。"
+        ),
+    )
+    parser.add_argument(
+        "--export_low_entropy_quantile",
+        type=float,
+        default=0.2,
+        help="与 --export_low_entropy_lse 联用：熵的全局分位数 q∈(0,1)，cutoff=np.quantile(熵, q)，保留 entropy≤cutoff（最低约 q 比例一侧）。",
+    )
+    parser.add_argument(
+        "--export_low_lse_quantile",
+        type=float,
+        default=0.2,
+        help="与 --export_low_entropy_lse 联用：log_sum_exp 的全局分位数 q∈(0,1)，保留 LSE≤cutoff。",
+    )
+    parser.add_argument(
+        "--output_low_entropy_lse_jsonl",
+        type=str,
+        default=None,
+        help="低熵+低 LSE 导出路径；默认 {output_plot stem}_low_entropy_low_lse.jsonl。",
+    )
     args = parser.parse_args()
 
     if args.lse_threshold_report and not math.isfinite(args.log_sum_exp_threshold):
         raise ValueError("使用 --lse_threshold_report 时必须指定有限的 --log_sum_exp_threshold")
+
+    if args.export_low_entropy_lse:
+        qe = float(args.export_low_entropy_quantile)
+        ql = float(args.export_low_lse_quantile)
+        if not (0.0 < qe < 1.0 and 0.0 < ql < 1.0):
+            raise ValueError("--export_low_entropy_quantile 与 --export_low_lse_quantile 须均在 (0, 1) 内")
 
     if args.lse_layer_probe:
         has_max = math.isfinite(args.lse_layer_probe_max_base_lse)
@@ -771,6 +843,15 @@ def main() -> None:
         case_counts_high_local = {CASE_A: 0, CASE_B: 0, CASE_AMBIGUOUS: 0}
         all_high_rows_local: list[dict[str, Any]] = []
         per_token_json_rows_local: list[dict[str, Any]] = []
+        low_entropy_lse_buffer: list[dict[str, Any]] = []
+        low_entropy_lse_rows: list[dict[str, Any]] = []
+        low_ent_lse_meta: dict[str, Any] = {}
+        low_ent_lse_out_path: Path | None = None
+        if args.export_low_entropy_lse:
+            if args.output_low_entropy_lse_jsonl:
+                low_ent_lse_out_path = Path(args.output_low_entropy_lse_jsonl)
+            else:
+                low_ent_lse_out_path = output_plot_path.parent / f"{output_plot_path.stem}_low_entropy_low_lse.jsonl"
 
         total_positions_local = 0
         high_entropy_count_local = 0
@@ -979,6 +1060,46 @@ def main() -> None:
                     if np.isfinite(e):
                         batch_topk_candidates.append((e, i, t))
 
+                    if args.export_low_entropy_lse and low_ent_lse_out_path is not None:
+                        if np.isfinite(e) and np.isfinite(lse_t):
+                            tid_list = target_ids.tolist()
+                            tstrs = tokenizer.convert_ids_to_tokens(tid_list)
+                            tok_id = int(tid_list[t])
+                            top_ids_l = top5_ids[t].tolist()
+                            top_p = top5_vals[t].float().tolist()
+                            top_raw = tokenizer.convert_ids_to_tokens(top_ids_l)
+                            top_txt = [tokenizer.decode([int(x)], skip_special_tokens=False) for x in top_ids_l]
+                            low_entropy_lse_buffer.append(
+                                {
+                                    "sample_idx": st + i,
+                                    "variant": variant_tag,
+                                    "filter_mode": filter_mode,
+                                    "is_correct": is_correct,
+                                    "t": t,
+                                    "entropy": e,
+                                    "log_sum_exp": lse_t,
+                                    "prompt_prefix": _build_prompt_prefix(
+                                        tokenizer=tokenizer,
+                                        prompt_text=prompts[i],
+                                        token_strs=tstrs,
+                                        t=t,
+                                    ),
+                                    "context": _build_token_context(
+                                        tokenizer=tokenizer,
+                                        token_ids=tid_list,
+                                        t=t,
+                                        window=6,
+                                    ),
+                                    "token_id": tok_id,
+                                    "token": tokenizer.decode([tok_id], skip_special_tokens=False),
+                                    "token_raw": tstrs[t],
+                                    "top5_tokens": top_txt,
+                                    "top5_tokens_raw": top_raw,
+                                    "top5_probs": [float(x) for x in top_p],
+                                    "top5_token_ids": [int(x) for x in top_ids_l],
+                                }
+                            )
+
                 batch_sample_buffers.append(
                     {
                         "prompt_preview": prompts[i],
@@ -1131,6 +1252,19 @@ def main() -> None:
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        if args.export_low_entropy_lse and low_ent_lse_out_path is not None:
+            low_entropy_lse_rows, low_ent_lse_meta = _filter_low_entropy_lse_by_quantiles(
+                low_entropy_lse_buffer,
+                float(args.export_low_entropy_quantile),
+                float(args.export_low_lse_quantile),
+            )
+            print(
+                f"[export_low_entropy_lse] pool_tokens={low_ent_lse_meta.get('n_pool_tokens', 0)} | "
+                f"entropy q={args.export_low_entropy_quantile} → cutoff={low_ent_lse_meta.get('entropy_cutoff')} | "
+                f"LSE q={args.export_low_lse_quantile} → cutoff={low_ent_lse_meta.get('lse_cutoff')} | "
+                f"exported={low_ent_lse_meta.get('n_exported', 0)}"
+            )
 
         if args.lse_layer_probe and final_norm is not None and use_lse_layer_q and layer_probe_pass1:
             qv = float(args.lse_layer_probe_bottom_quantile)
@@ -1335,11 +1469,26 @@ def main() -> None:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"[jsonl] saved: {output_jsonl_path.resolve()}")
 
+        if args.export_low_entropy_lse and low_ent_lse_out_path is not None:
+            low_ent_lse_out_path.parent.mkdir(parents=True, exist_ok=True)
+            with low_ent_lse_out_path.open("w", encoding="utf-8") as f:
+                for row in low_entropy_lse_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print(
+                f"[export_low_entropy_lse] 写入 {len(low_entropy_lse_rows)} 条 → {low_ent_lse_out_path.resolve()}"
+            )
+
         out_ret: dict[str, Any] = {**summary, "log_sum_exp": lse_stats_payload}
         if lse_thr_agg is not None:
             out_ret["lse_threshold_report"] = lse_thr_agg
         if layer_probe_summary is not None:
             out_ret["lse_layer_probe"] = layer_probe_summary
+        if args.export_low_entropy_lse and low_ent_lse_out_path is not None:
+            out_ret["export_low_entropy_lse"] = {
+                "path": str(low_ent_lse_out_path.resolve()),
+                "n_rows": len(low_entropy_lse_rows),
+                "meta": low_ent_lse_meta,
+            }
         return out_ret
 
     # 1) 原始输出分析
