@@ -170,6 +170,9 @@ def main() -> None:
 
     series = compute_overlap_series(use_files)
     # First row corresponds to i=1 (second file); include step labels
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     steps = [t[0] for t in series]
@@ -179,12 +182,13 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(9, 5))
     xs, ys = steps, rates
+    ann_nc, ann_no = n_curr, n_ovl
     if args.newest_left:
         pairs = sorted(zip(steps, rates, n_curr, n_ovl), key=lambda t: t[0], reverse=True)
         xs = [p[0] for p in pairs]
         ys = [p[1] for p in pairs]
-        n_curr = [p[2] for p in pairs]
-        n_ovl = [p[3] for p in pairs]
+        ann_nc = [p[2] for p in pairs]
+        ann_no = [p[3] for p in pairs]
     ax.plot(xs, ys, marker="o", linewidth=1.2, markersize=5, color="C0")
     ax.set_xlabel("trainer_step (current file)")
     ax.set_ylabel("overlap rate vs ∪(previous ≤3 files)")
@@ -192,14 +196,14 @@ def main() -> None:
     ax.grid(True, alpha=0.3)
     ax.set_title(f"cluster-A overlap (prev 3 files)\n{group_name}  (n_files={len(use_files)})")
     if not args.no_annotate:
-        for x, r, nc, no in zip(xs, ys, n_curr, n_ovl):
+        for x, r, nc, no in zip(xs, ys, ann_nc, ann_no):
             if nc > 0 and r == r:
                 ax.annotate(f"{no}/{nc}", (x, r), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7)
     fig.tight_layout()
     outp = Path(args.output).resolve()
     outp.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outp, dpi=args.dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(outp), format="png", dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig)
     print(outp)
 
     if args.json_out:

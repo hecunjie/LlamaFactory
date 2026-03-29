@@ -428,6 +428,9 @@ def plot_and_save_separate(
 ) -> list[Path]:
     r"""Save PNGs: ``01``–``06`` (train-centric; eval skips 01/06), ``07`` (A–D fractions), ``10``–``11``
     (A−D / A−B cosine-mean differences vs step)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if not rows:
@@ -455,8 +458,8 @@ def plot_and_save_separate(
         ax.set_title("optimizer learning rate")
         ax.grid(True, alpha=0.3)
         p = _name("01_optimizer_lr")
-        plt.savefig(p, dpi=dpi, bbox_inches="tight")
-        plt.close()
+        fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
         written.append(p)
 
     # 02 masked summary
@@ -485,8 +488,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title(ttl)
     p = _name("02_masked_summary")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     # 03 groups entropy
@@ -503,8 +506,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: entropy |Δ| (train) or |value| (eval)" if train else "groups: |entropy| mean_abs (eval)")
     p = _name("03_groups_entropy")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     # 04 groups max logit
@@ -521,8 +524,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: |Δmax_logit| mean_abs" if train else "groups: |max_logit| mean_abs")
     p = _name("04_groups_max_logit")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     # 05 groups max cosine
@@ -539,8 +542,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("groups: |Δmax_cosine| mean_abs" if train else "groups: |max_cosine| mean_abs")
     p = _name("05_groups_max_cosine")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     # 06 param / logit diagnostics (train only)
@@ -576,8 +579,8 @@ def plot_and_save_separate(
         ax.grid(True, alpha=0.3)
         ax.set_title("param / logit delta diagnostics")
         p = _name("06_param_logit_diagnostics")
-        plt.savefig(p, dpi=dpi, bbox_inches="tight")
-        plt.close()
+        fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
         written.append(p)
 
     # 07 A–D token count fractions
@@ -594,8 +597,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("cluster token count share (A–D) vs step")
     p = _name("07_group_count_fractions")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     ylab_cm = "delta_max_cosine.mean (train)" if train else "max_cosine.mean (eval)"
@@ -611,8 +614,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("cosine mean difference (A − D) vs step")
     p = _name("10_cosine_mean_diff_A_minus_D")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     # 11 cosine mean difference A − B vs step
@@ -627,8 +630,8 @@ def plot_and_save_separate(
     ax.grid(True, alpha=0.3)
     ax.set_title("cosine mean difference (A − B) vs step")
     p = _name("11_cosine_mean_diff_A_minus_B")
-    plt.savefig(p, dpi=dpi, bbox_inches="tight")
-    plt.close()
+    fig.savefig(str(p), format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
     written.append(p)
 
     return written
