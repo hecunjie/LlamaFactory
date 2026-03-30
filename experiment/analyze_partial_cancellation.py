@@ -214,6 +214,11 @@ def main() -> None:
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--disable_data_parallel",
+        action="store_true",
+        help="禁用多卡 DataParallel（默认检测到多卡时自动启用）。",
+    )
     parser.add_argument("--only_wrong", action="store_true", help="只分析错误样本。")
     parser.add_argument("--only_correct", action="store_true", help="只分析正确样本。")
     parser.add_argument(
@@ -286,13 +291,33 @@ def main() -> None:
     else:
         print("[template] disabled")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).eval()
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_data_parallel = (n_gpu > 1) and (not args.disable_data_parallel)
+    print(f"[device] cuda_available={torch.cuda.is_available()} n_gpu={n_gpu} data_parallel={use_data_parallel}")
+
+    if use_data_parallel:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        ).eval()
+        primary_device = torch.device("cuda:0")
+        base_model.to(primary_device)
+        model: Any = torch.nn.DataParallel(base_model, device_ids=list(range(n_gpu)))
+    else:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.float16,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        ).eval()
+        if torch.cuda.is_available():
+            primary_device = next(base_model.parameters()).device
+        else:
+            primary_device = torch.device("cpu")
+        model = base_model
 
     result_rows: list[dict[str, Any]] = []
     n_skipped_short = 0
@@ -312,7 +337,7 @@ def main() -> None:
         input_ids, attention_mask = _build_batch_inputs_from_ids(
             token_id_seqs=batch_full_ids,
             pad_token_id=int(tokenizer.pad_token_id),
-            device=model.lm_head.weight.device,
+            device=primary_device,
         )
 
         with torch.no_grad():
