@@ -242,7 +242,14 @@ def _build_model_inputs_for_row(
 ) -> tuple[list[int], int, str]:
     prompt_text = str(row.get("prompt", ""))
     predict_text = str(row.get("predict", ""))
-    if lf_template is None:
+    # 若 prompt 已经是模板化串（如已含 llama3/chatml 的 header token），避免二次套模板。
+    # 否则会出现 <|start_header_id|>... 重复拼接。
+    already_formatted = (
+        ("<|start_header_id|>" in prompt_text and "<|eot_id|>" in prompt_text)
+        or ("<|im_start|>" in prompt_text and "<|im_end|>" in prompt_text)
+        or ("[INST]" in prompt_text and "[/INST]" in prompt_text)
+    )
+    if lf_template is None or already_formatted:
         full_text = prompt_text + predict_text
         full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]

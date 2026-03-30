@@ -4,18 +4,20 @@ python experiment/analyze_entropy_for_logits.py \
   --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/checkpoint-936 \
   --max_samples 8000 \
   --batch_size 4 \
-  --high_entropy_topk 100 \
+  --entropy_threshold 2 \
+  --high_entropy_topk 20 \
   --sim_threshold 0.18 \
   --only_wrong \
-  --lse_threshold_report \
-  --log_sum_exp_threshold 22.0 \
-  --lse_layer_probe \
-  --lse_layer_probe_bottom_quantile 0.2 \
-  --export_low_entropy_lse \
-  --export_low_joint_quantile 0.3 \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/wrong_log_sum_exp/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/wrong_log_sum_exp/last_ckp_entropy_results.jsonl
-
+  --export_low_lse_positions \
+  --export_low_lse_bottom_quantile 0.2 \
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/all_correct_points/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/all_correct_points/last_ckp_entropy_results.jsonl
+  # --lse_threshold_report \
+  # --log_sum_exp_threshold 22.0 \
+  # --lse_layer_probe \
+  # --lse_layer_probe_bottom_quantile 0.2 \
+  # --export_low_entropy_lse \
+  # --export_low_joint_quantile 0.3 \
 python experiment/analyze_entropy_for_logits.py \
   --data data \
   --dataset gsm8k_sft_test \
