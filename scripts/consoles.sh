@@ -26,6 +26,8 @@ python experiment/analyze_partial_cancellation.py \
   --use_multi_process \
   --gpu_ids "0,1,2,3,4,5,6,7" \
   --num_processes 8 \
+  --low_lse_quantile 0.05 \
+  --high_lse_top_ratio 0.5 \
   --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/partial_cancellation
 
 python experiment/analyze_entropy_for_logits.py \
