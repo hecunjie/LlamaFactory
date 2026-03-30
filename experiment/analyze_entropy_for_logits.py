@@ -913,14 +913,14 @@ def main() -> None:
         action="store_true",
         help=(
             "导出低 log_sum_exp 的 token 位置（含上下文），输出为单独 jsonl；"
-            "筛选条件使用 --log_sum_exp_threshold 或 --export_low_lse_bottom_quantile（二选一）。"
+            "先在每个样本内选最小 LSE 位置，再可选用阈值/分位进一步筛选。"
         ),
     )
     parser.add_argument(
         "--export_low_lse_bottom_quantile",
         type=float,
         default=None,
-        help="与 --export_low_lse_positions 联用：在全集 response token 的 log_sum_exp 上取底部分位数阈值（如 0.2）。",
+        help="与 --export_low_lse_positions 联用：在“每样本最小 LSE 集合”上取底部分位阈值（如 0.2）。",
     )
     parser.add_argument(
         "--output_low_lse_jsonl",
@@ -956,19 +956,9 @@ def main() -> None:
         if not (0.0 < qj < 1.0):
             raise ValueError("--export_low_joint_quantile 须在 (0, 1) 内")
 
-    if args.export_low_lse_positions:
-        has_lse_thr = math.isfinite(args.log_sum_exp_threshold)
-        has_lse_q = (
-            args.export_low_lse_bottom_quantile is not None
-            and 0.0 < float(args.export_low_lse_bottom_quantile) < 1.0
-        )
-        if not has_lse_thr and not has_lse_q:
-            raise ValueError(
-                "--export_low_lse_positions 需要指定 --log_sum_exp_threshold 或 "
-                "--export_low_lse_bottom_quantile（0~1 之间）"
-            )
-        if has_lse_thr and has_lse_q:
-            raise ValueError("--export_low_lse_positions：请勿同时指定阈值与分位数。")
+    if args.export_low_lse_positions and args.export_low_lse_bottom_quantile is not None:
+        if not (0.0 < float(args.export_low_lse_bottom_quantile) < 1.0):
+            raise ValueError("--export_low_lse_bottom_quantile 须在 (0, 1) 内")
 
     if args.lse_layer_probe:
         has_max = math.isfinite(args.lse_layer_probe_max_base_lse)
@@ -1657,31 +1647,54 @@ def main() -> None:
             )
 
         if args.export_low_lse_positions and low_lse_out_path is not None:
-            lse_pool = np.array([float(r["log_sum_exp"]) for r in low_lse_buffer], dtype=np.float64)
-            lse_pool = lse_pool[np.isfinite(lse_pool)]
-            if lse_pool.size == 0:
+            # 按样本分组：支持“每个样本内部按分位筛选低 LSE 位置”
+            rows_by_sample: dict[int, list[dict[str, Any]]] = {}
+            for r in low_lse_buffer:
+                sid = int(r["sample_idx"])
+                rows_by_sample.setdefault(sid, []).append(r)
+
+            if len(rows_by_sample) == 0:
                 low_lse_rows = []
                 low_lse_meta = {
                     "mode": "empty_pool",
                     "threshold_base_lse": None,
                     "n_pool_tokens": 0,
+                    "n_pool_samples": 0,
                     "n_exported": 0,
                 }
             else:
                 if args.export_low_lse_bottom_quantile is not None:
                     q_lse = float(args.export_low_lse_bottom_quantile)
-                    thr_lse = float(np.quantile(lse_pool, q_lse))
-                    mode_lse = "bottom_quantile"
-                else:
+                    mode_lse = "per_sample_bottom_quantile"
+                    low_lse_rows = []
+                    per_sample_cutoffs: list[float] = []
+                    for sid, rows_s in rows_by_sample.items():
+                        lse_s = np.array([float(x["log_sum_exp"]) for x in rows_s], dtype=np.float64)
+                        lse_s = lse_s[np.isfinite(lse_s)]
+                        if lse_s.size == 0:
+                            continue
+                        thr_s = float(np.quantile(lse_s, q_lse))
+                        per_sample_cutoffs.append(thr_s)
+                        for rr in rows_s:
+                            if float(rr["log_sum_exp"]) <= thr_s:
+                                low_lse_rows.append(rr)
+                    thr_lse = float(np.mean(per_sample_cutoffs)) if per_sample_cutoffs else None
+                elif math.isfinite(args.log_sum_exp_threshold):
                     q_lse = None
                     thr_lse = float(args.log_sum_exp_threshold)
                     mode_lse = "absolute_threshold"
-                low_lse_rows = [r for r in low_lse_buffer if float(r["log_sum_exp"]) <= thr_lse]
+                    low_lse_rows = [r for r in low_lse_buffer if float(r["log_sum_exp"]) <= thr_lse]
+                else:
+                    q_lse = None
+                    thr_lse = None
+                    mode_lse = "all_positions"
+                    low_lse_rows = list(low_lse_buffer)
                 low_lse_meta = {
                     "mode": mode_lse,
                     "threshold_base_lse": thr_lse,
                     "bottom_quantile": q_lse,
                     "n_pool_tokens": int(len(low_lse_buffer)),
+                    "n_pool_samples": int(len(rows_by_sample)),
                     "n_exported": int(len(low_lse_rows)),
                 }
                 for rr in low_lse_rows:
@@ -1690,6 +1703,7 @@ def main() -> None:
                 f"[export_low_lse_positions] mode={low_lse_meta.get('mode')} | "
                 f"thr={low_lse_meta.get('threshold_base_lse')} | "
                 f"pool={low_lse_meta.get('n_pool_tokens', 0)} | "
+                f"samples={low_lse_meta.get('n_pool_samples', 0)} | "
                 f"exported={low_lse_meta.get('n_exported', 0)}"
             )
 
