@@ -209,6 +209,8 @@ def _run_partial_cancellation_chunk(
     template: str,
     disable_lf_template: bool,
     batch_size: int,
+    low_lse_quantile: float,
+    high_lse_top_ratio: float,
     device: torch.device,
 ) -> tuple[list[dict[str, Any]], int]:
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -295,21 +297,18 @@ def _run_partial_cancellation_chunk(
                 n_skipped_short += 1
                 continue
 
-            median_lse = float(np.median(lse_vec))
-            low_idx = np.where(lse_vec <= median_lse)[0]
-            high_idx = np.where(lse_vec >= median_lse)[0]
+            low_thr = float(np.quantile(lse_vec, low_lse_quantile))
+            high_thr = float(np.quantile(lse_vec, 1.0 - high_lse_top_ratio))
+            low_idx = np.where(lse_vec <= low_thr)[0]
+            high_idx = np.where(lse_vec >= high_thr)[0]
             if low_idx.size == 0 or high_idx.size == 0:
                 n_skipped_short += 1
                 continue
 
             low_sorted = low_idx[np.argsort(lse_vec[low_idx])]
             high_sorted = high_idx[np.argsort(-lse_vec[high_idx])]
-            k = int(min(low_sorted.size, high_sorted.size))
-            if k <= 0:
-                n_skipped_short += 1
-                continue
-            low_pick = low_sorted[:k]
-            high_pick = high_sorted[:k]
+            low_pick = low_sorted
+            high_pick = high_sorted
 
             for t in low_pick.tolist():
                 abs_pos = pred_start + int(t)
@@ -371,6 +370,8 @@ def _mp_worker(job: dict[str, Any]) -> dict[str, Any]:
         template=cfg["template"],
         disable_lf_template=cfg["disable_lf_template"],
         batch_size=int(cfg["batch_size"]),
+        low_lse_quantile=float(cfg["low_lse_quantile"]),
+        high_lse_top_ratio=float(cfg["high_lse_top_ratio"]),
         device=device,
     )
     return {"result_rows": result_rows, "n_skipped_short": n_skipped_short}
@@ -389,6 +390,18 @@ def main() -> None:
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--low_lse_quantile",
+        type=float,
+        default=0.1,
+        help="low_lse 使用的底部分位数（默认 0.1，即最低 10%）。",
+    )
+    parser.add_argument(
+        "--high_lse_top_ratio",
+        type=float,
+        default=0.2,
+        help="high_lse 使用的顶部比例（默认 0.2，即最高 20%）。",
+    )
     parser.add_argument("--use_multi_process", action="store_true", help="启用多卡多进程（每卡一个进程）。")
     parser.add_argument(
         "--gpu_ids",
@@ -414,6 +427,10 @@ def main() -> None:
 
     if args.only_wrong and args.only_correct:
         raise ValueError("--only_wrong 和 --only_correct 不能同时设置。")
+    if not (0.0 < float(args.low_lse_quantile) < 1.0):
+        raise ValueError("--low_lse_quantile 必须在 (0,1) 内。")
+    if not (0.0 < float(args.high_lse_top_ratio) < 1.0):
+        raise ValueError("--high_lse_top_ratio 必须在 (0,1) 内。")
 
     rows_raw, data_meta = resolve_input_rows(
         data_arg=args.data,
@@ -476,6 +493,8 @@ def main() -> None:
             "template": args.template,
             "disable_lf_template": bool(args.disable_lf_template),
             "batch_size": int(args.batch_size),
+            "low_lse_quantile": float(args.low_lse_quantile),
+            "high_lse_top_ratio": float(args.high_lse_top_ratio),
         }
         for wi in range(n_proc):
             jobs.append({"gpu_id": gpu_ids[wi], "rows": shards[wi], "cfg": cfg})
@@ -504,6 +523,8 @@ def main() -> None:
             template=args.template,
             disable_lf_template=bool(args.disable_lf_template),
             batch_size=int(args.batch_size),
+            low_lse_quantile=float(args.low_lse_quantile),
+            high_lse_top_ratio=float(args.high_lse_top_ratio),
             device=device,
         )
 
@@ -541,6 +562,8 @@ def main() -> None:
         "n_rows_raw": len(rows_raw),
         "n_rows_selected": len(rows_selected),
         "filter_mode": filter_mode,
+        "low_lse_quantile": float(args.low_lse_quantile),
+        "high_lse_top_ratio": float(args.high_lse_top_ratio),
         "n_positions_exported": len(result_rows),
         "n_samples_skipped_short_or_empty": n_skipped_short,
         "group_stats": {

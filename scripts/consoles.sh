@@ -1,23 +1,33 @@
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/last_ckp_on_gsm_nl.jsonl \
-  --template llama3 \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/checkpoint-936 \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404 \
   --max_samples 8000 \
   --batch_size 4 \
-  --entropy_threshold 2 \
+  --entropy_threshold 0.01 \
   --high_entropy_topk 20 \
   --sim_threshold 0.18 \
   --only_wrong \
   --export_low_lse_positions \
-  --export_low_lse_bottom_quantile 0.2 \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/all_correct_points/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/gsm_nl/all_correct_points/last_ckp_entropy_results.jsonl
+  --export_low_lse_bottom_quantile 0.05 \
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_points/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point/last_ckp_entropy_results.jsonl
   # --lse_threshold_report \
   # --log_sum_exp_threshold 22.0 \
   # --lse_layer_probe \
   # --lse_layer_probe_bottom_quantile 0.2 \
   # --export_low_entropy_lse \
   # --export_low_joint_quantile 0.3 \
+
+python experiment/analyze_partial_cancellation.py \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404 \
+  --max_samples 8000 \
+  --batch_size 1 \
+  --use_multi_process \
+  --gpu_ids "0,1,2,3,4,5,6,7" \
+  --num_processes 8 \
+  --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/partial_cancellation
+
 python experiment/analyze_entropy_for_logits.py \
   --data data \
   --dataset gsm8k_sft_test \
