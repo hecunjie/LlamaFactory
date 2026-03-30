@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import multiprocessing as mp
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -201,128 +202,48 @@ def _spearman_corr(x: np.ndarray, y: np.ndarray) -> tuple[float | None, float | 
         return None, None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Partial cancellation analysis on response tokens.")
-    parser.add_argument("--data", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--dataset_info", type=str, default=None)
-    parser.add_argument("--prompt_field", type=str, default=None)
-    parser.add_argument("--pred_field", type=str, default=None)
-    parser.add_argument("--label_field", type=str, default=None)
-    parser.add_argument("--template", type=str, default="llama3")
-    parser.add_argument("--disable_lf_template", action="store_true")
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--max_samples", type=int, default=2000)
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument(
-        "--disable_data_parallel",
-        action="store_true",
-        help="禁用多卡 DataParallel（默认检测到多卡时自动启用）。",
-    )
-    parser.add_argument("--only_wrong", action="store_true", help="只分析错误样本。")
-    parser.add_argument("--only_correct", action="store_true", help="只分析正确样本。")
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="partial_cancellation_outputs",
-        help="输出子目录，CSV/JSON/图片都会写到该目录下。",
-    )
-    args = parser.parse_args()
-
-    if args.only_wrong and args.only_correct:
-        raise ValueError("--only_wrong 和 --only_correct 不能同时设置。")
-
-    rows_raw, data_meta = resolve_input_rows(
-        data_arg=args.data,
-        dataset_name=args.dataset,
-        dataset_info_arg=args.dataset_info,
-        prompt_field_arg=args.prompt_field,
-        pred_field_arg=args.pred_field,
-        label_field_arg=args.label_field,
-    )
-    if not rows_raw:
-        raise ValueError("输入数据为空。")
-
-    rows_selected: list[dict[str, Any]] = []
-    for row in rows_raw:
-        pred = str(row.get("predict", ""))
-        label = str(row.get("label", ""))
-        is_correct = answers_match(extract_answer(pred), extract_answer(label))
-        rr = dict(row)
-        rr["_is_correct"] = bool(is_correct)
-        if args.only_wrong and is_correct:
-            continue
-        if args.only_correct and (not is_correct):
-            continue
-        rows_selected.append(rr)
-        if len(rows_selected) >= args.max_samples:
-            break
-
-    if not rows_selected:
-        raise ValueError("筛选后没有样本可分析。")
-
-    filter_mode = "wrong" if args.only_wrong else ("correct" if args.only_correct else "all")
-    print(
-        f"[load] mode={data_meta['mode']} data={data_meta['data_file']} selected={len(rows_selected)} filter={filter_mode}"
-    )
-    print(f"[load] model/tokenizer: {args.model}")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+def _run_partial_cancellation_chunk(
+    rows_selected: list[dict[str, Any]],
+    *,
+    model_path: str,
+    template: str,
+    disable_lf_template: bool,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[list[dict[str, Any]], int]:
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     lf_template = None
-    if not args.disable_lf_template:
+    if not disable_lf_template:
         try:
             from llamafactory.data import get_template_and_fix_tokenizer
 
             data_args = SimpleNamespace(
-                template=args.template,
+                template=template,
                 train_on_prompt=False,
                 tool_format=None,
                 default_system=None,
                 enable_thinking=True,
             )
             lf_template = get_template_and_fix_tokenizer(tokenizer, data_args)
-            print(f"[template] enabled: {args.template}")
-        except Exception as e:
-            print(f"[template] fallback to raw concat. reason: {e}")
+        except Exception:
             lf_template = None
-    else:
-        print("[template] disabled")
 
-    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_data_parallel = (n_gpu > 1) and (not args.disable_data_parallel)
-    print(f"[device] cuda_available={torch.cuda.is_available()} n_gpu={n_gpu} data_parallel={use_data_parallel}")
-
-    if use_data_parallel:
-        base_model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        ).eval()
-        primary_device = torch.device("cuda:0")
-        base_model.to(primary_device)
-        model: Any = torch.nn.DataParallel(base_model, device_ids=list(range(n_gpu)))
-    else:
-        base_model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype=torch.float16,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        ).eval()
-        if torch.cuda.is_available():
-            primary_device = next(base_model.parameters()).device
-        else:
-            primary_device = torch.device("cpu")
-        model = base_model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map=None,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    ).eval()
+    model.to(device)
 
     result_rows: list[dict[str, Any]] = []
     n_skipped_short = 0
-    for st in tqdm(range(0, len(rows_selected), args.batch_size), desc="partial_cancellation"):
-        batch_rows = rows_selected[st : st + args.batch_size]
+    for st in tqdm(range(0, len(rows_selected), batch_size), desc=f"partial_cancellation[{device}]"):
+        batch_rows = rows_selected[st : st + batch_size]
         batch_full_ids: list[list[int]] = []
         prompt_lens: list[int] = []
         for r in batch_rows:
@@ -337,7 +258,7 @@ def main() -> None:
         input_ids, attention_mask = _build_batch_inputs_from_ids(
             token_id_seqs=batch_full_ids,
             pad_token_id=int(tokenizer.pad_token_id),
-            device=primary_device,
+            device=device,
         )
 
         with torch.no_grad():
@@ -396,7 +317,7 @@ def main() -> None:
                 seg = _compute_segment_diversities(hidden_states, i, abs_pos)
                 result_rows.append(
                     {
-                        "sample_idx": int(st + i),
+                        "sample_idx": int(batch_rows[i].get("_global_sample_idx", st + i)),
                         "t": int(t),
                         "log_sum_exp": float(lse_vec[t]),
                         "is_correct": bool(is_correct),
@@ -413,7 +334,7 @@ def main() -> None:
                 seg = _compute_segment_diversities(hidden_states, i, abs_pos)
                 result_rows.append(
                     {
-                        "sample_idx": int(st + i),
+                        "sample_idx": int(batch_rows[i].get("_global_sample_idx", st + i)),
                         "t": int(t),
                         "log_sum_exp": float(lse_vec[t]),
                         "is_correct": bool(is_correct),
@@ -425,8 +346,166 @@ def main() -> None:
                     }
                 )
 
+        del out, logits, hidden_states, input_ids, attention_mask
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return result_rows, n_skipped_short
+
+
+def _mp_worker(job: dict[str, Any]) -> dict[str, Any]:
+    gpu_id = int(job["gpu_id"])
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+    else:
+        device = torch.device("cpu")
+    rows = job["rows"]
+    cfg = job["cfg"]
+    result_rows, n_skipped_short = _run_partial_cancellation_chunk(
+        rows_selected=rows,
+        model_path=cfg["model"],
+        template=cfg["template"],
+        disable_lf_template=cfg["disable_lf_template"],
+        batch_size=int(cfg["batch_size"]),
+        device=device,
+    )
+    return {"result_rows": result_rows, "n_skipped_short": n_skipped_short}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Partial cancellation analysis on response tokens.")
+    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--dataset_info", type=str, default=None)
+    parser.add_argument("--prompt_field", type=str, default=None)
+    parser.add_argument("--pred_field", type=str, default=None)
+    parser.add_argument("--label_field", type=str, default=None)
+    parser.add_argument("--template", type=str, default="llama3")
+    parser.add_argument("--disable_lf_template", action="store_true")
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--max_samples", type=int, default=2000)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--use_multi_process", action="store_true", help="启用多卡多进程（每卡一个进程）。")
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default=None,
+        help="多进程使用的 GPU 列表，如 '0,1,2,3'；默认使用全部可见 GPU。",
+    )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=0,
+        help="多进程数量（0 表示自动=GPU数量）。",
+    )
+    parser.add_argument("--only_wrong", action="store_true", help="只分析错误样本。")
+    parser.add_argument("--only_correct", action="store_true", help="只分析正确样本。")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="partial_cancellation_outputs",
+        help="输出子目录，CSV/JSON/图片都会写到该目录下。",
+    )
+    args = parser.parse_args()
+
+    if args.only_wrong and args.only_correct:
+        raise ValueError("--only_wrong 和 --only_correct 不能同时设置。")
+
+    rows_raw, data_meta = resolve_input_rows(
+        data_arg=args.data,
+        dataset_name=args.dataset,
+        dataset_info_arg=args.dataset_info,
+        prompt_field_arg=args.prompt_field,
+        pred_field_arg=args.pred_field,
+        label_field_arg=args.label_field,
+    )
+    if not rows_raw:
+        raise ValueError("输入数据为空。")
+
+    rows_selected: list[dict[str, Any]] = []
+    for row in rows_raw:
+        pred = str(row.get("predict", ""))
+        label = str(row.get("label", ""))
+        is_correct = answers_match(extract_answer(pred), extract_answer(label))
+        rr = dict(row)
+        rr["_is_correct"] = bool(is_correct)
+        if args.only_wrong and is_correct:
+            continue
+        if args.only_correct and (not is_correct):
+            continue
+        rows_selected.append(rr)
+        if len(rows_selected) >= args.max_samples:
+            break
+
+    if not rows_selected:
+        raise ValueError("筛选后没有样本可分析。")
+
+    filter_mode = "wrong" if args.only_wrong else ("correct" if args.only_correct else "all")
+    print(
+        f"[load] mode={data_meta['mode']} data={data_meta['data_file']} selected={len(rows_selected)} filter={filter_mode}"
+    )
+    print(f"[load] model/tokenizer: {args.model}")
+
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_mp = args.use_multi_process and n_gpu > 1
+    if use_mp:
+        if args.gpu_ids:
+            gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip() != ""]
+        else:
+            gpu_ids = list(range(n_gpu))
+        if not gpu_ids:
+            raise ValueError("启用多进程时 gpu_ids 为空。")
+        n_proc = int(args.num_processes) if int(args.num_processes) > 0 else len(gpu_ids)
+        n_proc = min(n_proc, len(gpu_ids))
+        gpu_ids = gpu_ids[:n_proc]
+
+        print(f"[device] cuda_available=True n_gpu={n_gpu} use_multi_process=True gpu_ids={gpu_ids}")
+        shards: list[list[dict[str, Any]]] = [[] for _ in range(n_proc)]
+        for idx, row in enumerate(rows_selected):
+            rr = dict(row)
+            rr["_global_sample_idx"] = int(idx)
+            shards[idx % n_proc].append(rr)
+
+        jobs: list[dict[str, Any]] = []
+        cfg = {
+            "model": args.model,
+            "template": args.template,
+            "disable_lf_template": bool(args.disable_lf_template),
+            "batch_size": int(args.batch_size),
+        }
+        for wi in range(n_proc):
+            jobs.append({"gpu_id": gpu_ids[wi], "rows": shards[wi], "cfg": cfg})
+
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_proc) as pool:
+            worker_outs = pool.map(_mp_worker, jobs)
+        result_rows: list[dict[str, Any]] = []
+        n_skipped_short = 0
+        for wo in worker_outs:
+            result_rows.extend(wo["result_rows"])
+            n_skipped_short += int(wo["n_skipped_short"])
+    else:
+        if args.use_multi_process and n_gpu <= 1:
+            print("[warn] --use_multi_process 已设置，但可见 GPU 数 <= 1，回退到单进程。")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"[device] cuda_available={torch.cuda.is_available()} n_gpu={n_gpu} use_multi_process=False device={device}")
+        rows_for_single: list[dict[str, Any]] = []
+        for idx, row in enumerate(rows_selected):
+            rr = dict(row)
+            rr["_global_sample_idx"] = int(idx)
+            rows_for_single.append(rr)
+        result_rows, n_skipped_short = _run_partial_cancellation_chunk(
+            rows_selected=rows_for_single,
+            model_path=args.model,
+            template=args.template,
+            disable_lf_template=bool(args.disable_lf_template),
+            batch_size=int(args.batch_size),
+            device=device,
+        )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
