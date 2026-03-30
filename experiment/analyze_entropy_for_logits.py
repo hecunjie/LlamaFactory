@@ -852,7 +852,7 @@ def main() -> None:
     )
     parser.add_argument("--entropy_threshold", type=float, default=2.0, help="High entropy threshold")
     parser.add_argument("--sim_threshold", type=float, default=0.3, help="Low-confidence sim threshold")
-    parser.add_argument("--only_wrong", action="store_true", default=True, help="Analyze only wrong samples")
+    parser.add_argument("--only_wrong", action="store_true", help="Analyze only wrong samples")
     parser.add_argument("--only_correct", action="store_true", help="Analyze only correct samples")
     parser.add_argument(
         "--all_samples",
@@ -1055,17 +1055,18 @@ def main() -> None:
         if len(rows_selected) >= args.max_samples:
             break
 
+    selected_mode = "all" if args.all_samples else ("correct" if args.only_correct else ("wrong" if args.only_wrong else "all"))
     print(
         f"[filter] total={total_count}, correct={correct_count}, wrong={wrong_count}, "
         f"selected={len(rows_selected)}, mode="
-        f"{'all' if args.all_samples else ('correct' if args.only_correct else 'wrong')}"
+        f"{selected_mode}"
     )
 
     if not rows_selected:
         print("没有满足筛选条件的样本，退出。")
         return
 
-    filter_mode = "all" if args.all_samples else ("correct" if args.only_correct else "wrong")
+    filter_mode = selected_mode
 
     print(f"[load] model/tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
