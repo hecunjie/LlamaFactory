@@ -881,13 +881,65 @@ def main() -> None:
         default=0.2,
         help="与 --export_low_entropy_lse 联用：q∈(0,1)，cutoff=np.quantile(joint_score, q)，约保留比例 q（有并列时略有偏差）。",
     )
+    # 兼容旧参数名：历史脚本使用“entropy/lse 各自分位”，当前实现已改为联合秩分位。
+    # 这里保留参数入口，统一映射到 --export_low_joint_quantile。
+    parser.add_argument(
+        "--export_low_entropy_quantile",
+        type=float,
+        default=None,
+        help="兼容旧参数：等价映射到 --export_low_joint_quantile（建议直接使用新参数）。",
+    )
+    parser.add_argument(
+        "--export_low_lse_quantile",
+        type=float,
+        default=None,
+        help="兼容旧参数：等价映射到 --export_low_joint_quantile（建议直接使用新参数）。",
+    )
     parser.add_argument(
         "--output_low_entropy_lse_jsonl",
         type=str,
         default=None,
         help="低熵+低 LSE 导出路径；默认 {output_plot stem}_low_entropy_low_lse.jsonl。",
     )
+    parser.add_argument(
+        "--export_low_lse_positions",
+        action="store_true",
+        help=(
+            "导出低 log_sum_exp 的 token 位置（含上下文），输出为单独 jsonl；"
+            "筛选条件使用 --log_sum_exp_threshold 或 --export_low_lse_bottom_quantile（二选一）。"
+        ),
+    )
+    parser.add_argument(
+        "--export_low_lse_bottom_quantile",
+        type=float,
+        default=None,
+        help="与 --export_low_lse_positions 联用：在全集 response token 的 log_sum_exp 上取底部分位数阈值（如 0.2）。",
+    )
+    parser.add_argument(
+        "--output_low_lse_jsonl",
+        type=str,
+        default=None,
+        help="低 LSE token 导出路径；默认 {output_plot stem}_low_lse_positions.jsonl。",
+    )
     args = parser.parse_args()
+
+    if args.export_low_entropy_quantile is not None or args.export_low_lse_quantile is not None:
+        legacy_qs = [
+            float(v)
+            for v in [args.export_low_entropy_quantile, args.export_low_lse_quantile]
+            if v is not None
+        ]
+        q_legacy = float(legacy_qs[0])
+        if any(abs(v - q_legacy) > 1e-12 for v in legacy_qs[1:]):
+            raise ValueError(
+                "旧参数 --export_low_entropy_quantile 与 --export_low_lse_quantile 同时提供时必须相等；"
+                "当前实现使用联合分位（--export_low_joint_quantile）。"
+            )
+        args.export_low_joint_quantile = q_legacy
+        print(
+            f"[compat] legacy quantile args detected, mapped to "
+            f"--export_low_joint_quantile={args.export_low_joint_quantile}"
+        )
 
     if args.lse_threshold_report and not math.isfinite(args.log_sum_exp_threshold):
         raise ValueError("使用 --lse_threshold_report 时必须指定有限的 --log_sum_exp_threshold")
@@ -896,6 +948,20 @@ def main() -> None:
         qj = float(args.export_low_joint_quantile)
         if not (0.0 < qj < 1.0):
             raise ValueError("--export_low_joint_quantile 须在 (0, 1) 内")
+
+    if args.export_low_lse_positions:
+        has_lse_thr = math.isfinite(args.log_sum_exp_threshold)
+        has_lse_q = (
+            args.export_low_lse_bottom_quantile is not None
+            and 0.0 < float(args.export_low_lse_bottom_quantile) < 1.0
+        )
+        if not has_lse_thr and not has_lse_q:
+            raise ValueError(
+                "--export_low_lse_positions 需要指定 --log_sum_exp_threshold 或 "
+                "--export_low_lse_bottom_quantile（0~1 之间）"
+            )
+        if has_lse_thr and has_lse_q:
+            raise ValueError("--export_low_lse_positions：请勿同时指定阈值与分位数。")
 
     if args.lse_layer_probe:
         has_max = math.isfinite(args.lse_layer_probe_max_base_lse)
@@ -1115,6 +1181,15 @@ def main() -> None:
                 low_ent_lse_out_path = Path(args.output_low_entropy_lse_jsonl)
             else:
                 low_ent_lse_out_path = output_plot_path.parent / f"{output_plot_path.stem}_low_entropy_low_lse.jsonl"
+        low_lse_buffer: list[dict[str, Any]] = []
+        low_lse_rows: list[dict[str, Any]] = []
+        low_lse_meta: dict[str, Any] = {}
+        low_lse_out_path: Path | None = None
+        if args.export_low_lse_positions:
+            if args.output_low_lse_jsonl:
+                low_lse_out_path = Path(args.output_low_lse_jsonl)
+            else:
+                low_lse_out_path = output_plot_path.parent / f"{output_plot_path.stem}_low_lse_positions.jsonl"
 
         total_positions_local = 0
         high_entropy_count_local = 0
@@ -1363,6 +1438,50 @@ def main() -> None:
                                     "top5_token_ids": [int(x) for x in top_ids_l],
                                 }
                             )
+                    if args.export_low_lse_positions and low_lse_out_path is not None:
+                        if np.isfinite(lse_t):
+                            tid_list = target_ids.tolist()
+                            tstrs = tokenizer.convert_ids_to_tokens(tid_list)
+                            tok_id = int(tid_list[t])
+                            top_ids_l = top5_ids[t].tolist()
+                            top_p = top5_vals[t].float().tolist()
+                            top_raw = tokenizer.convert_ids_to_tokens(top_ids_l)
+                            top_txt = [tokenizer.decode([int(x)], skip_special_tokens=False) for x in top_ids_l]
+                            low_lse_buffer.append(
+                                {
+                                    "sample_idx": st + i,
+                                    "variant": variant_tag,
+                                    "filter_mode": filter_mode,
+                                    "is_correct": is_correct,
+                                    "t": t,
+                                    "prompt_prefix": _build_prompt_prefix(
+                                        tokenizer=tokenizer,
+                                        prompt_text=prompts[i],
+                                        token_strs=tstrs,
+                                        t=t,
+                                    ),
+                                    "token_id": tok_id,
+                                    "token": tokenizer.decode([tok_id], skip_special_tokens=False),
+                                    "token_raw": tstrs[t],
+                                    "context": _build_token_context(
+                                        tokenizer=tokenizer,
+                                        token_ids=tid_list,
+                                        t=t,
+                                        window=6,
+                                    ),
+                                    "entropy": e,
+                                    "top1_prob": p1,
+                                    "top5_mass": p5m,
+                                    "log_sum_exp": lse_t,
+                                    # 与原 output_jsonl 的 top5_cosine_sim 对应，改为更贴近 LSE 的 top5 对数概率
+                                    "top5_log_probs": [float(math.log(max(float(x), 1e-12))) for x in top_p],
+                                    "case": case,
+                                    "top5_tokens": top_txt,
+                                    "top5_tokens_raw": top_raw,
+                                    "top5_probs": [float(x) for x in top_p],
+                                    "top5_token_ids": [int(x) for x in top_ids_l],
+                                }
+                            )
 
                 batch_sample_buffers.append(
                     {
@@ -1528,6 +1647,43 @@ def main() -> None:
                 f"(参考) 边际 entropy_cut@{args.export_low_joint_quantile}={low_ent_lse_meta.get('marginal_entropy_cutoff_at_same_q')} | "
                 f"lse_cut={low_ent_lse_meta.get('marginal_lse_cutoff_at_same_q')} | "
                 f"exported={low_ent_lse_meta.get('n_exported', 0)}"
+            )
+
+        if args.export_low_lse_positions and low_lse_out_path is not None:
+            lse_pool = np.array([float(r["log_sum_exp"]) for r in low_lse_buffer], dtype=np.float64)
+            lse_pool = lse_pool[np.isfinite(lse_pool)]
+            if lse_pool.size == 0:
+                low_lse_rows = []
+                low_lse_meta = {
+                    "mode": "empty_pool",
+                    "threshold_base_lse": None,
+                    "n_pool_tokens": 0,
+                    "n_exported": 0,
+                }
+            else:
+                if args.export_low_lse_bottom_quantile is not None:
+                    q_lse = float(args.export_low_lse_bottom_quantile)
+                    thr_lse = float(np.quantile(lse_pool, q_lse))
+                    mode_lse = "bottom_quantile"
+                else:
+                    q_lse = None
+                    thr_lse = float(args.log_sum_exp_threshold)
+                    mode_lse = "absolute_threshold"
+                low_lse_rows = [r for r in low_lse_buffer if float(r["log_sum_exp"]) <= thr_lse]
+                low_lse_meta = {
+                    "mode": mode_lse,
+                    "threshold_base_lse": thr_lse,
+                    "bottom_quantile": q_lse,
+                    "n_pool_tokens": int(len(low_lse_buffer)),
+                    "n_exported": int(len(low_lse_rows)),
+                }
+                for rr in low_lse_rows:
+                    rr["criteria"] = dict(low_lse_meta)
+            print(
+                f"[export_low_lse_positions] mode={low_lse_meta.get('mode')} | "
+                f"thr={low_lse_meta.get('threshold_base_lse')} | "
+                f"pool={low_lse_meta.get('n_pool_tokens', 0)} | "
+                f"exported={low_lse_meta.get('n_exported', 0)}"
             )
 
         if args.lse_layer_probe and final_norm is not None and use_lse_layer_q and layer_probe_pass1:
@@ -1741,6 +1897,14 @@ def main() -> None:
             print(
                 f"[export_low_entropy_lse] 写入 {len(low_entropy_lse_rows)} 条 → {low_ent_lse_out_path.resolve()}"
             )
+        if args.export_low_lse_positions and low_lse_out_path is not None:
+            low_lse_out_path.parent.mkdir(parents=True, exist_ok=True)
+            with low_lse_out_path.open("w", encoding="utf-8") as f:
+                for row in low_lse_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print(
+                f"[export_low_lse_positions] 写入 {len(low_lse_rows)} 条 → {low_lse_out_path.resolve()}"
+            )
 
         out_ret: dict[str, Any] = {**summary, "log_sum_exp": lse_stats_payload}
         if lse_thr_agg is not None:
@@ -1752,6 +1916,12 @@ def main() -> None:
                 "path": str(low_ent_lse_out_path.resolve()),
                 "n_rows": len(low_entropy_lse_rows),
                 "meta": low_ent_lse_meta,
+            }
+        if args.export_low_lse_positions and low_lse_out_path is not None:
+            out_ret["export_low_lse_positions"] = {
+                "path": str(low_lse_out_path.resolve()),
+                "n_rows": len(low_lse_rows),
+                "meta": low_lse_meta,
             }
         return out_ret
 
