@@ -7,6 +7,7 @@ import json
 import math
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import matplotlib.pyplot as plt
@@ -97,6 +98,173 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def load_json_array(path: Path) -> list[dict[str, Any]]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(obj, list):
+        return [x for x in obj if isinstance(x, dict)]
+    if isinstance(obj, dict):
+        # 兼容 {"data": [...]} 这类封装
+        data_obj = obj.get("data")
+        if isinstance(data_obj, list):
+            return [x for x in data_obj if isinstance(x, dict)]
+    raise ValueError(f"不支持的 JSON 格式（需要 list[dict] 或 {{'data': [...]}}）：{path}")
+
+
+def load_data_records(path: Path) -> list[dict[str, Any]]:
+    suf = path.suffix.lower()
+    if suf == ".jsonl":
+        return load_jsonl(path)
+    if suf == ".json":
+        return load_json_array(path)
+    raise ValueError(f"仅支持 .json/.jsonl 文件: {path}")
+
+
+def _pick_first(row: dict[str, Any], keys: list[str], default: str = "") -> str:
+    for k in keys:
+        if k in row and row.get(k) is not None:
+            return str(row.get(k))
+    return default
+
+
+def _normalize_rows_with_fields(
+    rows: list[dict[str, Any]],
+    *,
+    prompt_field: str,
+    pred_field: str,
+    label_field: str,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        rr = dict(row)
+        rr["prompt"] = _pick_first(rr, [prompt_field, "prompt", "instruction", "input", "question"], default="")
+        rr["predict"] = _pick_first(rr, [pred_field, "predict", "predictions", "output", "response"], default="")
+        rr["label"] = _pick_first(rr, [label_field, "label", "response", "output"], default="")
+        out.append(rr)
+    return out
+
+
+def resolve_input_rows(
+    *,
+    data_arg: str,
+    dataset_name: Optional[str],
+    dataset_info_arg: Optional[str],
+    prompt_field_arg: Optional[str],
+    pred_field_arg: Optional[str],
+    label_field_arg: Optional[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    data_path = Path(data_arg)
+    is_dataset_info_mode = data_path.is_dir() or data_path.name == "dataset_info.json"
+
+    if is_dataset_info_mode:
+        data_dir = data_path if data_path.is_dir() else data_path.parent
+        dataset_info_path = Path(dataset_info_arg) if dataset_info_arg else (data_dir / "dataset_info.json")
+        if not dataset_info_path.exists():
+            raise FileNotFoundError(f"未找到 dataset_info.json: {dataset_info_path}")
+        dataset_info = json.loads(dataset_info_path.read_text(encoding="utf-8"))
+        if not isinstance(dataset_info, dict):
+            raise ValueError(f"dataset_info.json 格式错误（应为 dict）：{dataset_info_path}")
+        if not dataset_name:
+            raise ValueError("检测到 dataset_info 模式，请通过 --dataset 指定数据集名称。")
+        if dataset_name not in dataset_info:
+            raise KeyError(f"--dataset={dataset_name} 不在 {dataset_info_path} 中。")
+        ds_conf = dataset_info[dataset_name]
+        if not isinstance(ds_conf, dict):
+            raise ValueError(f"dataset_info['{dataset_name}'] 格式错误（应为 dict）。")
+        file_name = ds_conf.get("file_name")
+        if not file_name:
+            raise ValueError(f"dataset_info['{dataset_name}'] 缺少 file_name，无法定位本地数据文件。")
+        file_path = Path(file_name)
+        if not file_path.is_absolute():
+            file_path = data_dir / file_path
+        rows_raw = load_data_records(file_path)
+
+        # dataset_info 模式下按需求默认 output/response（而不是 predict/predictions）
+        prompt_field = prompt_field_arg or "prompt"
+        pred_field = pred_field_arg or "output"
+        label_field = label_field_arg or "response"
+        rows = _normalize_rows_with_fields(
+            rows_raw,
+            prompt_field=prompt_field,
+            pred_field=pred_field,
+            label_field=label_field,
+        )
+        meta = {
+            "mode": "dataset_info",
+            "data_file": str(file_path),
+            "dataset_info": str(dataset_info_path),
+            "dataset": dataset_name,
+            "fields": {"prompt": prompt_field, "predict": pred_field, "label": label_field},
+        }
+        return rows, meta
+
+    rows_raw = load_data_records(data_path)
+    prompt_field = prompt_field_arg or "prompt"
+    pred_field = pred_field_arg or "predict"
+    label_field = label_field_arg or "label"
+    rows = _normalize_rows_with_fields(
+        rows_raw,
+        prompt_field=prompt_field,
+        pred_field=pred_field,
+        label_field=label_field,
+    )
+    meta = {
+        "mode": "direct_file",
+        "data_file": str(data_path),
+        "fields": {"prompt": prompt_field, "predict": pred_field, "label": label_field},
+    }
+    return rows, meta
+
+
+def _build_batch_inputs_from_ids(
+    token_id_seqs: list[list[int]],
+    pad_token_id: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_len = max(len(x) for x in token_id_seqs)
+    bs = len(token_id_seqs)
+    input_ids = torch.full((bs, max_len), int(pad_token_id), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((bs, max_len), dtype=torch.long, device=device)
+    for i, ids in enumerate(token_id_seqs):
+        if not ids:
+            continue
+        n = len(ids)
+        input_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=device)
+        attention_mask[i, :n] = 1
+    return input_ids, attention_mask
+
+
+def _build_model_inputs_for_row(
+    row: dict[str, Any],
+    tokenizer: Any,
+    lf_template: Any = None,
+) -> tuple[list[int], int, str]:
+    prompt_text = str(row.get("prompt", ""))
+    predict_text = str(row.get("predict", ""))
+    if lf_template is None:
+        full_text = prompt_text + predict_text
+        full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        return full_ids, len(prompt_ids), prompt_text
+
+    messages = [
+        {"role": "user", "content": prompt_text},
+        {"role": "assistant", "content": predict_text},
+    ]
+    system_text_raw = row.get("system", None)
+    tools_text_raw = row.get("tools", None)
+    system_text = str(system_text_raw) if system_text_raw is not None else None
+    tools_text = str(tools_text_raw) if tools_text_raw is not None else None
+    prompt_ids, response_ids = lf_template.encode_oneturn(
+        tokenizer,
+        messages,
+        system=system_text,
+        tools=tools_text,
+    )
+    full_ids = prompt_ids + response_ids
+    prompt_rendered = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+    return full_ids, len(prompt_ids), prompt_rendered
 
 
 def classify_case(
@@ -529,39 +697,72 @@ def _build_prompt_prefix(tokenizer: Any, prompt_text: str, token_strs: list[str]
     return prompt_text + response_prefix
 
 
-def _filter_low_entropy_lse_by_quantiles(
+def _rankdata_average_asc(a: np.ndarray) -> np.ndarray:
+    """升序秩（值越小秩越小），并列取平均秩。与 scipy.stats.rankdata(method='average') 一致。"""
+    n = a.size
+    s = np.argsort(a, kind="mergesort")
+    r = np.empty(n, dtype=np.float64)
+    r[s] = np.arange(1, n + 1, dtype=np.float64)
+    sorted_a = a[s]
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_a[j + 1] == sorted_a[i]:
+            j += 1
+        if j > i:
+            mm = float(r[s[i : j + 1]].mean())
+            r[s[i : j + 1]] = mm
+        i = j + 1
+    return r
+
+
+def _filter_low_entropy_lse_by_joint_quantile(
     buffer: list[dict[str, Any]],
-    q_entropy: float,
-    q_lse: float,
+    q: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """在全集 token 上取熵、LSE 的分位 cutoff，仅保留同时 ≤ 各自 cutoff 的记录。"""
+    """用「熵秩与 LSE 秩的平均」作联合分数，取 joint_score ≤ quantile(joint_score, q) 的 token。
+
+    若对熵、LSE **分别**取分位再求交集，在二者负相关时交集可能为空；联合秩可避免 0 条。
+    """
     if not buffer:
         meta = {
-            "mode": "quantile",
-            "entropy_quantile": q_entropy,
-            "lse_quantile": q_lse,
-            "entropy_cutoff": None,
-            "lse_cutoff": None,
+            "mode": "joint_rank_quantile",
+            "joint_quantile": q,
+            "joint_score_cutoff": None,
             "n_pool_tokens": 0,
             "n_exported": 0,
+            "note": "pool empty",
         }
         return [], meta
     ents = np.array([float(r["entropy"]) for r in buffer], dtype=np.float64)
     lses = np.array([float(r["log_sum_exp"]) for r in buffer], dtype=np.float64)
-    ent_cut = float(np.quantile(ents, q_entropy))
-    lse_cut = float(np.quantile(lses, q_lse))
+    rank_e = _rankdata_average_asc(ents)
+    rank_l = _rankdata_average_asc(lses)
+    joint = (rank_e + rank_l) / 2.0
+    joint_cut = float(np.quantile(joint, q))
+    # 边际分位仅作参考（与联合筛选无关）
+    ent_cut_m = float(np.quantile(ents, q))
+    lse_cut_m = float(np.quantile(lses, q))
     meta = {
-        "mode": "quantile",
-        "entropy_quantile": q_entropy,
-        "lse_quantile": q_lse,
-        "entropy_cutoff": ent_cut,
-        "lse_cutoff": lse_cut,
+        "mode": "joint_rank_quantile",
+        "joint_quantile": q,
+        "joint_score_cutoff": joint_cut,
+        "marginal_entropy_cutoff_at_same_q": ent_cut_m,
+        "marginal_lse_cutoff_at_same_q": lse_cut_m,
         "n_pool_tokens": len(buffer),
+        "description": (
+            "joint_score = (rank(entropy)+rank(log_sum_exp))/2，值越小表示熵与 LSE 在池中越偏低；"
+            "保留 joint_score ≤ np.quantile(joint_score, q)。"
+        ),
     }
     out: list[dict[str, Any]] = []
-    for r in buffer:
-        if float(r["entropy"]) <= ent_cut and float(r["log_sum_exp"]) <= lse_cut:
-            out.append(dict(r))
+    for idx, r in enumerate(buffer):
+        if float(joint[idx]) <= joint_cut:
+            rr = dict(r)
+            rr["joint_score"] = float(joint[idx])
+            rr["rank_entropy"] = float(rank_e[idx])
+            rr["rank_log_sum_exp"] = float(rank_l[idx])
+            out.append(rr)
     meta["n_exported"] = len(out)
     for rr in out:
         rr["criteria"] = dict(meta)
@@ -570,7 +771,41 @@ def _filter_low_entropy_lse_by_quantiles(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze logits entropy and hidden-state confidence.")
-    parser.add_argument("--data", type=str, required=True, help="Input JSONL path")
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help=(
+            "输入数据路径：可为 .json/.jsonl 文件；"
+            "也可传 data 目录或 dataset_info.json（此时需配合 --dataset）。"
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="dataset_info 模式下的数据集名（对应 dataset_info.json 的 key）。",
+    )
+    parser.add_argument(
+        "--dataset_info",
+        type=str,
+        default=None,
+        help="可选：显式指定 dataset_info.json 路径；默认使用 {data}/dataset_info.json。",
+    )
+    parser.add_argument("--prompt_field", type=str, default=None, help="可选：手动指定 prompt 字段名。")
+    parser.add_argument("--pred_field", type=str, default=None, help="可选：手动指定预测字段名。")
+    parser.add_argument("--label_field", type=str, default=None, help="可选：手动指定标签字段名。")
+    parser.add_argument(
+        "--template",
+        type=str,
+        default="llama3",
+        help="LlamaFactory 模板名（建议与训练一致）；默认 llama3。",
+    )
+    parser.add_argument(
+        "--disable_lf_template",
+        action="store_true",
+        help="禁用 LlamaFactory 模板编码，退回旧逻辑（prompt + predict 字符串拼接）。",
+    )
     parser.add_argument("--model", type=str, required=True, help="Local model checkpoint path")
     parser.add_argument("--max_samples", type=int, default=200, help="Max samples to analyze")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
@@ -635,22 +870,16 @@ def main() -> None:
         "--export_low_entropy_lse",
         action="store_true",
         help=(
-            "在本轮全部 response token 上，用分位数定义「低熵」「低 LSE」："
-            "entropy ≤ entropy 的 q 分位、且 log_sum_exp ≤ LSE 的 q 分位时导出为 JSONL（含上下文与 top5）。"
-            "分位数由 --export_low_entropy_quantile / --export_low_lse_quantile 指定。"
+            "在本轮全部 response token 上，用联合秩导出「同时偏低熵、偏低 LSE」的 token（含上下文与 top5）。"
+            "联合分数 joint_score=(rank(熵)+rank(LSE))/2，保留 joint_score≤quantile(joint,q)。"
+            "见 --export_low_joint_quantile（边际分位 AND 易为空，已改为联合秩）。"
         ),
     )
     parser.add_argument(
-        "--export_low_entropy_quantile",
+        "--export_low_joint_quantile",
         type=float,
         default=0.2,
-        help="与 --export_low_entropy_lse 联用：熵的全局分位数 q∈(0,1)，cutoff=np.quantile(熵, q)，保留 entropy≤cutoff（最低约 q 比例一侧）。",
-    )
-    parser.add_argument(
-        "--export_low_lse_quantile",
-        type=float,
-        default=0.2,
-        help="与 --export_low_entropy_lse 联用：log_sum_exp 的全局分位数 q∈(0,1)，保留 LSE≤cutoff。",
+        help="与 --export_low_entropy_lse 联用：q∈(0,1)，cutoff=np.quantile(joint_score, q)，约保留比例 q（有并列时略有偏差）。",
     )
     parser.add_argument(
         "--output_low_entropy_lse_jsonl",
@@ -664,10 +893,9 @@ def main() -> None:
         raise ValueError("使用 --lse_threshold_report 时必须指定有限的 --log_sum_exp_threshold")
 
     if args.export_low_entropy_lse:
-        qe = float(args.export_low_entropy_quantile)
-        ql = float(args.export_low_lse_quantile)
-        if not (0.0 < qe < 1.0 and 0.0 < ql < 1.0):
-            raise ValueError("--export_low_entropy_quantile 与 --export_low_lse_quantile 须均在 (0, 1) 内")
+        qj = float(args.export_low_joint_quantile)
+        if not (0.0 < qj < 1.0):
+            raise ValueError("--export_low_joint_quantile 须在 (0, 1) 内")
 
     if args.lse_layer_probe:
         has_max = math.isfinite(args.lse_layer_probe_max_base_lse)
@@ -685,14 +913,27 @@ def main() -> None:
     if args.only_correct and args.all_samples:
         raise ValueError("--only_correct 与 --all_samples 不能同时设置")
 
-    data_path = Path(args.data)
     output_plot = Path(args.output_plot)
     output_jsonl = Path(args.output_jsonl)
     output_plot.parent.mkdir(parents=True, exist_ok=True)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[load] data: {data_path}")
-    data = load_jsonl(data_path)
+    data, data_meta = resolve_input_rows(
+        data_arg=args.data,
+        dataset_name=args.dataset,
+        dataset_info_arg=args.dataset_info,
+        prompt_field_arg=args.prompt_field,
+        pred_field_arg=args.pred_field,
+        label_field_arg=args.label_field,
+    )
+    print(f"[load] mode={data_meta['mode']}, data={data_meta['data_file']}")
+    if data_meta["mode"] == "dataset_info":
+        print(
+            f"[load] dataset_info={data_meta['dataset_info']}, dataset={data_meta['dataset']}, "
+            f"fields={data_meta['fields']}"
+        )
+    else:
+        print(f"[load] fields={data_meta['fields']}")
     if not data:
         print("输入数据为空，退出。")
         return
@@ -739,6 +980,28 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    lf_template = None
+    if not args.disable_lf_template:
+        try:
+            from llamafactory.data import get_template_and_fix_tokenizer
+
+            data_args = SimpleNamespace(
+                template=args.template,
+                train_on_prompt=False,
+                tool_format=None,
+                default_system=None,
+                enable_thinking=True,
+            )
+            lf_template = get_template_and_fix_tokenizer(tokenizer, data_args)
+            print(
+                f"[template] enabled: {args.template if args.template else 'auto(tokenizer/default)'} | "
+                f"class={type(lf_template).__name__}"
+            )
+        except Exception as e:
+            print(f"[template] failed to init LlamaFactory template, fallback to raw concat. reason: {e}")
+            lf_template = None
+    else:
+        print("[template] disabled, using raw `prompt + predict`.")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float16,
@@ -858,25 +1121,26 @@ def main() -> None:
 
         for st in tqdm(range(0, len(rows_selected_local), args.batch_size), desc=f"Analyzing({variant_tag})"):
             batch_rows = rows_selected_local[st : st + args.batch_size]
-            full_texts = [str(r.get("prompt", "")) + str(r.get("predict", "")) for r in batch_rows]
-            prompts = [str(r.get("prompt", "")) for r in batch_rows]
+            batch_full_ids: list[list[int]] = []
+            prompts: list[str] = []
+            prompt_lens: list[int] = []
+            for r in batch_rows:
+                full_ids_i, prompt_len_i, prompt_rendered_i = _build_model_inputs_for_row(
+                    row=r,
+                    tokenizer=tokenizer,
+                    lf_template=lf_template,
+                )
+                batch_full_ids.append(full_ids_i)
+                prompt_lens.append(int(prompt_len_i))
+                prompts.append(prompt_rendered_i)
             predicts = [str(r.get("predict", "")) for r in batch_rows]
             labels = [str(r.get("label", "")) for r in batch_rows]
 
-            enc = tokenizer(
-                full_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=False,
-                add_special_tokens=False,
+            input_ids, attention_mask = _build_batch_inputs_from_ids(
+                token_id_seqs=batch_full_ids,
+                pad_token_id=int(tokenizer.pad_token_id),
+                device=model.lm_head.weight.device,
             )
-            input_ids = enc["input_ids"].to(model.lm_head.weight.device)
-            attention_mask = enc["attention_mask"].to(model.lm_head.weight.device)
-
-            prompt_lens = []
-            for p in prompts:
-                p_ids = tokenizer(p, add_special_tokens=False)["input_ids"]
-                prompt_lens.append(len(p_ids))
 
             with torch.no_grad():
                 out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -1254,15 +1518,15 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
         if args.export_low_entropy_lse and low_ent_lse_out_path is not None:
-            low_entropy_lse_rows, low_ent_lse_meta = _filter_low_entropy_lse_by_quantiles(
+            low_entropy_lse_rows, low_ent_lse_meta = _filter_low_entropy_lse_by_joint_quantile(
                 low_entropy_lse_buffer,
-                float(args.export_low_entropy_quantile),
-                float(args.export_low_lse_quantile),
+                float(args.export_low_joint_quantile),
             )
             print(
                 f"[export_low_entropy_lse] pool_tokens={low_ent_lse_meta.get('n_pool_tokens', 0)} | "
-                f"entropy q={args.export_low_entropy_quantile} → cutoff={low_ent_lse_meta.get('entropy_cutoff')} | "
-                f"LSE q={args.export_low_lse_quantile} → cutoff={low_ent_lse_meta.get('lse_cutoff')} | "
+                f"joint_q={args.export_low_joint_quantile} → joint_cutoff={low_ent_lse_meta.get('joint_score_cutoff')} | "
+                f"(参考) 边际 entropy_cut@{args.export_low_joint_quantile}={low_ent_lse_meta.get('marginal_entropy_cutoff_at_same_q')} | "
+                f"lse_cut={low_ent_lse_meta.get('marginal_lse_cutoff_at_same_q')} | "
                 f"exported={low_ent_lse_meta.get('n_exported', 0)}"
             )
 
@@ -1276,21 +1540,21 @@ def main() -> None:
                 desc=f"lse_layer_probe_p2({variant_tag})",
             ):
                 batch_rows = rows_selected_local[st : st + args.batch_size]
-                full_texts = [str(r.get("prompt", "")) + str(r.get("predict", "")) for r in batch_rows]
-                prompts = [str(r.get("prompt", "")) for r in batch_rows]
-                enc = tokenizer(
-                    full_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=False,
-                    add_special_tokens=False,
-                )
-                input_ids = enc["input_ids"].to(model.lm_head.weight.device)
-                attention_mask = enc["attention_mask"].to(model.lm_head.weight.device)
+                batch_full_ids_p2: list[list[int]] = []
                 prompt_lens_p2: list[int] = []
-                for p in prompts:
-                    p_ids = tokenizer(p, add_special_tokens=False)["input_ids"]
-                    prompt_lens_p2.append(len(p_ids))
+                for r in batch_rows:
+                    full_ids_i, prompt_len_i, _ = _build_model_inputs_for_row(
+                        row=r,
+                        tokenizer=tokenizer,
+                        lf_template=lf_template,
+                    )
+                    batch_full_ids_p2.append(full_ids_i)
+                    prompt_lens_p2.append(int(prompt_len_i))
+                input_ids, attention_mask = _build_batch_inputs_from_ids(
+                    token_id_seqs=batch_full_ids_p2,
+                    pad_token_id=int(tokenizer.pad_token_id),
+                    device=model.lm_head.weight.device,
+                )
                 with torch.no_grad():
                     out_p2 = model(
                         input_ids=input_ids,
