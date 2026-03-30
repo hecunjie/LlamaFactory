@@ -136,12 +136,40 @@ def _normalize_rows_with_fields(
     label_field: str,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         rr = dict(row)
-        rr["prompt"] = _pick_first(rr, [prompt_field, "prompt", "instruction", "input", "question"], default="")
-        rr["predict"] = _pick_first(rr, [pred_field, "predict", "predictions", "output", "response"], default="")
-        rr["label"] = _pick_first(rr, [label_field, "label", "response", "output"], default="")
-        out.append(rr)
+        prompt_val = _pick_first(rr, [prompt_field, "prompt", "instruction", "input", "question"], default="")
+        label_val = _pick_first(rr, [label_field, "label", "response", "output"], default="")
+
+        # 主预测（兼容旧字段）
+        main_predict = _pick_first(rr, [pred_field, "predict", "output", "response"], default="")
+        predict_variants: list[str] = [main_predict]
+
+        # 额外候选预测：支持 predicts / predictions 为 list
+        extra_obj = None
+        for k in ("predicts", "predictions"):
+            if isinstance(rr.get(k), list):
+                extra_obj = rr.get(k)
+                break
+        if isinstance(extra_obj, list):
+            for x in extra_obj:
+                if isinstance(x, dict):
+                    cand = str(
+                        x.get("predict", x.get("prediction", x.get("output", x.get("response", x.get("text", "")))))
+                    )
+                else:
+                    cand = str(x)
+                if cand != "":
+                    predict_variants.append(cand)
+
+        for vidx, pred_text in enumerate(predict_variants):
+            rri = dict(rr)
+            rri["prompt"] = prompt_val
+            rri["predict"] = pred_text
+            rri["label"] = label_val
+            rri["_source_row_idx"] = int(row_idx)
+            rri["_predict_variant_idx"] = int(vidx)  # 0: 原 predict，>=1: predicts/predictions 展开项
+            out.append(rri)
     return out
 
 
