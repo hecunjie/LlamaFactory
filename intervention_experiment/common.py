@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import inspect
 import math
 import os
 import random
@@ -217,13 +216,11 @@ def _generate_one(
     device = _model_input_device(model)
     eos_id = tokenizer.eos_token_id
     emb_matrix = model.get_input_embeddings().weight if method == "soft_step" else None
-    loop_layers = None
+    loop_k_int = 0
     if method == "loop_layers":
-        all_layers = model.model.layers
-        k = int(loop_k or 0)
-        if k <= 0:
+        loop_k_int = int(loop_k or 0)
+        if loop_k_int <= 0:
             raise ValueError("loop_layers method requires loop_k > 0")
-        loop_layers = all_layers[-k:]
 
     prompt_ids = prompt_ids.to(device)
     all_ids = prompt_ids.clone()
@@ -270,32 +267,8 @@ def _generate_one(
                 final_logits = outputs_extra.logits[0, -1, :]
 
             if intervene and method == "loop_layers":
-                # Re-run last-k decoder layers on the current token hidden state.
-                # This is a one-token refinement path without touching KV cache.
                 h = outputs.hidden_states[-1][:, -1:, :]
-                current_position = int(all_ids.shape[1] - 1)
-                pos_ids = torch.tensor([[current_position]], device=h.device, dtype=torch.long)
-                for layer in loop_layers:
-                    position_embeddings = _build_layer_position_embeddings(model, layer, pos_ids, h)
-                    layer_kwargs: dict[str, Any] = {}
-                    sig = inspect.signature(layer.forward)
-                    if "attention_mask" in sig.parameters:
-                        layer_kwargs["attention_mask"] = None
-                    if "position_ids" in sig.parameters:
-                        layer_kwargs["position_ids"] = pos_ids
-                    if "position_embeddings" in sig.parameters and position_embeddings is not None:
-                        layer_kwargs["position_embeddings"] = position_embeddings
-                    if "past_key_values" in sig.parameters:
-                        layer_kwargs["past_key_values"] = None
-                    elif "past_key_value" in sig.parameters:
-                        layer_kwargs["past_key_value"] = None
-                    if "use_cache" in sig.parameters:
-                        layer_kwargs["use_cache"] = False
-                    layer_out = layer(h, **layer_kwargs)
-                    h = layer_out[0]
-                h_normed = model.model.norm(h)
-                refined = model.lm_head(h_normed)
-                final_logits = refined[0, -1, :]
+                final_logits = _loop_via_hook(model, loop_k_int, h, all_ids)
                 lse_after = torch.logsumexp(final_logits, dim=-1).item()
                 intervention_lse_after.append(float(lse_after))
 
@@ -343,53 +316,39 @@ def _generate_one(
     }
 
 
-def _build_position_embeddings(model, hidden_states: torch.Tensor, position_ids: torch.Tensor):
-    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
-    if rotary is None:
-        return None
-    try:
-        return rotary(hidden_states, position_ids)
-    except Exception:
-        return None
+def _loop_via_hook(
+    model, loop_k: int, h_inject: torch.Tensor, all_ids: torch.Tensor
+) -> torch.Tensor:
+    """Re-run last-k layers by injecting h into a normal model forward via hook.
 
+    Uses a forward pre-hook on the target entry layer to replace hidden states
+    with the provided h_inject, then does a standard model forward from that
+    point. This avoids manually calling individual layer forwards and lets
+    transformers handle all RoPE / attention mask / cache logic internally.
+    """
+    total_layers = len(model.model.layers)
+    entry_idx = total_layers - loop_k
+    replaced = [False]
 
-def _call_rotary_emb(rotary, dummy: torch.Tensor, position_ids: torch.Tensor):
-    try:
-        return rotary(dummy, position_ids)
-    except Exception:
-        pass
-    try:
-        return rotary(position_ids)
-    except Exception:
-        pass
-    return None
+    def _pre_hook(module, args):
+        if replaced[0]:
+            return args
+        replaced[0] = True
+        new_args = list(args)
+        new_args[0] = h_inject.expand_as(args[0])
+        return tuple(new_args)
 
-
-def _build_layer_position_embeddings(model, layer, position_ids: torch.Tensor, hidden_states: torch.Tensor):
-    attn = getattr(layer, "self_attn", None)
-    rotary_layer = getattr(attn, "rotary_emb", None) if attn is not None else None
-    rotary_model = getattr(getattr(model, "model", None), "rotary_emb", None)
+    handle = model.model.layers[entry_idx].register_forward_pre_hook(_pre_hook)
     try:
-        num_kv = int(getattr(attn, "num_key_value_heads"))
-        head_dim = int(getattr(attn, "head_dim"))
-        bsz = int(hidden_states.shape[0])
-        seqlen = int(hidden_states.shape[1])
-        dummy = torch.zeros(
-            (bsz, num_kv, seqlen, head_dim),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        out = model(
+            input_ids=all_ids,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
         )
-        if rotary_layer is not None:
-            out = _call_rotary_emb(rotary_layer, dummy, position_ids)
-            if out is not None:
-                return out
-        if rotary_model is not None:
-            out = _call_rotary_emb(rotary_model, dummy, position_ids)
-            if out is not None:
-                return out
-        return None
-    except Exception:
-        return None
+        return out.logits[0, -1, :]
+    finally:
+        handle.remove()
 
 
 def _load_gsm8k(args: ExperimentArgs):
