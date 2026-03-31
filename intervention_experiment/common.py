@@ -276,7 +276,7 @@ def _generate_one(
                 current_position = int(all_ids.shape[1] - 1)
                 pos_ids = torch.tensor([[current_position]], device=h.device, dtype=torch.long)
                 for layer in loop_layers:
-                    position_embeddings = _build_layer_position_embeddings(layer, pos_ids, h)
+                    position_embeddings = _build_layer_position_embeddings(model, layer, pos_ids, h)
                     layer_kwargs: dict[str, Any] = {}
                     sig = inspect.signature(layer.forward)
                     if "attention_mask" in sig.parameters:
@@ -353,11 +353,22 @@ def _build_position_embeddings(model, hidden_states: torch.Tensor, position_ids:
         return None
 
 
-def _build_layer_position_embeddings(layer, position_ids: torch.Tensor, hidden_states: torch.Tensor):
+def _call_rotary_emb(rotary, dummy: torch.Tensor, position_ids: torch.Tensor):
+    try:
+        return rotary(dummy, position_ids)
+    except Exception:
+        pass
+    try:
+        return rotary(position_ids)
+    except Exception:
+        pass
+    return None
+
+
+def _build_layer_position_embeddings(model, layer, position_ids: torch.Tensor, hidden_states: torch.Tensor):
     attn = getattr(layer, "self_attn", None)
-    rotary = getattr(attn, "rotary_emb", None) if attn is not None else None
-    if rotary is None:
-        return None
+    rotary_layer = getattr(attn, "rotary_emb", None) if attn is not None else None
+    rotary_model = getattr(getattr(model, "model", None), "rotary_emb", None)
     try:
         num_kv = int(getattr(attn, "num_key_value_heads"))
         head_dim = int(getattr(attn, "head_dim"))
@@ -368,7 +379,15 @@ def _build_layer_position_embeddings(layer, position_ids: torch.Tensor, hidden_s
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        return rotary(dummy, position_ids)
+        if rotary_layer is not None:
+            out = _call_rotary_emb(rotary_layer, dummy, position_ids)
+            if out is not None:
+                return out
+        if rotary_model is not None:
+            out = _call_rotary_emb(rotary_model, dummy, position_ids)
+            if out is not None:
+                return out
+        return None
     except Exception:
         return None
 
