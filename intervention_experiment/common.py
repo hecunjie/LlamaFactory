@@ -275,8 +275,8 @@ def _generate_one(
                 h = outputs.hidden_states[-1][:, -1:, :]
                 current_position = int(all_ids.shape[1] - 1)
                 pos_ids = torch.tensor([[current_position]], device=h.device, dtype=torch.long)
-                position_embeddings = _build_position_embeddings(model, h, pos_ids)
                 for layer in loop_layers:
+                    position_embeddings = _build_layer_position_embeddings(layer, pos_ids, h)
                     layer_kwargs: dict[str, Any] = {}
                     sig = inspect.signature(layer.forward)
                     if "attention_mask" in sig.parameters:
@@ -349,6 +349,26 @@ def _build_position_embeddings(model, hidden_states: torch.Tensor, position_ids:
         return None
     try:
         return rotary(hidden_states, position_ids)
+    except Exception:
+        return None
+
+
+def _build_layer_position_embeddings(layer, position_ids: torch.Tensor, hidden_states: torch.Tensor):
+    attn = getattr(layer, "self_attn", None)
+    rotary = getattr(attn, "rotary_emb", None) if attn is not None else None
+    if rotary is None:
+        return None
+    try:
+        num_kv = int(getattr(attn, "num_key_value_heads"))
+        head_dim = int(getattr(attn, "head_dim"))
+        bsz = int(hidden_states.shape[0])
+        seqlen = int(hidden_states.shape[1])
+        dummy = torch.zeros(
+            (bsz, num_kv, seqlen, head_dim),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        return rotary(dummy, position_ids)
     except Exception:
         return None
 
