@@ -74,4 +74,21 @@ for th in "${SOFT_THRESHOLDS[@]}"; do
     --save_path "${RESULT_DIR}/soft_step_${th}_eval.json"
 done
 
-echo "[4/4] done: ${RESULT_DIR}"
+echo "[4/5] loop_layers sweep (9 configs)"
+LOOP_THRESHOLDS=(19.0 19.764647 20.5)
+LOOP_KS=(4 8 16)
+for th in "${LOOP_THRESHOLDS[@]}"; do
+  for k in "${LOOP_KS[@]}"; do
+    out="${RESULT_DIR}/loop_layers_${th}_${k}.jsonl"
+    run_distributed intervention_experiment/run_loop_layers.py \
+      --threshold "${th}" \
+      --loop_k "${k}" \
+      --output_path "${out}"
+    python intervention_experiment/evaluate.py \
+      --pred_path "${out}" \
+      --baseline_path "${BASELINE_PATH}" \
+      --save_path "${RESULT_DIR}/loop_layers_${th}_${k}_eval.json"
+  done
+done
+
+echo "[5/5] done: ${RESULT_DIR}"

@@ -38,8 +38,20 @@ def summarize(rows: list[dict]):
 
     total_steps = 0
     total_intervened = 0
+    lse_uplifts = []
     bin_stats = {}
     for r in rows:
+        lse_before = r.get("intervention_lse_values", []) or []
+        lse_after = r.get("intervention_lse_after", []) or []
+        for b, a in zip(lse_before, lse_after):
+            try:
+                bf = float(b)
+                af = float(a)
+            except Exception:
+                continue
+            if af == af and bf == bf:  # skip nan
+                lse_uplifts.append(af - bf)
+
         for step in r.get("step_records", []):
             total_steps += 1
             total_intervened += int(step.get("intervened", False))
@@ -63,6 +75,8 @@ def summarize(rows: list[dict]):
         "accuracy": acc,
         "avg_response_length": avg_len,
         "trigger_rate": trigger_rate,
+        "mean_lse_uplift": (sum(lse_uplifts) / len(lse_uplifts)) if lse_uplifts else None,
+        "n_lse_uplift_points": len(lse_uplifts),
         "per_lse_bin": per_bin,
     }
 

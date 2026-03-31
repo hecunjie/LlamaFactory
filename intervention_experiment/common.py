@@ -39,6 +39,7 @@ class ExperimentArgs:
     base_temp: float = 1.0
     threshold: float | None = None
     local_temp: float | None = None
+    loop_k: int | None = None
     device_map: str = "single"  # single|auto
     dtype: str = "bfloat16"  # bfloat16|float16|float32
 
@@ -209,11 +210,19 @@ def _generate_one(
     base_temp: float,
     threshold: float | None,
     local_temp: float | None,
+    loop_k: int | None,
     max_new_tokens: int,
 ) -> dict[str, Any]:
     device = _model_input_device(model)
     eos_id = tokenizer.eos_token_id
     emb_matrix = model.get_input_embeddings().weight if method == "soft_step" else None
+    loop_layers = None
+    if method == "loop_layers":
+        all_layers = model.model.layers
+        k = int(loop_k or 0)
+        if k <= 0:
+            raise ValueError("loop_layers method requires loop_k > 0")
+        loop_layers = all_layers[-k:]
 
     prompt_ids = prompt_ids.to(device)
     all_ids = prompt_ids.clone()
@@ -223,6 +232,7 @@ def _generate_one(
     generated: list[int] = []
     intervention_positions: list[int] = []
     intervention_lse_values: list[float] = []
+    intervention_lse_after: list[float] = []
     step_records: list[dict[str, Any]] = []
 
     with torch.no_grad():
@@ -231,6 +241,7 @@ def _generate_one(
                 input_ids=cur_input,
                 past_key_values=past_key_values,
                 use_cache=True,
+                output_hidden_states=(method == "loop_layers"),
                 return_dict=True,
             )
             logits = outputs.logits[0, -1, :]
@@ -257,6 +268,27 @@ def _generate_one(
                 )
                 final_logits = outputs_extra.logits[0, -1, :]
 
+            if intervene and method == "loop_layers":
+                # Re-run last-k decoder layers on the current token hidden state.
+                # This is a one-token refinement path without touching KV cache.
+                h = outputs.hidden_states[-1][:, -1:, :]
+                current_position = int(all_ids.shape[1] - 1)
+                pos_ids = torch.tensor([[current_position]], device=h.device, dtype=torch.long)
+                for layer in loop_layers:
+                    layer_out = layer(
+                        h,
+                        attention_mask=None,
+                        position_ids=pos_ids,
+                        past_key_value=None,
+                        use_cache=False,
+                    )
+                    h = layer_out[0]
+                h_normed = model.model.norm(h)
+                refined = model.lm_head(h_normed)
+                final_logits = refined[0, -1, :]
+                lse_after = torch.logsumexp(final_logits, dim=-1).item()
+                intervention_lse_after.append(float(lse_after))
+
             next_token, picked_is_top1 = sample_top_p(
                 final_logits,
                 top_p=top_p,
@@ -266,6 +298,8 @@ def _generate_one(
             if intervene:
                 intervention_positions.append(int(all_ids.shape[1]))
                 intervention_lse_values.append(float(lse))
+                if method != "loop_layers":
+                    intervention_lse_after.append(float("nan"))
 
             step_records.append(
                 {
@@ -273,6 +307,11 @@ def _generate_one(
                     "lse": float(lse),
                     "intervened": bool(intervene),
                     "picked_is_top1": bool(picked_is_top1),
+                    "lse_after": (
+                        intervention_lse_after[-1]
+                        if (intervene and len(intervention_lse_after) > 0)
+                        else None
+                    ),
                 }
             )
 
@@ -289,6 +328,7 @@ def _generate_one(
         "n_interventions": len(intervention_positions),
         "intervention_positions": intervention_positions,
         "intervention_lse_values": intervention_lse_values,
+        "intervention_lse_after": intervention_lse_after,
         "step_records": step_records,
     }
 
@@ -415,7 +455,7 @@ def _get_shard_indices(total: int, rank: int, world_size: int) -> list[int]:
 
 
 def run_experiment(args: ExperimentArgs, method: str) -> str:
-    assert method in {"baseline", "local_temp", "soft_step"}
+    assert method in {"baseline", "local_temp", "soft_step", "loop_layers"}
     set_seed(args.seed)
     rank, world_size, _ = get_rank_info()
 
@@ -446,6 +486,7 @@ def run_experiment(args: ExperimentArgs, method: str) -> str:
                 base_temp=args.base_temp,
                 threshold=args.threshold,
                 local_temp=args.local_temp,
+                loop_k=args.loop_k,
                 max_new_tokens=args.max_new_tokens,
             )
             pred = parse_answer(gen["response"])
@@ -459,6 +500,7 @@ def run_experiment(args: ExperimentArgs, method: str) -> str:
                 "n_interventions": gen["n_interventions"],
                 "intervention_positions": gen["intervention_positions"],
                 "intervention_lse_values": gen["intervention_lse_values"],
+                "intervention_lse_after": gen["intervention_lse_after"],
                 "response_length": len(gen["generated_tokens"]),
                 "step_records": gen["step_records"],
             }
