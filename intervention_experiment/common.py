@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import math
 import os
 import random
@@ -274,14 +275,23 @@ def _generate_one(
                 h = outputs.hidden_states[-1][:, -1:, :]
                 current_position = int(all_ids.shape[1] - 1)
                 pos_ids = torch.tensor([[current_position]], device=h.device, dtype=torch.long)
+                position_embeddings = _build_position_embeddings(model, h, pos_ids)
                 for layer in loop_layers:
-                    layer_out = layer(
-                        h,
-                        attention_mask=None,
-                        position_ids=pos_ids,
-                        past_key_value=None,
-                        use_cache=False,
-                    )
+                    layer_kwargs: dict[str, Any] = {}
+                    sig = inspect.signature(layer.forward)
+                    if "attention_mask" in sig.parameters:
+                        layer_kwargs["attention_mask"] = None
+                    if "position_ids" in sig.parameters:
+                        layer_kwargs["position_ids"] = pos_ids
+                    if "position_embeddings" in sig.parameters and position_embeddings is not None:
+                        layer_kwargs["position_embeddings"] = position_embeddings
+                    if "past_key_values" in sig.parameters:
+                        layer_kwargs["past_key_values"] = None
+                    elif "past_key_value" in sig.parameters:
+                        layer_kwargs["past_key_value"] = None
+                    if "use_cache" in sig.parameters:
+                        layer_kwargs["use_cache"] = False
+                    layer_out = layer(h, **layer_kwargs)
                     h = layer_out[0]
                 h_normed = model.model.norm(h)
                 refined = model.lm_head(h_normed)
@@ -331,6 +341,16 @@ def _generate_one(
         "intervention_lse_after": intervention_lse_after,
         "step_records": step_records,
     }
+
+
+def _build_position_embeddings(model, hidden_states: torch.Tensor, position_ids: torch.Tensor):
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if rotary is None:
+        return None
+    try:
+        return rotary(hidden_states, position_ids)
+    except Exception:
+        return None
 
 
 def _load_gsm8k(args: ExperimentArgs):
