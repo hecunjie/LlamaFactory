@@ -426,9 +426,10 @@ def run_experiment(args: ExperimentArgs, method: str) -> str:
     out_path = Path(args.output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     part_path = out_path.with_suffix(out_path.suffix + f".rank{rank}")
+    part_tmp_path = out_path.with_suffix(out_path.suffix + f".rank{rank}.tmp")
 
     started = time.time()
-    with part_path.open("w", encoding="utf-8") as fout:
+    with part_tmp_path.open("w", encoding="utf-8") as fout:
         for done_idx, sample_idx in enumerate(shard_indices, start=1):
             item = dataset[int(sample_idx)]
             question = str(item["question"])
@@ -468,6 +469,9 @@ def run_experiment(args: ExperimentArgs, method: str) -> str:
                     f"[{method}][rank={rank}] {done_idx}/{len(shard_indices)} done "
                     f"(elapsed={elapsed:.1f}s)"
                 )
+    # Atomic finalize for distributed merge safety:
+    # rank0 should only merge files that are fully written.
+    part_tmp_path.replace(part_path)
 
     _merge_parts_when_ready(out_path, world_size)
     return str(out_path)
