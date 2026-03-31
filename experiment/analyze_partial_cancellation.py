@@ -76,6 +76,18 @@ def _compute_segment_diversities(
     }
 
 
+def _compute_hidden_state_norm(
+    hidden_states: tuple[torch.Tensor, ...],
+    batch_idx: int,
+    pos: int,
+    layer_idx: int = -1,
+) -> float:
+    if len(hidden_states) == 0:
+        return float("nan")
+    hs = hidden_states[layer_idx][batch_idx, pos, :].float()
+    return float(torch.norm(hs, p=2).item())
+
+
 def _safe_float(x: Any) -> float | None:
     if x is None:
         return None
@@ -101,6 +113,7 @@ def _write_csv(rows: list[dict[str, Any]], path: Path) -> None:
                     "div_early",
                     "div_middle",
                     "div_late",
+                    "hidden_state_norm",
                 ]
             )
         return
@@ -314,6 +327,7 @@ def _run_partial_cancellation_chunk(
                 abs_pos = pred_start + int(t)
                 div = _compute_direction_diversity(hidden_states, i, abs_pos)
                 seg = _compute_segment_diversities(hidden_states, i, abs_pos)
+                hs_norm = _compute_hidden_state_norm(hidden_states, i, abs_pos)
                 result_rows.append(
                     {
                         "sample_idx": int(batch_rows[i].get("_global_sample_idx", st + i)),
@@ -325,12 +339,14 @@ def _run_partial_cancellation_chunk(
                         "div_early": float(seg["early"]),
                         "div_middle": float(seg["middle"]),
                         "div_late": float(seg["late"]),
+                        "hidden_state_norm": float(hs_norm),
                     }
                 )
             for t in high_pick.tolist():
                 abs_pos = pred_start + int(t)
                 div = _compute_direction_diversity(hidden_states, i, abs_pos)
                 seg = _compute_segment_diversities(hidden_states, i, abs_pos)
+                hs_norm = _compute_hidden_state_norm(hidden_states, i, abs_pos)
                 result_rows.append(
                     {
                         "sample_idx": int(batch_rows[i].get("_global_sample_idx", st + i)),
@@ -342,6 +358,7 @@ def _run_partial_cancellation_chunk(
                         "div_early": float(seg["early"]),
                         "div_middle": float(seg["middle"]),
                         "div_late": float(seg["late"]),
+                        "hidden_state_norm": float(hs_norm),
                     }
                 )
 
@@ -548,6 +565,16 @@ def main() -> None:
     )
     low_vals = low_vals[np.isfinite(low_vals)]
     high_vals = high_vals[np.isfinite(high_vals)]
+    low_norm_vals = np.array(
+        [float(r["hidden_state_norm"]) for r in result_rows if r["group"] == "low_lse"],
+        dtype=np.float64,
+    )
+    high_norm_vals = np.array(
+        [float(r["hidden_state_norm"]) for r in result_rows if r["group"] == "high_lse"],
+        dtype=np.float64,
+    )
+    low_norm_vals = low_norm_vals[np.isfinite(low_norm_vals)]
+    high_norm_vals = high_norm_vals[np.isfinite(high_norm_vals)]
     all_lse = np.array([float(r["log_sum_exp"]) for r in result_rows], dtype=np.float64)
     all_div = np.array([float(r["direction_diversity"]) for r in result_rows], dtype=np.float64)
     mask = np.isfinite(all_lse) & np.isfinite(all_div)
@@ -555,6 +582,7 @@ def main() -> None:
     all_div = all_div[mask]
 
     mw_stat, mw_p = _mann_whitney_less(low_vals, high_vals)
+    mw_norm_stat, mw_norm_p = _mann_whitney_less(low_norm_vals, high_norm_vals)
     rho, rho_p = _spearman_corr(all_lse, all_div)
 
     summary = {
@@ -571,14 +599,19 @@ def main() -> None:
                 "n": int(low_vals.size),
                 "mean_direction_diversity": (float(np.mean(low_vals)) if low_vals.size > 0 else None),
                 "std_direction_diversity": (float(np.std(low_vals, ddof=0)) if low_vals.size > 0 else None),
+                "mean_hidden_state_norm": (float(np.mean(low_norm_vals)) if low_norm_vals.size > 0 else None),
+                "std_hidden_state_norm": (float(np.std(low_norm_vals, ddof=0)) if low_norm_vals.size > 0 else None),
             },
             "high_lse": {
                 "n": int(high_vals.size),
                 "mean_direction_diversity": (float(np.mean(high_vals)) if high_vals.size > 0 else None),
                 "std_direction_diversity": (float(np.std(high_vals, ddof=0)) if high_vals.size > 0 else None),
+                "mean_hidden_state_norm": (float(np.mean(high_norm_vals)) if high_norm_vals.size > 0 else None),
+                "std_hidden_state_norm": (float(np.std(high_norm_vals, ddof=0)) if high_norm_vals.size > 0 else None),
             },
         },
         "mann_whitney_u_less": {"stat": mw_stat, "p_value": mw_p},
+        "mann_whitney_u_less_hidden_state_norm": {"stat": mw_norm_stat, "p_value": mw_norm_p},
         "spearman_lse_vs_diversity": {"rho": rho, "p_value": rho_p},
         "outputs": {
             "csv": str(out_csv.resolve()),
@@ -597,7 +630,9 @@ def main() -> None:
     print(
         f"[stats] low_mean={summary['group_stats']['low_lse']['mean_direction_diversity']} "
         f"high_mean={summary['group_stats']['high_lse']['mean_direction_diversity']} "
-        f"mw_p={mw_p} spearman_rho={rho}"
+        f"low_norm_mean={summary['group_stats']['low_lse']['mean_hidden_state_norm']} "
+        f"high_norm_mean={summary['group_stats']['high_lse']['mean_hidden_state_norm']} "
+        f"mw_p={mw_p} mw_norm_p={mw_norm_p} spearman_rho={rho}"
     )
 
 
