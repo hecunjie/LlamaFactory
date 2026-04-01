@@ -23,6 +23,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}"
 
+# UMAP + sklearn + OpenBLAS 多线程叠在一起时常见 double free；默认单线程可规避（可自行 export 覆盖）
+: "${OMP_NUM_THREADS:=1}"
+: "${OPENBLAS_NUM_THREADS:=1}"
+: "${MKL_NUM_THREADS:=1}"
+: "${NUMEXPR_NUM_THREADS:=1}"
+export OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS
+
 MODEL="${MODEL_NAME_OR_PATH:-${MODEL:-${1:-}}}"
 DATASET_NAME="${DATASET:-${2:-gsm8k_sft_train}}"
 DATASET_DIR="${DATASET_DIR:-data}"

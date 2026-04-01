@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+# 须在 import numpy / sklearn 之前限制 BLAS 线程，避免 OpenBLAS 与 UMAP/NumPy 并发导致
+# “double free / Bad memory unallocation”（尤其 Linux + 高核数机器）。
+import os
+
+for _env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env, "1")
+
 import argparse
 import json
-import os
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -36,7 +42,13 @@ def main() -> None:
     # range(args.k_min, args.k_max) convention: try k in [k_min, k_max)
     k_hi_exclusive = min(args.k_max, n + 1)
     sil_sample = min(5000, n)
-    reducer = umap.UMAP(n_components=2, metric="cosine", random_state=args.random_state)
+    reducer = umap.UMAP(
+        n_components=2,
+        metric="cosine",
+        random_state=args.random_state,
+        n_jobs=1,
+        verbose=False,
+    )
     hs_2d = reducer.fit_transform(hs_norm)
     umap_path = os.path.join(args.input_dir, "umap_2d.npy")
     np.save(umap_path, hs_2d)
@@ -52,7 +64,13 @@ def main() -> None:
     for k in range(args.k_min, k_hi_exclusive):
         km = KMeans(n_clusters=k, random_state=args.random_state, n_init=10)
         labels = km.fit_predict(hs_norm)
-        sil = float(silhouette_score(hs_norm, labels, sample_size=sil_sample) if n > 1 else 0.0)
+        if n > 1:
+            try:
+                sil = float(silhouette_score(hs_norm, labels, sample_size=sil_sample, n_jobs=1))
+            except TypeError:
+                sil = float(silhouette_score(hs_norm, labels, sample_size=sil_sample))
+        else:
+            sil = 0.0
         db = float(davies_bouldin_score(hs_norm, labels)) if k > 1 else float("nan")
         results[k] = {"silhouette": sil, "davies_bouldin": db}
         print(f"K={k}: silhouette={sil:.4f}, davies_bouldin={db:.4f}")

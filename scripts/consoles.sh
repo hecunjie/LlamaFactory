@@ -1,3 +1,4 @@
+# 分析low lse,low max_cosine_sim的点
 python experiment/analyze_entropy_for_logits.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
   --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404 \
@@ -6,17 +7,20 @@ python experiment/analyze_entropy_for_logits.py \
   --entropy_threshold 0.01 \
   --high_entropy_topk 20 \
   --sim_threshold 0.18 \
-  --only_wrong \
+  --only_correct \
   --export_low_lse_positions \
   --export_low_lse_bottom_quantile 0.05 \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_points/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point/last_ckp_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point_correct/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point_correct/last_ckp_entropy_results.jsonl
   # --lse_threshold_report \
   # --log_sum_exp_threshold 22.0 \
   # --lse_layer_probe \
   # --lse_layer_probe_bottom_quantile 0.2 \
   # --export_low_entropy_lse \
   # --export_low_joint_quantile 0.3 \
+
+## 在 LOW LSE 的点上进行干预实验
+MODEL="/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404" NPROC=8 DTYPE="bfloat16" LF_DATASET_NAME="gsm_nl_test" DATASET_INFO_PATH="data/dataset_info.json" bash intervention_experiment/sweep.sh
 
 python experiment/analyze_partial_cancellation.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
@@ -26,9 +30,9 @@ python experiment/analyze_partial_cancellation.py \
   --use_multi_process \
   --gpu_ids "0,1,2,3,4,5,6,7" \
   --num_processes 8 \
-  --low_lse_quantile 0.05 \
+  --low_lse_quantile 0.1 \
   --high_lse_top_ratio 0.5 \
-  --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/partial_cancellation
+  --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/partial_cancellation_and_check_norm
 
 python experiment/analyze_entropy_for_logits.py \
   --data data \
