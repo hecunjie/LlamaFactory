@@ -33,9 +33,10 @@ def main() -> None:
         pick = random.sample(samples, min(args.per_cluster, len(samples)))
         block = [f"\n{'=' * 60}", f"CLUSTER {cid} (n={len(samples)})", "=" * 60]
         for s in pick:
+            ctx_show = s.get("context_window_marked", s.get("context_window", ""))
             block.append(
                 f"  neg_logprob={s['neg_logprob']:.3f} | token={s['token_str']!r} | "
-                f"context: ...{s['context_window']}..."
+                f"context: {ctx_show}"
             )
         print("\n".join(block))
         lines.extend(block)

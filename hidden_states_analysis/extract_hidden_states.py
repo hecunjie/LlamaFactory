@@ -129,6 +129,11 @@ def extract(
                 ctx_lo = max(0, t - 10)
                 ctx_hi = min(seq_len, t + 11)
                 ctx = tokenizer.decode(full_ids[ctx_lo:ctx_hi], skip_special_tokens=False)
+                # 便于人工审查：在窗口中明确标出该高熵位置对应 token
+                left_ctx = tokenizer.decode(full_ids[ctx_lo:t], skip_special_tokens=False)
+                tok_str = tokenizer.decode([full_ids[t]], skip_special_tokens=False)
+                right_ctx = tokenizer.decode(full_ids[t + 1 : ctx_hi], skip_special_tokens=False)
+                ctx_marked = f"{left_ctx}[[{tok_str}]]{right_ctx}"
                 all_hs.append(hs)
                 all_meta.append(
                     {
@@ -136,8 +141,9 @@ def extract(
                         "position": t,
                         "neg_logprob": token_neg_logprobs[t],
                         "token_id": full_ids[t],
-                        "token_str": tokenizer.decode([full_ids[t]], skip_special_tokens=False),
+                        "token_str": tok_str,
                         "context_window": ctx,
+                        "context_window_marked": ctx_marked,
                     }
                 )
 
