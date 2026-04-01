@@ -13,17 +13,19 @@ from trainer import train_model
 def build_samples_from_lf_rows(rows, tokenizer, template_style: str = "auto"):
     samples = []
     has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    use_manual_llama3 = False
     if template_style == "qa":
         use_chat_template = False
     elif template_style == "auto":
         use_chat_template = has_chat_template
     elif template_style in {"chat", "llama3"}:
-        if not has_chat_template:
+        if template_style == "chat" and not has_chat_template:
             raise ValueError(
-                f"template_style={template_style} requires tokenizer.chat_template, "
+                "template_style=chat requires tokenizer.chat_template, "
                 "but current tokenizer has no chat template."
             )
-        use_chat_template = True
+        use_chat_template = has_chat_template
+        use_manual_llama3 = template_style == "llama3" and not has_chat_template
     else:
         raise ValueError(f"Unsupported template_style: {template_style}")
 
@@ -36,10 +38,15 @@ def build_samples_from_lf_rows(rows, tokenizer, template_style: str = "auto"):
                 tokenize=False,
                 add_generation_prompt=True,
             )
+        elif use_manual_llama3:
+            prompt = (
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+                f"{row['prompt']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
         else:
             prompt = f"Q: {row['prompt']}\nA:"
         response = row["response"]
-        if use_chat_template and eot_token:
+        if (use_chat_template or use_manual_llama3) and eot_token:
             if not response.endswith(eot_token):
                 response = response + eot_token
         elif tokenizer.eos_token and not response.endswith(tokenizer.eos_token):
