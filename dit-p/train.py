@@ -2,6 +2,7 @@ import argparse
 import os
 
 import torch
+import torch.distributed as dist
 
 from dataset import DITPDataset, load_dataset_from_lf_info
 from evaluate import evaluate_gsm8k
@@ -92,10 +93,23 @@ def main():
     )
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = world_size > 1
+    if is_distributed:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+        is_main_process = dist.get_rank() == 0
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        is_main_process = True
+
     model, tokenizer = load_model_and_tokenizer(args.model_name)
     pause_token_id, added = register_pause_token(tokenizer, model)
-    print(f"[PAUSE] token id: {pause_token_id}, newly_added: {added}")
+    if is_main_process:
+        print(f"[PAUSE] token id: {pause_token_id}, newly_added: {added}")
 
     train_rows = load_dataset_from_lf_info(
         dataset_info_path=args.dataset_info_path,
@@ -113,7 +127,8 @@ def main():
     test_samples = build_samples_from_lf_rows(
         test_rows, tokenizer, template_style=args.template_style
     )
-    print(f"Template style: {args.template_style}")
+    if is_main_process:
+        print(f"Template style: {args.template_style}")
 
     dataset = DITPDataset(
         samples=train_samples,
@@ -125,18 +140,20 @@ def main():
         max_length=args.max_length,
         device=device,
     )
-    print(f"Prepared training samples: {len(dataset)}")
+    if is_main_process:
+        print(f"Prepared training samples: {len(dataset)}")
     if len(dataset) == 0:
         raise ValueError(
             "No valid training samples after preprocessing. "
             "Please check dataset paths, columns mapping in dataset_info.json, and max_length."
         )
-    print(
-        f"Pause stats | inserted={dataset.total_pause_inserted}, "
-        f"density={dataset.pause_density:.6f}, mode={args.mode}, m_dit={args.m_dit}"
-    )
+    if is_main_process:
+        print(
+            f"Pause stats | inserted={dataset.total_pause_inserted}, "
+            f"density={dataset.pause_density:.6f}, mode={args.mode}, m_dit={args.m_dit}"
+        )
 
-    train_model(
+    model = train_model(
         model=model,
         dataset=dataset,
         epochs=args.epochs,
@@ -148,24 +165,29 @@ def main():
         tokenizer=tokenizer,
     )
 
-    model.save_pretrained(args.save_path)
-    tokenizer.save_pretrained(args.save_path)
-    print(f"Saved model to: {args.save_path}")
+    if is_main_process:
+        model.save_pretrained(args.save_path)
+        tokenizer.save_pretrained(args.save_path)
+        print(f"Saved model to: {args.save_path}")
 
-    metrics = evaluate_gsm8k(
-        model=model,
-        tokenizer=tokenizer,
-        samples=test_samples,
-        pause_token_id=pause_token_id,
-        max_new_tokens=args.max_new_tokens,
-        device=device,
-    )
-    print(
-        f"Eval | accuracy={metrics['accuracy']:.4f}, "
-        f"avg_pause_count={metrics['avg_pause_count']:.4f}, "
-        f"pause_nonzero_rate={metrics['pause_nonzero_rate']:.4f}, "
-        f"n={metrics['num_samples']}"
-    )
+        metrics = evaluate_gsm8k(
+            model=model,
+            tokenizer=tokenizer,
+            samples=test_samples,
+            pause_token_id=pause_token_id,
+            max_new_tokens=args.max_new_tokens,
+            device=device,
+        )
+        print(
+            f"Eval | accuracy={metrics['accuracy']:.4f}, "
+            f"avg_pause_count={metrics['avg_pause_count']:.4f}, "
+            f"pause_nonzero_rate={metrics['pause_nonzero_rate']:.4f}, "
+            f"n={metrics['num_samples']}"
+        )
+
+    if is_distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

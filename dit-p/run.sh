@@ -15,6 +15,7 @@ SAVE_STEPS="${SAVE_STEPS:-0}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 TEMPLATE_STYLE="${TEMPLATE_STYLE:-llama3}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
 TEST_DATASET_NAME="${TEST_DATASET_NAME:-gsm8k_sft_test}"
 
@@ -73,8 +74,15 @@ echo "[INFO] TEST_FILE=${TEST_FILE}"
 echo "[INFO] SAVE_PATH=${SAVE_PATH}"
 echo "[INFO] SAVE_STEPS=${SAVE_STEPS}"
 echo "[INFO] TEMPLATE_STYLE=${TEMPLATE_STYLE}"
+echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE}"
 
-python "${SCRIPT_DIR}/train.py" \
+if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
+  LAUNCHER=(torchrun --standalone --nproc_per_node "${NPROC_PER_NODE}" "${SCRIPT_DIR}/train.py")
+else
+  LAUNCHER=(python "${SCRIPT_DIR}/train.py")
+fi
+
+"${LAUNCHER[@]}" \
   --model_name "${MODEL_NAME}" \
   --mode "${MODE}" \
   --m_dit "${M_DIT}" \

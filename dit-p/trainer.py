@@ -3,8 +3,10 @@ import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 from transformers import get_linear_schedule_with_warmup
 
@@ -22,13 +24,22 @@ def train_model(
     save_path: Optional[str] = None,
     tokenizer=None,
 ):
+    is_distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_distributed else 0
+    is_main_process = rank == 0
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    sampler = DistributedSampler(dataset, shuffle=True) if is_distributed else None
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         collate_fn=dataset.collate_fn,
     )
     model = model.to(device)
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=lr)
@@ -40,12 +51,15 @@ def train_model(
 
     global_step = 0
     for epoch in range(epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         epoch_loss = 0.0
         pbar = tqdm(
             dataloader,
             desc=f"Epoch {epoch + 1}/{epochs}",
             leave=True,
             dynamic_ncols=True,
+            disable=not is_main_process,
         )
         for batch in pbar:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -70,15 +84,19 @@ def train_model(
                 step=global_step,
             )
 
-            if save_steps > 0 and global_step % save_steps == 0:
+            if is_main_process and save_steps > 0 and global_step % save_steps == 0:
                 if not save_path:
                     raise ValueError("save_path is required when save_steps > 0")
                 ckpt_dir = os.path.join(save_path, f"checkpoint-step-{global_step}")
                 os.makedirs(ckpt_dir, exist_ok=True)
-                model.save_pretrained(ckpt_dir)
+                model_to_save = model.module if isinstance(model, DDP) else model
+                model_to_save.save_pretrained(ckpt_dir)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(ckpt_dir)
                 print(f"Saved checkpoint at step {global_step}: {ckpt_dir}")
 
         avg_loss = epoch_loss / max(len(dataloader), 1)
-        print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+        if is_main_process:
+            print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+
+    return model.module if isinstance(model, DDP) else model
