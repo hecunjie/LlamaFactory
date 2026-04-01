@@ -39,6 +39,11 @@ def train_model(
             optimizer.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Encountered non-finite loss (NaN/Inf). "
+                    "Try smaller lr, bf16/fp32, or verify data quality."
+                )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()

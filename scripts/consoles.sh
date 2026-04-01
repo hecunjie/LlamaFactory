@@ -22,6 +22,20 @@ python experiment/analyze_entropy_for_logits.py \
 ## 在 LOW LSE 的点上进行干预实验
 MODEL="/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404" NPROC=8 DTYPE="bfloat16" LF_DATASET_NAME="gsm_nl_test" DATASET_INFO_PATH="data/dataset_info.json" bash intervention_experiment/sweep.sh
 
+
+## 训练DIT-P
+
+python dit-p/train.py \
+  --model_name /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
+  --mode ditp \
+  --m_dit 5 \
+  --epochs 2 \
+  --lr 1e-5 \
+  --batch_size 16 \
+  --save_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_5_2_epoch/
+
+
+
 python experiment/analyze_partial_cancellation.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
   --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404 \

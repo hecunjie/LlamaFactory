@@ -72,6 +72,11 @@ def main():
         device=device,
     )
     print(f"Prepared training samples: {len(dataset)}")
+    if len(dataset) == 0:
+        raise ValueError(
+            "No valid training samples after preprocessing. "
+            "Please check dataset paths, columns mapping in dataset_info.json, and max_length."
+        )
 
     train_model(
         model=model,
