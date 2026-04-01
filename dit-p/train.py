@@ -10,16 +10,39 @@ from tokenizer_utils import register_pause_token
 from trainer import train_model
 
 
-def build_samples_from_lf_rows(rows, tokenizer):
+def build_samples_from_lf_rows(rows, tokenizer, template_style: str = "auto"):
     samples = []
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    if template_style == "qa":
+        use_chat_template = False
+    elif template_style == "auto":
+        use_chat_template = has_chat_template
+    elif template_style in {"chat", "llama3"}:
+        if not has_chat_template:
+            raise ValueError(
+                f"template_style={template_style} requires tokenizer.chat_template, "
+                "but current tokenizer has no chat template."
+            )
+        use_chat_template = True
+    else:
+        raise ValueError(f"Unsupported template_style: {template_style}")
+
+    eot_token = "<|eot_id|>" if tokenizer.convert_tokens_to_ids("<|eot_id|>") != tokenizer.unk_token_id else None
+
     for row in rows:
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": row["prompt"]}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if use_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": row["prompt"]}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = f"Q: {row['prompt']}\nA:"
         response = row["response"]
-        if tokenizer.eos_token and not response.endswith(tokenizer.eos_token):
+        if use_chat_template and eot_token:
+            if not response.endswith(eot_token):
+                response = response + eot_token
+        elif tokenizer.eos_token and not response.endswith(tokenizer.eos_token):
             response = response + tokenizer.eos_token
         samples.append({"prompt": prompt, "response": response})
     return samples
@@ -49,6 +72,12 @@ def main():
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument(
+        "--template_style",
+        choices=["auto", "chat", "qa", "llama3"],
+        default="llama3",
+        help="Prompt template style. auto=use tokenizer.chat_template when available.",
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=0,
@@ -71,8 +100,13 @@ def main():
         data_dir=args.data_dir,
         dataset_name=args.test_dataset_name,
     )
-    train_samples = build_samples_from_lf_rows(train_rows, tokenizer)
-    test_samples = build_samples_from_lf_rows(test_rows, tokenizer)
+    train_samples = build_samples_from_lf_rows(
+        train_rows, tokenizer, template_style=args.template_style
+    )
+    test_samples = build_samples_from_lf_rows(
+        test_rows, tokenizer, template_style=args.template_style
+    )
+    print(f"Template style: {args.template_style}")
 
     dataset = DITPDataset(
         samples=train_samples,

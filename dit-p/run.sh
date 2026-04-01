@@ -14,6 +14,7 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 SAVE_STEPS="${SAVE_STEPS:-0}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+TEMPLATE_STYLE="${TEMPLATE_STYLE:-llama3}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
 TEST_DATASET_NAME="${TEST_DATASET_NAME:-gsm8k_sft_test}"
 
@@ -71,6 +72,7 @@ echo "[INFO] TRAIN_FILE=${TRAIN_FILE}"
 echo "[INFO] TEST_FILE=${TEST_FILE}"
 echo "[INFO] SAVE_PATH=${SAVE_PATH}"
 echo "[INFO] SAVE_STEPS=${SAVE_STEPS}"
+echo "[INFO] TEMPLATE_STYLE=${TEMPLATE_STYLE}"
 
 python "${SCRIPT_DIR}/train.py" \
   --model_name "${MODEL_NAME}" \
@@ -82,6 +84,7 @@ python "${SCRIPT_DIR}/train.py" \
   --save_steps "${SAVE_STEPS}" \
   --max_length "${MAX_LENGTH}" \
   --max_new_tokens "${MAX_NEW_TOKENS}" \
+  --template_style "${TEMPLATE_STYLE}" \
   --dataset_info_path "${DATASET_INFO_PATH}" \
   --data_dir "${DATA_DIR}" \
   --train_dataset_name "${TRAIN_DATASET_NAME}" \
