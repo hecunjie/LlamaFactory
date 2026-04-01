@@ -6,6 +6,8 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import BoundaryNorm
+from matplotlib import cm
 
 
 def main() -> None:
@@ -19,9 +21,28 @@ def main() -> None:
     hs_2d = np.load(umap_path)
     labels = np.load(labels_path)
 
+    labels = labels.astype(int)
+    n_k = int(labels.max()) + 1
+    # 离散类别：避免 k 较小时仍把 label 线性映射到 [0,1]，colorbar 误显示成连续渐变
+    try:
+        base_cmap = plt.colormaps["tab10"].resampled(n_k)
+    except (AttributeError, KeyError):
+        base_cmap = cm.get_cmap("tab10", n_k)
+    bounds = np.arange(-0.5, n_k + 0.5, 1.0)
+    norm = BoundaryNorm(bounds, n_k)
+
     fig, ax = plt.subplots(figsize=(12, 8))
-    sc = ax.scatter(hs_2d[:, 0], hs_2d[:, 1], c=labels, cmap="tab10", alpha=0.5, s=5)
-    plt.colorbar(sc, ax=ax)
+    sc = ax.scatter(
+        hs_2d[:, 0],
+        hs_2d[:, 1],
+        c=labels,
+        cmap=base_cmap,
+        norm=norm,
+        alpha=0.5,
+        s=5,
+    )
+    cbar = plt.colorbar(sc, ax=ax, ticks=np.arange(n_k))
+    cbar.set_label("cluster id")
     ax.set_title("UMAP of high-entropy hidden states (by cluster)")
     out = os.path.join(args.input_dir, args.output_name)
     fig.tight_layout()

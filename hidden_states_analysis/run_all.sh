@@ -16,6 +16,9 @@
 #   MAX_SAMPLES       默认 2000（调试可设 200）
 #   TOP_K_PERCENT     默认 10
 #   DTYPE             默认 bfloat16（可选 float16 float32）
+#   LAYER_IDX         默认 -1（单实验时用；可取 -1/last/middle/整数）
+#   RUN_MIDDLE_EXPERIMENT 默认 1（1=同时跑最后一层和中间层，0=只跑 LAYER_IDX）
+#   MIDDLE_LAYER_IDX  默认 middle
 #   SKIP_EXTRACT=1    仅跑聚类/图/统计（需已有 OUTPUT_DIR 下的 hidden_states.npy）
 #
 set -euo pipefail
@@ -38,10 +41,52 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/hidden_states_run}"
 MAX_SAMPLES="${MAX_SAMPLES:-2000}"
 TOP_K_PERCENT="${TOP_K_PERCENT:-10}"
 DTYPE="${DTYPE:-bfloat16}"
+LAYER_IDX="${LAYER_IDX:--1}"
+RUN_MIDDLE_EXPERIMENT="${RUN_MIDDLE_EXPERIMENT:-1}"
+MIDDLE_LAYER_IDX="${MIDDLE_LAYER_IDX:-middle}"
 SKIP_EXTRACT="${SKIP_EXTRACT:-0}"
 
-ABS_OUT="${ROOT}/${OUTPUT_DIR}"
-HIDDEN_NPY="${ABS_OUT}/hidden_states.npy"
+ABS_OUT_BASE="${ROOT}/${OUTPUT_DIR}"
+
+run_one() {
+  local layer_label="$1"
+  local layer_idx="$2"
+  local out_dir="$3"
+  local hidden_npy="${out_dir}/hidden_states.npy"
+
+  if [[ "${SKIP_EXTRACT}" != "1" ]]; then
+    echo "==> [1/5] 抽取 hidden states (${layer_label}, layer_idx=${layer_idx})"
+    echo "    model=${MODEL} dataset=${DATASET_NAME} dataset_dir=${DATASET_DIR} out=${out_dir}"
+    python "${ROOT}/hidden_states_analysis/extract_hidden_states.py" \
+      --model_name_or_path "${MODEL}" \
+      --dataset_dir "${ROOT}/${DATASET_DIR}" \
+      --dataset "${DATASET_NAME}" \
+      --template "${TEMPLATE}" \
+      --output_dir "${out_dir}" \
+      --max_samples "${MAX_SAMPLES}" \
+      --top_k_percent "${TOP_K_PERCENT}" \
+      --dtype "${DTYPE}" \
+      --layer_idx "${layer_idx}"
+  else
+    echo "==> 跳过抽取 (SKIP_EXTRACT=1)，使用已有：${hidden_npy}"
+    if [[ ! -f "${hidden_npy}" ]]; then
+      echo "错误：找不到 ${hidden_npy}" >&2
+      exit 1
+    fi
+  fi
+
+  echo "==> [2/5] UMAP + KMeans (${layer_label})"
+  python "${ROOT}/hidden_states_analysis/cluster_analysis.py" --input_dir "${out_dir}"
+
+  echo "==> [3/5] 可视化 UMAP (${layer_label})"
+  python "${ROOT}/hidden_states_analysis/visualize.py" --input_dir "${out_dir}"
+
+  echo "==> [4/5] 聚类上下文抽样（人工可读）(${layer_label})"
+  python "${ROOT}/hidden_states_analysis/interpret_clusters.py" --input_dir "${out_dir}"
+
+  echo "==> [5/5] 定量统计 (${layer_label})"
+  python "${ROOT}/hidden_states_analysis/quantitative_features.py" --input_dir "${out_dir}"
+}
 
 if [[ "${SKIP_EXTRACT}" != "1" ]]; then
   if [[ -z "${MODEL}" ]]; then
@@ -49,37 +94,17 @@ if [[ "${SKIP_EXTRACT}" != "1" ]]; then
     echo "示例：MODEL_NAME_OR_PATH=meta-llama/Meta-Llama-3-8B-Instruct ${ROOT}/hidden_states_analysis/run_all.sh" >&2
     exit 1
   fi
-
-  echo "==> [1/5] 抽取 hidden states"
-  echo "    model=${MODEL} dataset=${DATASET_NAME} dataset_dir=${DATASET_DIR} out=${ABS_OUT}"
-  python "${ROOT}/hidden_states_analysis/extract_hidden_states.py" \
-    --model_name_or_path "${MODEL}" \
-    --dataset_dir "${ROOT}/${DATASET_DIR}" \
-    --dataset "${DATASET_NAME}" \
-    --template "${TEMPLATE}" \
-    --output_dir "${ABS_OUT}" \
-    --max_samples "${MAX_SAMPLES}" \
-    --top_k_percent "${TOP_K_PERCENT}" \
-    --dtype "${DTYPE}"
-else
-  echo "==> 跳过抽取 (SKIP_EXTRACT=1)，使用已有：${HIDDEN_NPY}"
-  if [[ ! -f "${HIDDEN_NPY}" ]]; then
-    echo "错误：找不到 ${HIDDEN_NPY}" >&2
-    exit 1
-  fi
 fi
 
-echo "==> [2/5] UMAP + KMeans"
-python "${ROOT}/hidden_states_analysis/cluster_analysis.py" --input_dir "${ABS_OUT}"
-
-echo "==> [3/5] 可视化 UMAP"
-python "${ROOT}/hidden_states_analysis/visualize.py" --input_dir "${ABS_OUT}"
-
-echo "==> [4/5] 聚类上下文抽样（人工可读）"
-python "${ROOT}/hidden_states_analysis/interpret_clusters.py" --input_dir "${ABS_OUT}"
-
-echo "==> [5/5] 定量统计"
-python "${ROOT}/hidden_states_analysis/quantitative_features.py" --input_dir "${ABS_OUT}"
-
-echo "全部完成。输出目录：${ABS_OUT}"
-ls -la "${ABS_OUT}"
+if [[ "${RUN_MIDDLE_EXPERIMENT}" == "1" ]]; then
+  OUT_LAST="${ABS_OUT_BASE}/last_layer"
+  OUT_MID="${ABS_OUT_BASE}/middle_layer"
+  run_one "last_layer" "-1" "${OUT_LAST}"
+  run_one "middle_layer" "${MIDDLE_LAYER_IDX}" "${OUT_MID}"
+  echo "全部完成。输出目录：${ABS_OUT_BASE}"
+  ls -la "${ABS_OUT_BASE}"
+else
+  run_one "single_layer" "${LAYER_IDX}" "${ABS_OUT_BASE}"
+  echo "全部完成。输出目录：${ABS_OUT_BASE}"
+  ls -la "${ABS_OUT_BASE}"
+fi

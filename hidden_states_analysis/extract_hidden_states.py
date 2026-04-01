@@ -64,13 +64,25 @@ def extract(
     *,
     top_k_percent: float,
     max_samples: int,
-    layer_idx: int,
+    layer_idx: str,
     cutoff_len: int,
 ) -> tuple[np.ndarray, list[dict]]:
     all_hs: list[np.ndarray] = []
     all_meta: list[dict] = []
 
     n_layers = model.config.num_hidden_layers
+
+    def _resolve_layer_tensor_idx(layer_arg: str) -> int:
+        s = str(layer_arg).strip().lower()
+        if s in {"-1", "last"}:
+            return n_layers
+        if s in {"middle", "mid"}:
+            return max(1, n_layers // 2)
+        try:
+            user_idx = int(s)
+        except ValueError as err:
+            raise ValueError(f"Invalid layer_idx={layer_arg!r}, use -1/last/middle or integer.") from err
+        return user_idx + 1
 
     model.eval()
     device = next(model.parameters()).device
@@ -85,13 +97,10 @@ def extract(
             outputs = model(input_ids=input_ids, output_hidden_states=True)
             hidden_stack = outputs.hidden_states
             # hidden_stack[0] = embeddings; [1..num_hidden_layers] = each block output; [-1] == last layer
-            if layer_idx < 0:
-                layer_tensor_idx = len(hidden_stack) - 1
-            else:
-                layer_tensor_idx = layer_idx + 1
+            layer_tensor_idx = _resolve_layer_tensor_idx(layer_idx)
             if layer_tensor_idx < 0 or layer_tensor_idx >= len(hidden_stack):
                 raise ValueError(
-                    f"layer_idx={layer_idx} invalid: need 0..{n_layers - 1} or -1, "
+                    f"layer_idx={layer_idx} invalid: need 0..{n_layers - 1}, -1/last, or middle, "
                     f"got hidden_states depth {len(hidden_stack)}."
                 )
             h_layer = hidden_stack[layer_tensor_idx][0]
@@ -146,7 +155,12 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default="outputs/hidden_states_run", help="Directory for .npy / .json.")
     parser.add_argument("--top_k_percent", type=float, default=10.0, help="Top fraction of neg_logprob within assistant span.")
     parser.add_argument("--max_samples", type=int, default=2000, help="Max dataset rows (use 200 for smoke test).")
-    parser.add_argument("--layer_idx", type=int, default=-1, help="-1 = last transformer layer.")
+    parser.add_argument(
+        "--layer_idx",
+        type=str,
+        default="-1",
+        help="Layer selector: -1/last (final layer), middle, or integer block index.",
+    )
     parser.add_argument("--cutoff_len", type=int, default=4096, help="Truncate tokenized length.")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     args = parser.parse_args()
