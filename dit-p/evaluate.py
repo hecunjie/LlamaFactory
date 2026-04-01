@@ -60,6 +60,7 @@ def evaluate_gsm8k(
 ):
     correct = 0
     total_pause = 0
+    pause_nonzero = 0
     n = 0
     for sample in samples:
         prompt = sample["prompt"]
@@ -76,9 +77,17 @@ def evaluate_gsm8k(
         gold_ans = extract_gsm8k_answer(label)
         if _match(pred_ans, gold_ans):
             correct += 1
-        total_pause += int(pred["pause_count"])
+        pause_count = int(pred["pause_count"])
+        total_pause += pause_count
+        if pause_count > 0:
+            pause_nonzero += 1
         n += 1
 
     accuracy = correct / max(n, 1)
     avg_pause = total_pause / max(n, 1)
-    return {"accuracy": accuracy, "avg_pause_count": avg_pause, "num_samples": n}
+    return {
+        "accuracy": accuracy,
+        "avg_pause_count": avg_pause,
+        "pause_nonzero_rate": pause_nonzero / max(n, 1),
+        "num_samples": n,
+    }

@@ -38,7 +38,10 @@ def generate_with_pause(
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        temperature=None,
+        top_p=None,
         logits_processor=[PauseLimiter(pause_token_id=pause_token_id, max_consecutive_pause=3)],
+        renormalize_logits=True,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )

@@ -77,6 +77,8 @@ class DITPDataset(Dataset):
         self.features = []
         self.pad_token_id = tokenizer.pad_token_id
         self.mode = mode
+        self.pause_token_id = pause_token_id
+        self.total_pause_inserted = 0
         model.eval()
         model = model.to(device)
 
@@ -125,6 +127,7 @@ class DITPDataset(Dataset):
                 if i in selected:
                     new_input_ids.append(pause_token_id)
                     new_labels.append(pause_token_id if mode == "ditp" else -100)
+                    self.total_pause_inserted += 1
                 new_input_ids.append(tid)
                 new_labels.append(tid)
 
@@ -135,6 +138,11 @@ class DITPDataset(Dataset):
                     "attention_mask": [1] * len(new_input_ids),
                 }
             )
+
+        self.total_tokens = sum(len(x["input_ids"]) for x in self.features)
+        self.pause_density = (
+            self.total_pause_inserted / max(self.total_tokens, 1) if self.features else 0.0
+        )
 
     def __len__(self) -> int:
         return len(self.features)

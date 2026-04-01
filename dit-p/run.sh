@@ -11,6 +11,7 @@ M_DIT="${M_DIT:-5}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-5}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
+SAVE_STEPS="${SAVE_STEPS:-0}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
@@ -69,6 +70,7 @@ echo "[INFO] MODEL_NAME=${MODEL_NAME}"
 echo "[INFO] TRAIN_FILE=${TRAIN_FILE}"
 echo "[INFO] TEST_FILE=${TEST_FILE}"
 echo "[INFO] SAVE_PATH=${SAVE_PATH}"
+echo "[INFO] SAVE_STEPS=${SAVE_STEPS}"
 
 python "${SCRIPT_DIR}/train.py" \
   --model_name "${MODEL_NAME}" \
@@ -77,6 +79,7 @@ python "${SCRIPT_DIR}/train.py" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
   --batch_size "${BATCH_SIZE}" \
+  --save_steps "${SAVE_STEPS}" \
   --max_length "${MAX_LENGTH}" \
   --max_new_tokens "${MAX_NEW_TOKENS}" \
   --dataset_info_path "${DATASET_INFO_PATH}" \

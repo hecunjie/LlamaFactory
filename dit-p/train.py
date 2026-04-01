@@ -10,11 +10,18 @@ from tokenizer_utils import register_pause_token
 from trainer import train_model
 
 
-def build_samples_from_lf_rows(rows):
+def build_samples_from_lf_rows(rows, tokenizer):
     samples = []
     for row in rows:
-        prompt = f"Q: {row['prompt']}\nA:"
-        samples.append({"prompt": prompt, "response": row["response"]})
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": row["prompt"]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        response = row["response"]
+        if tokenizer.eos_token and not response.endswith(tokenizer.eos_token):
+            response = response + tokenizer.eos_token
+        samples.append({"prompt": prompt, "response": response})
     return samples
 
 
@@ -41,6 +48,12 @@ def main():
     parser.add_argument("--test_dataset_name", type=str, default="gsm8k_sft_test")
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=0,
+        help="Save checkpoint every N optimizer steps. 0 disables step checkpointing.",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,8 +71,8 @@ def main():
         data_dir=args.data_dir,
         dataset_name=args.test_dataset_name,
     )
-    train_samples = build_samples_from_lf_rows(train_rows)
-    test_samples = build_samples_from_lf_rows(test_rows)
+    train_samples = build_samples_from_lf_rows(train_rows, tokenizer)
+    test_samples = build_samples_from_lf_rows(test_rows, tokenizer)
 
     dataset = DITPDataset(
         samples=train_samples,
@@ -77,6 +90,10 @@ def main():
             "No valid training samples after preprocessing. "
             "Please check dataset paths, columns mapping in dataset_info.json, and max_length."
         )
+    print(
+        f"Pause stats | inserted={dataset.total_pause_inserted}, "
+        f"density={dataset.pause_density:.6f}, mode={args.mode}, m_dit={args.m_dit}"
+    )
 
     train_model(
         model=model,
@@ -85,6 +102,9 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         device=device,
+        save_steps=args.save_steps,
+        save_path=args.save_path,
+        tokenizer=tokenizer,
     )
 
     model.save_pretrained(args.save_path)
@@ -102,6 +122,7 @@ def main():
     print(
         f"Eval | accuracy={metrics['accuracy']:.4f}, "
         f"avg_pause_count={metrics['avg_pause_count']:.4f}, "
+        f"pause_nonzero_rate={metrics['pause_nonzero_rate']:.4f}, "
         f"n={metrics['num_samples']}"
     )
 
