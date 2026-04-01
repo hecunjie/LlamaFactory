@@ -19,6 +19,8 @@
 #   LAYER_IDX         默认 -1（单实验时用；可取 -1/last/middle/整数）
 #   RUN_MIDDLE_EXPERIMENT 默认 1（1=同时跑最后一层和中间层，0=只跑 LAYER_IDX）
 #   MIDDLE_LAYER_IDX  默认 middle
+#   K_MIN             默认 2
+#   K_MAX             默认 12（注意是开区间上界，实际会跑 K_MIN..K_MAX-1）
 #   SKIP_EXTRACT=1    仅跑聚类/图/统计（需已有 OUTPUT_DIR 下的 hidden_states.npy）
 #
 set -euo pipefail
@@ -44,6 +46,8 @@ DTYPE="${DTYPE:-bfloat16}"
 LAYER_IDX="${LAYER_IDX:--1}"
 RUN_MIDDLE_EXPERIMENT="${RUN_MIDDLE_EXPERIMENT:-1}"
 MIDDLE_LAYER_IDX="${MIDDLE_LAYER_IDX:-middle}"
+K_MIN="${K_MIN:-2}"
+K_MAX="${K_MAX:-12}"
 SKIP_EXTRACT="${SKIP_EXTRACT:-0}"
 
 ABS_OUT_BASE="${ROOT}/${OUTPUT_DIR}"
@@ -75,8 +79,11 @@ run_one() {
     fi
   fi
 
-  echo "==> [2/5] UMAP + KMeans (${layer_label})"
-  python "${ROOT}/hidden_states_analysis/cluster_analysis.py" --input_dir "${out_dir}"
+  echo "==> [2/5] UMAP + KMeans (${layer_label}, K=${K_MIN}..$((K_MAX - 1)))"
+  python "${ROOT}/hidden_states_analysis/cluster_analysis.py" \
+    --input_dir "${out_dir}" \
+    --k_min "${K_MIN}" \
+    --k_max "${K_MAX}"
 
   echo "==> [3/5] 可视化 UMAP (${layer_label})"
   python "${ROOT}/hidden_states_analysis/visualize.py" --input_dir "${out_dir}"
