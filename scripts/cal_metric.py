@@ -6,8 +6,12 @@ Input JSONL format (one JSON object per line):
   {
     "prompt":    "<question text>",
     "label":     "<CoT reasoning> #### <answer>",
-    "predicts":  ["<pred1>", "<pred2>", ...]
+    "predicts":  ["<pred1>", "<pred2>", ...],  # optional; used when present and non-empty
+    "predict":   "<single pred>"               # optional; used when predicts is missing or empty
   }
+
+  If ``predicts`` exists and is non-empty (after parsing), it is used; otherwise ``predict``
+  (one string) is wrapped as a one-element list.
 
 Metrics computed:
   - pass@1        : accuracy of the first prediction
@@ -156,6 +160,9 @@ def normalize_record(record: dict) -> dict:
     """
     Normalize one JSONL record to a robust internal format.
 
+    Predictions: if ``predicts`` is present and non-empty (list[str] or one str), use it;
+    otherwise use ``predict`` as a single answer wrapped in a one-element list.
+
     Added keys:
       - system_prompt
       - user_prompt
@@ -171,6 +178,11 @@ def normalize_record(record: dict) -> dict:
     elif not isinstance(predicts, list):
         predicts = []
     predicts = [p for p in predicts if isinstance(p, str)]
+
+    if not predicts:
+        p_one = record.get("predict", None)
+        if isinstance(p_one, str) and p_one:
+            predicts = [p_one]
 
     system_prompt, user_prompt, parse_ok = split_system_user_from_prompt(prompt)
 
@@ -251,7 +263,8 @@ def evaluate_dataset(records: list[dict], k: Optional[int] = None) -> dict:
     """
     Evaluate a list of records and aggregate metrics.
 
-    Each record must have: "label" (str) and "predicts" (list[str]).
+    Each record must have: "label" (str). Predictions come from "predicts" (if non-empty)
+    or "predict" (single answer), after ``normalize_record``.
     "prompt" is optional and ignored here.
 
     Returns:
