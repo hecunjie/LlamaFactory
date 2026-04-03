@@ -16,6 +16,8 @@ MAX_LENGTH="${MAX_LENGTH:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 TEMPLATE_STYLE="${TEMPLATE_STYLE:-llama3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+PAUSE_SELECTION="${PAUSE_SELECTION:-top_m}"
+PAUSE_PROB_THRESHOLD="${PAUSE_PROB_THRESHOLD:-0.4}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
 TEST_DATASET_NAME="${TEST_DATASET_NAME:-gsm8k_sft_test}"
 
@@ -75,6 +77,8 @@ echo "[INFO] SAVE_PATH=${SAVE_PATH}"
 echo "[INFO] SAVE_STEPS=${SAVE_STEPS}"
 echo "[INFO] TEMPLATE_STYLE=${TEMPLATE_STYLE}"
 echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE}"
+echo "[INFO] PAUSE_SELECTION=${PAUSE_SELECTION}"
+echo "[INFO] PAUSE_PROB_THRESHOLD=${PAUSE_PROB_THRESHOLD}"
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   LAUNCHER=(torchrun --standalone --nproc_per_node "${NPROC_PER_NODE}" "${SCRIPT_DIR}/train.py")
@@ -93,6 +97,8 @@ fi
   --max_length "${MAX_LENGTH}" \
   --max_new_tokens "${MAX_NEW_TOKENS}" \
   --template_style "${TEMPLATE_STYLE}" \
+  --pause_selection "${PAUSE_SELECTION}" \
+  --pause_prob_threshold "${PAUSE_PROB_THRESHOLD}" \
   --dataset_info_path "${DATASET_INFO_PATH}" \
   --data_dir "${DATA_DIR}" \
   --train_dataset_name "${TRAIN_DATASET_NAME}" \

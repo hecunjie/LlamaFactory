@@ -1,9 +1,45 @@
 import json
+import math
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Set
 
 import torch
 from torch.utils.data import Dataset
+
+
+def select_pause_positions(
+    target_log_probs: List[float],
+    m_dit: int,
+    selection: str,
+    prob_threshold: float,
+) -> Set[int]:
+    """
+    Choose target token indices (0..len-1) before which to insert [PAUSE].
+
+    - top_m (paper / DIT): the m_dit positions with *lowest* log p(y_t | context),
+      i.e. highest model uncertainty on the gold next token.
+    - prob_threshold: all positions where p = exp(log p) < prob_threshold;
+      if more than m_dit, keep the m_dit positions with smallest p.
+    """
+    n = len(target_log_probs)
+    if n == 0 or m_dit <= 0:
+        return set()
+
+    if selection == "top_m":
+        pairs = sorted(enumerate(target_log_probs), key=lambda x: x[1])
+        return {idx for idx, _ in pairs[: min(m_dit, len(pairs))]}
+
+    if selection == "prob_threshold":
+        probs = [math.exp(lp) for lp in target_log_probs]
+        candidates = [i for i, p in enumerate(probs) if p < prob_threshold]
+        if not candidates:
+            return set()
+        if len(candidates) <= m_dit:
+            return set(candidates)
+        candidates.sort(key=lambda i: probs[i])
+        return set(candidates[:m_dit])
+
+    raise ValueError(f"Unknown pause selection mode: {selection}")
 
 
 def load_dataset_from_lf_info(
@@ -73,11 +109,15 @@ class DITPDataset(Dataset):
         mode: str = "ditp",
         max_length: int = 1024,
         device: str = "cuda",
+        pause_selection: str = "top_m",
+        pause_prob_threshold: float = 0.4,
     ) -> None:
         self.features = []
         self.pad_token_id = tokenizer.pad_token_id
         self.mode = mode
         self.pause_token_id = pause_token_id
+        self.pause_selection = pause_selection
+        self.pause_prob_threshold = pause_prob_threshold
         self.total_pause_inserted = 0
         model.eval()
         model = model.to(device)
@@ -111,11 +151,12 @@ class DITPDataset(Dataset):
 
             prefix_len = len(prefix_ids)
             target_ll = token_log_likelihood[0, max(prefix_len - 1, 0) :].tolist()
-            if not target_ll:
-                selected = set()
-            else:
-                pairs = sorted(enumerate(target_ll), key=lambda x: x[1])
-                selected = {idx for idx, _ in pairs[: min(m_dit, len(pairs))]}
+            selected = select_pause_positions(
+                target_ll,
+                m_dit=m_dit,
+                selection=pause_selection,
+                prob_threshold=pause_prob_threshold,
+            )
 
             new_input_ids = []
             new_labels = []
