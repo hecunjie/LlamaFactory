@@ -170,14 +170,19 @@ def main():
         tokenizer.save_pretrained(args.save_path)
         print(f"Saved model to: {args.save_path}")
 
-        metrics = evaluate_gsm8k(
-            model=model,
-            tokenizer=tokenizer,
-            samples=test_samples,
-            pause_token_id=pause_token_id,
-            max_new_tokens=args.max_new_tokens,
-            device=device,
-        )
+    if is_distributed and dist.is_initialized():
+        dist.barrier()
+
+    metrics = evaluate_gsm8k(
+        model=model,
+        tokenizer=tokenizer,
+        samples=test_samples,
+        pause_token_id=pause_token_id,
+        max_new_tokens=args.max_new_tokens,
+        device=device,
+        distributed=is_distributed,
+    )
+    if is_main_process:
         print(
             f"Eval | accuracy={metrics['accuracy']:.4f}, "
             f"avg_pause_count={metrics['avg_pause_count']:.4f}, "

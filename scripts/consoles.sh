@@ -1,17 +1,17 @@
 # 分析low lse,low max_cosine_sim的点
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404 \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/last_ckp_on_gsm8k_4_instruct.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B-Instruct \
   --max_samples 8000 \
   --batch_size 4 \
-  --entropy_threshold 0.01 \
+  --entropy_threshold 2.0 \
   --high_entropy_topk 20 \
   --sim_threshold 0.18 \
-  --only_correct \
+  --only_wrong \
   --export_low_lse_positions \
   --export_low_lse_bottom_quantile 0.05 \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point_correct/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/gsm_nl/fork_point_correct/last_ckp_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/zeroshot_4_3B_instruct/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/zeroshot_4_3B_instruct/last_ckp_entropy_results.jsonl
   # --lse_threshold_report \
   # --log_sum_exp_threshold 22.0 \
   # --lse_layer_probe \
@@ -23,16 +23,17 @@ python experiment/analyze_entropy_for_logits.py \
 MODEL="/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404" NPROC=8 DTYPE="bfloat16" LF_DATASET_NAME="gsm_nl_test" DATASET_INFO_PATH="data/dataset_info.json" bash intervention_experiment/sweep.sh
 
 
-## 训练DIT-P
-
+## 训练 DIT-P（多卡：bash dit-p/train_multigpu.sh ditp）
 python dit-p/train.py \
   --model_name /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
   --mode ditp \
   --m_dit 5 \
-  --epochs 2 \
+  --epochs 3 \
   --lr 1e-5 \
-  --batch_size 16 \
-  --save_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_5_2_epoch/
+  --batch_size 8 \
+  --dataset_info_path data/dataset_info.json \
+  --data_dir data \
+  --save_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_5_3_epoch_lr1e-5/
 
 
 

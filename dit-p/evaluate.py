@@ -2,6 +2,9 @@ import math
 import re
 from typing import Optional, Sequence
 
+import torch
+import torch.distributed as dist
+
 from inference import generate_with_pause
 
 
@@ -50,14 +53,15 @@ def _match(pred: Optional[str], gold: Optional[str]) -> bool:
         return pred.strip().lower() == gold.strip().lower()
 
 
-def evaluate_gsm8k(
+def _eval_one_shard(
     model,
     tokenizer,
     samples: Sequence[dict],
     pause_token_id: int,
-    max_new_tokens: int = 256,
-    device: str = "cuda",
-):
+    max_new_tokens: int,
+    device: str,
+) -> tuple[int, int, int, int]:
+    """Returns (correct_count, total_pause, pause_nonzero_count, n_samples)."""
     correct = 0
     total_pause = 0
     pause_nonzero = 0
@@ -82,12 +86,61 @@ def evaluate_gsm8k(
         if pause_count > 0:
             pause_nonzero += 1
         n += 1
+    return correct, total_pause, pause_nonzero, n
 
-    accuracy = correct / max(n, 1)
-    avg_pause = total_pause / max(n, 1)
+
+def evaluate_gsm8k(
+    model,
+    tokenizer,
+    samples: Sequence[dict],
+    pause_token_id: int,
+    max_new_tokens: int = 256,
+    device: str = "cuda",
+    distributed: bool = False,
+):
+    """
+    If distributed=True and process group is initialized, each rank evaluates a
+    strided shard of `samples`, then aggregates via all_reduce (NCCL-friendly).
+    """
+    if distributed and dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        ws = dist.get_world_size()
+        shard = list(samples[rank::ws])
+        correct, total_pause, pause_nonzero, n_local = _eval_one_shard(
+            model,
+            tokenizer,
+            shard,
+            pause_token_id,
+            max_new_tokens,
+            device,
+        )
+        stats = torch.tensor(
+            [correct, total_pause, pause_nonzero, n_local],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        tot_n = int(stats[3].item())
+        tot_n = max(tot_n, 1)
+        return {
+            "accuracy": float(stats[0].item() / tot_n),
+            "avg_pause_count": float(stats[1].item() / tot_n),
+            "pause_nonzero_rate": float(stats[2].item() / tot_n),
+            "num_samples": tot_n,
+        }
+
+    correct, total_pause, pause_nonzero, n = _eval_one_shard(
+        model,
+        tokenizer,
+        samples,
+        pause_token_id,
+        max_new_tokens,
+        device,
+    )
+    tot_n = max(n, 1)
     return {
-        "accuracy": accuracy,
-        "avg_pause_count": avg_pause,
-        "pause_nonzero_rate": pause_nonzero / max(n, 1),
+        "accuracy": correct / tot_n,
+        "avg_pause_count": total_pause / tot_n,
+        "pause_nonzero_rate": pause_nonzero / tot_n,
         "num_samples": n,
     }
