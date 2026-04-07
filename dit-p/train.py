@@ -10,6 +10,11 @@ from model import load_model_and_tokenizer
 from tokenizer_utils import register_pause_token
 from trainer import train_model
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 def build_samples_from_lf_rows(rows, tokenizer, template_style: str = "auto"):
     samples = []
@@ -108,6 +113,9 @@ def main():
         default=0.4,
         help="Used when --pause_selection prob_threshold (probability of gold next token).",
     )
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
@@ -146,6 +154,26 @@ def main():
     )
     if is_main_process:
         print(f"Template style: {args.template_style}")
+    wandb_run = None
+    if is_main_process and args.wandb_project:
+        if wandb is None:
+            raise ImportError("wandb is not installed. Please `pip install wandb`.")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            config={
+                "model_name": args.model_name,
+                "mode": args.mode,
+                "m_dit": args.m_dit,
+                "pause_selection": args.pause_selection,
+                "pause_prob_threshold": args.pause_prob_threshold,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "template_style": args.template_style,
+            },
+        )
 
     dataset = DITPDataset(
         samples=train_samples,
@@ -158,6 +186,7 @@ def main():
         device=device,
         pause_selection=args.pause_selection,
         pause_prob_threshold=args.pause_prob_threshold,
+        wandb_run=wandb_run,
     )
     if is_main_process:
         print(f"Prepared training samples: {len(dataset)}")
@@ -218,10 +247,21 @@ def main():
             f"pause_nonzero_rate={metrics['pause_nonzero_rate']:.4f}, "
             f"n={metrics['num_samples']}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "eval/accuracy": metrics["accuracy"],
+                    "eval/avg_pause_count": metrics["avg_pause_count"],
+                    "eval/pause_nonzero_rate": metrics["pause_nonzero_rate"],
+                    "eval/num_samples": metrics["num_samples"],
+                }
+            )
 
     if is_distributed and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+    if is_main_process and wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

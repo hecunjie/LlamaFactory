@@ -18,6 +18,9 @@ TEMPLATE_STYLE="${TEMPLATE_STYLE:-llama3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 PAUSE_SELECTION="${PAUSE_SELECTION:-top_m}"
 PAUSE_PROB_THRESHOLD="${PAUSE_PROB_THRESHOLD:-0.4}"
+WANDB_PROJECT="${WANDB_PROJECT:-}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
 TEST_DATASET_NAME="${TEST_DATASET_NAME:-gsm8k_sft_test}"
 
@@ -79,6 +82,7 @@ echo "[INFO] TEMPLATE_STYLE=${TEMPLATE_STYLE}"
 echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "[INFO] PAUSE_SELECTION=${PAUSE_SELECTION}"
 echo "[INFO] PAUSE_PROB_THRESHOLD=${PAUSE_PROB_THRESHOLD}"
+echo "[INFO] WANDB_PROJECT=${WANDB_PROJECT}"
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   LAUNCHER=(torchrun --standalone --nproc_per_node "${NPROC_PER_NODE}" "${SCRIPT_DIR}/train.py")
@@ -99,6 +103,9 @@ fi
   --template_style "${TEMPLATE_STYLE}" \
   --pause_selection "${PAUSE_SELECTION}" \
   --pause_prob_threshold "${PAUSE_PROB_THRESHOLD}" \
+  --wandb_project "${WANDB_PROJECT}" \
+  --wandb_run_name "${WANDB_RUN_NAME}" \
+  --wandb_entity "${WANDB_ENTITY}" \
   --dataset_info_path "${DATASET_INFO_PATH}" \
   --data_dir "${DATA_DIR}" \
   --train_dataset_name "${TRAIN_DATASET_NAME}" \

@@ -119,6 +119,7 @@ def train_model(
     m_dit: int = 5,
     pause_selection: str = "top_m",
     pause_prob_threshold: float = 0.4,
+    wandb_run=None,
 ):
     if pause_token_id is None:
         raise ValueError("pause_token_id is required for online pause insertion.")
@@ -200,6 +201,16 @@ def train_model(
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 step=global_step,
             )
+            if is_main_process and wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss_step": loss_val,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/global_step": global_step,
+                        "train/epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
 
             if is_main_process and save_steps > 0 and global_step % save_steps == 0:
                 if not save_path:
@@ -215,5 +226,13 @@ def train_model(
         avg_loss = epoch_loss / max(len(dataloader), 1)
         if is_main_process:
             print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss_epoch": avg_loss,
+                        "train/epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
 
     return model.module if isinstance(model, DDP) else model
