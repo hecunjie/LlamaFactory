@@ -168,9 +168,8 @@ def main():
         )
     if is_main_process:
         print(
-            f"Pause stats | inserted={dataset.total_pause_inserted}, "
-            f"density={dataset.pause_density:.6f}, mode={args.mode}, m_dit={args.m_dit}, "
-            f"pause_selection={args.pause_selection}"
+            "Pause stats | online_insertion=True, "
+            f"mode={args.mode}, m_dit={args.m_dit}, pause_selection={args.pause_selection}"
             + (
                 f", pause_prob_threshold={args.pause_prob_threshold}"
                 if args.pause_selection == "prob_threshold"
@@ -188,6 +187,11 @@ def main():
         save_steps=args.save_steps,
         save_path=args.save_path,
         tokenizer=tokenizer,
+        pause_token_id=pause_token_id,
+        mode=args.mode,
+        m_dit=args.m_dit,
+        pause_selection=args.pause_selection,
+        pause_prob_threshold=args.pause_prob_threshold,
     )
 
     if is_main_process:

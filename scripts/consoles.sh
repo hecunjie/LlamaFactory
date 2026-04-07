@@ -35,6 +35,14 @@ python dit-p/train.py \
   --data_dir data \
   --save_path /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_5_3_epoch_lr1e-5/
 
+torchrun --nproc_per_node=8 intervention_experiment/run_loop_layers.py \
+  --model_name_or_path "/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/checkpoint-1404" \
+  --lf_dataset_name "gsm_nl_test" \
+  --dataset_info_path "data/dataset_info.json" \
+  --threshold 19.764647 \
+  --loop_k 8 \
+  --output_path intervention_experiment/results/loop_layers_19.764647_8.jsonl \
+  --max_samples 20
 
 
 python experiment/analyze_partial_cancellation.py \
