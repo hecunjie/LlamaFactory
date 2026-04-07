@@ -4,11 +4,12 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 
 
 def _select_pause_positions(target_log_probs, m_dit, selection, prob_threshold):
@@ -151,7 +152,7 @@ def train_model(
     optimizer = AdamW(model.parameters(), lr=lr)
     total_steps = epochs * len(dataloader)
     warmup_steps = math.ceil(total_steps * warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
@@ -189,6 +190,28 @@ def train_model(
                     "Encountered non-finite loss (NaN/Inf). "
                     "Try smaller lr, bf16/fp32, or verify data quality."
                 )
+            # Diagnostic split: pause-token loss vs non-pause-token loss.
+            with torch.no_grad():
+                shift_logits = outputs.logits[:, :-1, :].contiguous()
+                shift_labels = train_batch["labels"][:, 1:].contiguous()
+                valid_mask = shift_labels.ne(-100)
+                pause_mask = valid_mask & shift_labels.eq(pause_token_id)
+                non_pause_mask = valid_mask & shift_labels.ne(pause_token_id)
+                token_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).view_as(shift_labels)
+                pause_loss_val = (
+                    token_loss[pause_mask].mean().item() if pause_mask.any() else float("nan")
+                )
+                non_pause_loss_val = (
+                    token_loss[non_pause_mask].mean().item() if non_pause_mask.any() else float("nan")
+                )
+                pause_token_ratio = (
+                    (pause_mask.sum().float() / valid_mask.sum().float()).item() if valid_mask.any() else 0.0
+                )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -198,6 +221,8 @@ def train_model(
             epoch_loss += loss_val
             pbar.set_postfix(
                 loss=f"{loss_val:.4f}",
+                pause=f"{pause_loss_val:.3f}" if pause_loss_val == pause_loss_val else "nan",
+                non_pause=f"{non_pause_loss_val:.3f}" if non_pause_loss_val == non_pause_loss_val else "nan",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 step=global_step,
             )
@@ -205,6 +230,9 @@ def train_model(
                 wandb_run.log(
                     {
                         "train/loss_step": loss_val,
+                        "train/loss_pause_step": pause_loss_val,
+                        "train/loss_non_pause_step": non_pause_loss_val,
+                        "train/pause_token_ratio": pause_token_ratio,
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/global_step": global_step,
                         "train/epoch": epoch + 1,

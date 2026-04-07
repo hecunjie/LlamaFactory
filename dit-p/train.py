@@ -68,6 +68,12 @@ def main():
     parser.add_argument("--m_dit", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.1,
+        help="Warmup ratio for cosine LR scheduler.",
+    )
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--save_path", type=str, required=True)
     parser.add_argument(
@@ -210,6 +216,7 @@ def main():
         dataset=dataset,
         epochs=args.epochs,
         lr=args.lr,
+        warmup_ratio=args.warmup_ratio,
         batch_size=args.batch_size,
         device=device,
         save_steps=args.save_steps,

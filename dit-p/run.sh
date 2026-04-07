@@ -10,6 +10,7 @@ MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.2-3B-Instruct}"
 M_DIT="${M_DIT:-5}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-5}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 SAVE_STEPS="${SAVE_STEPS:-0}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
@@ -78,6 +79,7 @@ echo "[INFO] TRAIN_FILE=${TRAIN_FILE}"
 echo "[INFO] TEST_FILE=${TEST_FILE}"
 echo "[INFO] SAVE_PATH=${SAVE_PATH}"
 echo "[INFO] SAVE_STEPS=${SAVE_STEPS}"
+echo "[INFO] WARMUP_RATIO=${WARMUP_RATIO}"
 echo "[INFO] TEMPLATE_STYLE=${TEMPLATE_STYLE}"
 echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "[INFO] PAUSE_SELECTION=${PAUSE_SELECTION}"
@@ -96,6 +98,7 @@ fi
   --m_dit "${M_DIT}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
+  --warmup_ratio "${WARMUP_RATIO}" \
   --batch_size "${BATCH_SIZE}" \
   --save_steps "${SAVE_STEPS}" \
   --max_length "${MAX_LENGTH}" \
