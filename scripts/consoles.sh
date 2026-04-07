@@ -44,6 +44,34 @@ torchrun --nproc_per_node=8 intervention_experiment/run_loop_layers.py \
   --output_path intervention_experiment/results/loop_layers_19.764647_8.jsonl \
   --max_samples 20
 
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-7B \
+ROLLOUTS_PER_PROMPT=5 \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/r1_7b_entropy_credit_outputs_1k \
+MAX_NEW_TOKENS=2048 \
+MAX_SAMPLES=64 \
+PHASE2_MAX_POSITIONS=32 \
+PHASE2_PROGRESS=1 \
+METHOD_B_M_SAMPLES=5 \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_entropy_credit_experiment.sh 2>&1 \
+| tee /mnt/ali-sh-1/dataset/zeus/hecunjie/train_opd.log
+
+export WANDB_API_KEY="522a32e0a2b1b6781aabe86e432e96c99f5ca4f7"  # 替换为你的 WandB API Key
+
+WANDB_PROJECT=ditp-exp \
+WANDB_RUN_NAME=llama3b-ditp-online-md10 \
+NPROC_PER_NODE=8 \
+MODEL_NAME=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
+M_DIT=10 \
+EPOCHS=3 \
+LR=1e-5 \
+BATCH_SIZE=4 \
+TEMPLATE_STYLE=llama3 \
+PAUSE_SELECTION=prob_threshold \
+PAUSE_PROB_THRESHOLD=0.4 \
+SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_10_3_epoch_lr1e-5_online_pause/ \
+bash dit-p/train_multigpu.sh ditp
+
 
 python experiment/analyze_partial_cancellation.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \

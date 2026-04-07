@@ -186,7 +186,6 @@ def main():
         device=device,
         pause_selection=args.pause_selection,
         pause_prob_threshold=args.pause_prob_threshold,
-        wandb_run=wandb_run,
     )
     if is_main_process:
         print(f"Prepared training samples: {len(dataset)}")
@@ -221,6 +220,7 @@ def main():
         m_dit=args.m_dit,
         pause_selection=args.pause_selection,
         pause_prob_threshold=args.pause_prob_threshold,
+        wandb_run=wandb_run,
     )
 
     if is_main_process:
