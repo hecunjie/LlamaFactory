@@ -37,6 +37,7 @@ def _build_online_paused_batch(
     pause_prob_threshold: float,
     pad_token_id: int,
     device: str,
+    exclude_before_token_ids,
 ):
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
@@ -67,6 +68,8 @@ def _build_online_paused_batch(
         start = max(p_len - 1, 0)
         target_ll = token_ll[b, start : start + t_len].tolist()
         selected = _select_pause_positions(target_ll, m_dit, pause_selection, pause_prob_threshold)
+        if exclude_before_token_ids:
+            selected = {i for i in selected if target_ids[i] not in exclude_before_token_ids}
 
         cur_in = []
         cur_lb = []
@@ -125,6 +128,13 @@ def train_model(
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     sampler = DistributedSampler(dataset, shuffle=True) if is_distributed else None
+    exclude_before_token_ids = set()
+    if tokenizer is not None:
+        if tokenizer.eos_token_id is not None:
+            exclude_before_token_ids.add(int(tokenizer.eos_token_id))
+        eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if isinstance(eot_id, int) and eot_id >= 0 and eot_id != tokenizer.unk_token_id:
+            exclude_before_token_ids.add(int(eot_id))
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -169,6 +179,7 @@ def train_model(
                 pause_prob_threshold=pause_prob_threshold,
                 pad_token_id=dataset.pad_token_id,
                 device=device,
+                exclude_before_token_ids=exclude_before_token_ids,
             )
             outputs = model(**train_batch)
             loss = outputs.loss
