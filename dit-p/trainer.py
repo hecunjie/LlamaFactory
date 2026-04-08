@@ -120,6 +120,9 @@ def train_model(
     m_dit: int = 5,
     pause_selection: str = "top_m",
     pause_prob_threshold: float = 0.4,
+    nextlat_weight: float = 0.0,
+    nextlat_loss_type: str = "cosine",
+    nextlat_stopgrad_target: bool = False,
     wandb_run=None,
 ):
     if pause_token_id is None:
@@ -183,8 +186,33 @@ def train_model(
                 device=device,
                 exclude_before_token_ids=exclude_before_token_ids,
             )
-            outputs = model(**train_batch)
-            loss = outputs.loss
+            outputs = model(**train_batch, output_hidden_states=(nextlat_weight > 0.0))
+            ce_loss = outputs.loss
+            nextlat_loss = torch.tensor(0.0, device=device)
+            nextlat_pairs = 0
+
+            if nextlat_weight > 0.0:
+                hidden = outputs.hidden_states[-1]  # (B, T, D)
+                cur_ids = train_batch["input_ids"]
+                cur_mask = train_batch["attention_mask"].bool()
+                # Align h_t at [PAUSE] with h_{t+1}.
+                pause_pos = cur_ids.eq(pause_token_id)
+                valid_next = torch.zeros_like(cur_mask)
+                valid_next[:, :-1] = cur_mask[:, 1:]
+                pair_mask = pause_pos & cur_mask & valid_next
+                nextlat_pairs = int(pair_mask.sum().item())
+                if nextlat_pairs > 0:
+                    src = hidden[:, :-1, :][pair_mask[:, :-1]]
+                    tgt = hidden[:, 1:, :][pair_mask[:, :-1]]
+                    if nextlat_stopgrad_target:
+                        tgt = tgt.detach()
+                    if nextlat_loss_type == "cosine":
+                        nextlat_loss = (1.0 - F.cosine_similarity(src, tgt, dim=-1)).mean()
+                    elif nextlat_loss_type == "mse":
+                        nextlat_loss = F.mse_loss(src, tgt)
+                    else:
+                        raise ValueError(f"Unknown nextlat_loss_type: {nextlat_loss_type}")
+            loss = ce_loss + nextlat_weight * nextlat_loss
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     "Encountered non-finite loss (NaN/Inf). "
@@ -230,6 +258,9 @@ def train_model(
                 wandb_run.log(
                     {
                         "train/loss_step": loss_val,
+                        "train/loss_ce_step": ce_loss.item(),
+                        "train/loss_nextlat_step": nextlat_loss.item(),
+                        "train/nextlat_pairs": nextlat_pairs,
                         "train/loss_pause_step": pause_loss_val,
                         "train/loss_non_pause_step": non_pause_loss_val,
                         "train/pause_token_ratio": pause_token_ratio,

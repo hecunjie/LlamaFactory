@@ -122,6 +122,26 @@ def main():
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument(
+        "--nextlat_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for NextLat-style latent alignment loss on [PAUSE] positions. "
+            "0 disables this loss."
+        ),
+    )
+    parser.add_argument(
+        "--nextlat_loss_type",
+        choices=["cosine", "mse"],
+        default="cosine",
+        help="Latent alignment loss type.",
+    )
+    parser.add_argument(
+        "--nextlat_stopgrad_target",
+        action="store_true",
+        help="Stop gradient on target hidden states (next position).",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
@@ -174,6 +194,9 @@ def main():
                 "m_dit": args.m_dit,
                 "pause_selection": args.pause_selection,
                 "pause_prob_threshold": args.pause_prob_threshold,
+                "nextlat_weight": args.nextlat_weight,
+                "nextlat_loss_type": args.nextlat_loss_type,
+                "nextlat_stopgrad_target": args.nextlat_stopgrad_target,
                 "epochs": args.epochs,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
@@ -227,6 +250,9 @@ def main():
         m_dit=args.m_dit,
         pause_selection=args.pause_selection,
         pause_prob_threshold=args.pause_prob_threshold,
+        nextlat_weight=args.nextlat_weight,
+        nextlat_loss_type=args.nextlat_loss_type,
+        nextlat_stopgrad_target=args.nextlat_stopgrad_target,
         wandb_run=wandb_run,
     )
 

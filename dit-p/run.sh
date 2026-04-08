@@ -22,6 +22,9 @@ PAUSE_PROB_THRESHOLD="${PAUSE_PROB_THRESHOLD:-0.4}"
 WANDB_PROJECT="${WANDB_PROJECT:-}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
+NEXTLAT_WEIGHT="${NEXTLAT_WEIGHT:-0.0}"
+NEXTLAT_LOSS_TYPE="${NEXTLAT_LOSS_TYPE:-cosine}"
+NEXTLAT_STOPGRAD_TARGET="${NEXTLAT_STOPGRAD_TARGET:-0}"
 TRAIN_DATASET_NAME="${TRAIN_DATASET_NAME:-gsm8k_sft_train}"
 TEST_DATASET_NAME="${TEST_DATASET_NAME:-gsm8k_sft_test}"
 
@@ -85,11 +88,19 @@ echo "[INFO] NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "[INFO] PAUSE_SELECTION=${PAUSE_SELECTION}"
 echo "[INFO] PAUSE_PROB_THRESHOLD=${PAUSE_PROB_THRESHOLD}"
 echo "[INFO] WANDB_PROJECT=${WANDB_PROJECT}"
+echo "[INFO] NEXTLAT_WEIGHT=${NEXTLAT_WEIGHT}"
+echo "[INFO] NEXTLAT_LOSS_TYPE=${NEXTLAT_LOSS_TYPE}"
+echo "[INFO] NEXTLAT_STOPGRAD_TARGET=${NEXTLAT_STOPGRAD_TARGET}"
 
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   LAUNCHER=(torchrun --standalone --nproc_per_node "${NPROC_PER_NODE}" "${SCRIPT_DIR}/train.py")
 else
   LAUNCHER=(python "${SCRIPT_DIR}/train.py")
+fi
+
+EXTRA_ARGS=()
+if [[ "${NEXTLAT_STOPGRAD_TARGET}" == "1" ]]; then
+  EXTRA_ARGS+=(--nextlat_stopgrad_target)
 fi
 
 "${LAUNCHER[@]}" \
@@ -109,8 +120,11 @@ fi
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_run_name "${WANDB_RUN_NAME}" \
   --wandb_entity "${WANDB_ENTITY}" \
+  --nextlat_weight "${NEXTLAT_WEIGHT}" \
+  --nextlat_loss_type "${NEXTLAT_LOSS_TYPE}" \
   --dataset_info_path "${DATASET_INFO_PATH}" \
   --data_dir "${DATA_DIR}" \
   --train_dataset_name "${TRAIN_DATASET_NAME}" \
   --test_dataset_name "${TEST_DATASET_NAME}" \
-  --save_path "${SAVE_PATH}"
+  --save_path "${SAVE_PATH}" \
+  "${EXTRA_ARGS[@]}"

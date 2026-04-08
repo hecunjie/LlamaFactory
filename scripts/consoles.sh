@@ -1,17 +1,17 @@
 # 分析low lse,low max_cosine_sim的点
 python experiment/analyze_entropy_for_logits.py \
-  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/last_ckp_on_gsm8k_4_instruct.jsonl \
-  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B-Instruct \
+  --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/greedy_gsm_wrong/last_ckp_on_gsm8k_greedy.jsonl \
+  --model /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/checkpoint-936 \
   --max_samples 8000 \
   --batch_size 4 \
   --entropy_threshold 2.0 \
   --high_entropy_topk 20 \
   --sim_threshold 0.18 \
-  --only_wrong \
+  --only_correct \
   --export_low_lse_positions \
   --export_low_lse_bottom_quantile 0.05 \
-  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/zeroshot_4_3B_instruct/last_ckp_entropy_analysis.png \
-  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_instruct_sft_2_epoch/vllm_infer/zeroshot_4_3B_instruct/last_ckp_entropy_results.jsonl
+  --output_plot /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/greedy_gsm_correct/last_ckp_entropy_analysis.png \
+  --output_jsonl /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_2_epoch_baseline/vllm_infer/greedy_gsm_correct/last_ckp_entropy_results.jsonl
   # --lse_threshold_report \
   # --log_sum_exp_threshold 22.0 \
   # --lse_layer_probe \
@@ -59,19 +59,21 @@ bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/
 export WANDB_API_KEY="522a32e0a2b1b6781aabe86e432e96c99f5ca4f7"  # 替换为你的 WandB API Key
 
 WANDB_PROJECT=ditp-exp \
-WANDB_RUN_NAME=llama3b-ditp-online-md10 \
+WANDB_RUN_NAME=llama3b-dit-online-md5-nextlat_mse \
 NPROC_PER_NODE=8 \
+NEXTLAT_WEIGHT=0.02 \
+NEXTLAT_LOSS_TYPE=mse \
 MODEL_NAME=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
-M_DIT=10 \
+M_DIT=5 \
 EPOCHS=3 \
 LR=1e-5 \
 BATCH_SIZE=4 \
 TEMPLATE_STYLE=llama3 \
-PAUSE_SELECTION=prob_threshold \
-PAUSE_PROB_THRESHOLD=0.4 \
-SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_10_3_epoch_lr1e-5_online_pause/ \
-bash dit-p/train_multigpu.sh ditp
+SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_nextlat_mse_3_epoch_lr1e-5_online_pause/ \
+bash dit-p/train_multigpu.sh dit
 
+# PAUSE_SELECTION=prob_threshold \
+# PAUSE_PROB_THRESHOLD=0.4 \
 
 python experiment/analyze_partial_cancellation.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \
