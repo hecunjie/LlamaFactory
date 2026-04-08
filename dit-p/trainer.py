@@ -103,6 +103,38 @@ def _build_online_paused_batch(
     }
 
 
+def _build_pre_labeled_paused_batch(
+    batch,
+    pause_token_id: int,
+    mode: str,
+    device: str,
+):
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    prefix_lens = batch["prefix_lens"]
+    target_lens = batch["target_lens"]
+
+    labels = torch.full_like(input_ids, -100)
+    bsz, seq_len = input_ids.shape
+    for b in range(bsz):
+        p_len = int(prefix_lens[b].item())
+        t_len = int(target_lens[b].item())
+        end = min(p_len + t_len, seq_len)
+        if end <= p_len:
+            continue
+        tgt_tokens = input_ids[b, p_len:end]
+        tgt_labels = tgt_tokens.clone()
+        if mode == "dit":
+            tgt_labels[tgt_tokens.eq(pause_token_id)] = -100
+        labels[b, p_len:end] = tgt_labels
+
+    return {
+        "input_ids": input_ids.to(device),
+        "labels": labels.to(device),
+        "attention_mask": attention_mask.to(device),
+    }
+
+
 def train_model(
     model,
     dataset,
@@ -174,18 +206,26 @@ def train_model(
         for batch in pbar:
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
-            train_batch = _build_online_paused_batch(
-                model=model,
-                batch=batch,
-                pause_token_id=pause_token_id,
-                mode=mode,
-                m_dit=m_dit,
-                pause_selection=pause_selection,
-                pause_prob_threshold=pause_prob_threshold,
-                pad_token_id=dataset.pad_token_id,
-                device=device,
-                exclude_before_token_ids=exclude_before_token_ids,
-            )
+            if pause_selection == "pre_labeled":
+                train_batch = _build_pre_labeled_paused_batch(
+                    batch=batch,
+                    pause_token_id=pause_token_id,
+                    mode=mode,
+                    device=device,
+                )
+            else:
+                train_batch = _build_online_paused_batch(
+                    model=model,
+                    batch=batch,
+                    pause_token_id=pause_token_id,
+                    mode=mode,
+                    m_dit=m_dit,
+                    pause_selection=pause_selection,
+                    pause_prob_threshold=pause_prob_threshold,
+                    pad_token_id=dataset.pad_token_id,
+                    device=device,
+                    exclude_before_token_ids=exclude_before_token_ids,
+                )
             outputs = model(**train_batch, output_hidden_states=(nextlat_weight > 0.0))
             ce_loss = outputs.loss
             nextlat_loss = torch.tensor(0.0, device=device)

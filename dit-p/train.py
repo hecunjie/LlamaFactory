@@ -104,13 +104,14 @@ def main():
     )
     parser.add_argument(
         "--pause_selection",
-        choices=["top_m", "prob_threshold"],
+        choices=["top_m", "prob_threshold", "pre_labeled"],
         default="top_m",
         help=(
             "Where to insert [PAUSE] in the target: "
             "top_m = paper/DIT: M positions with lowest log p(gold next token) (see --m_dit); "
             "prob_threshold = insert where p(gold next token) < --pause_prob_threshold, "
-            "at most --m_dit inserts."
+            "at most --m_dit inserts; "
+            "pre_labeled = use [PAUSE] already present in dataset response, no online scoring/insertion."
         ),
     )
     parser.add_argument(
@@ -225,7 +226,7 @@ def main():
         )
     if is_main_process:
         print(
-            "Pause stats | online_insertion=True, "
+            f"Pause stats | online_insertion={args.pause_selection != 'pre_labeled'}, "
             f"mode={args.mode}, m_dit={args.m_dit}, pause_selection={args.pause_selection}"
             + (
                 f", pause_prob_threshold={args.pause_prob_threshold}"
