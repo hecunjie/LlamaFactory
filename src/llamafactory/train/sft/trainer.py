@@ -985,6 +985,36 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if hasattr(model, "optimizer") and hasattr(model.optimizer, "parameter_offload"):
             pass  # Stage 3 doesn't use params_already_reduced
 
+    def _maybe_mask_add_think_labels_for_ce(
+        self, inputs: dict[str, Union["torch.Tensor", Any]]
+    ) -> None:
+        r"""When ``add_think_token`` is True and ``add_think_ce_loss`` is False, do not supervise
+        the prediction of ``<add_think>`` (set those label positions to ``IGNORE_INDEX``).
+
+        This matches DIT-style training where the inserted pause token has no CE target.
+        Only applies to the standard SFT branch (not ``recurrent_add_think_training``).
+        """
+        if not getattr(self.finetuning_args, "add_think_token", False):
+            return
+        if getattr(self.finetuning_args, "add_think_ce_loss", True):
+            return
+        if getattr(self.finetuning_args, "recurrent_add_think_training", False):
+            return
+        labels = inputs.get("labels")
+        if labels is None:
+            return
+        tok = self.processing_class
+        tid = tok.convert_tokens_to_ids(THINK_TOKEN)
+        if isinstance(tid, list):
+            tid = tid[0] if tid else None
+        if tid is None or (isinstance(tid, int) and tid < 0):
+            return
+        if isinstance(tid, int) and tok.unk_token_id is not None and tid == tok.unk_token_id:
+            return
+        masked = labels.clone()
+        masked[labels == tid] = IGNORE_INDEX
+        inputs["labels"] = masked
+
     # ---- Training ----
 
     @override
@@ -1131,6 +1161,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
+            self._maybe_mask_add_think_labels_for_ce(inputs)
             if self.use_align_loss or self.use_rgha:
                 inputs["output_hidden_states"] = True
             with self.compute_loss_context_manager():
@@ -1419,6 +1450,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         full_preds[b_idx, s_start:end] = s_argmax[: end - s_start]
                 logits = full_preds  # 2D argmax tensor, handled by eval_logit_processor
             else:
+                self._maybe_mask_add_think_labels_for_ce(inputs)
                 loss_answer, outputs = super().compute_loss(model, inputs, return_outputs=True)
                 loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
                 total_loss = loss_answer

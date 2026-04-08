@@ -847,6 +847,17 @@ class FinetuningArguments(
             )
         },
     )
+    add_think_ce_loss: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Only used when `add_think_token` is True and standard SFT (not `recurrent_add_think_training`). "
+                "If True (default), the next-token CE loss includes predicting `<add_think>` wherever it appears "
+                "in supervised labels. If False, label positions whose gold token is `<add_think>` are set to "
+                "IGNORE_INDEX so they do not contribute to CE (DIT-style: no loss on the pause/think token)."
+            )
+        },
+    )
     recurrent_add_think_training: bool = field(
         default=False,
         metadata={

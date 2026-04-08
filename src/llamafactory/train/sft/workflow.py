@@ -76,6 +76,7 @@ def run_sft(
                 "Added '<add_think>' to tokenizer "
                 f"(new vocab size={len(tokenizer)}; "
                 f"add_think_token={getattr(finetuning_args, 'add_think_token', False)}, "
+                f"add_think_ce_loss={getattr(finetuning_args, 'add_think_ce_loss', True)}, "
                 f"recurrent_add_think_training={getattr(finetuning_args, 'recurrent_add_think_training', False)}, "
                 f"use_align_loss={getattr(finetuning_args, 'use_align_loss', False)}, "
                 f"use_ortho_loss={getattr(finetuning_args, 'use_ortho_loss', False)}, "
@@ -110,7 +111,8 @@ def run_sft(
                 unwrapped.tie_weights()
             logger.info_rank0(
                 f"Resized model token embeddings to {vocab_size} for '<add_think>' "
-                f"(add_think_added={add_think_added})."
+                f"(add_think_added={add_think_added}, "
+                f"add_think_ce_loss={getattr(finetuning_args, 'add_think_ce_loss', True)})."
             )
 
     # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.

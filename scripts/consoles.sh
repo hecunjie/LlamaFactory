@@ -58,11 +58,13 @@ bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/
 
 export WANDB_API_KEY="522a32e0a2b1b6781aabe86e432e96c99f5ca4f7"  # 替换为你的 WandB API Key
 
+TRAIN_DATASET_NAME=gsm8k_pause \
 WANDB_PROJECT=ditp-exp \
 WANDB_RUN_NAME=llama3b-dit-online-md5-nextlat_mse \
 NPROC_PER_NODE=8 \
 NEXTLAT_WEIGHT=0.02 \
 NEXTLAT_LOSS_TYPE=mse \
+PAUSE_SELECTION=pre_labeled
 MODEL_NAME=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
 M_DIT=5 \
 EPOCHS=3 \
@@ -70,7 +72,7 @@ LR=1e-5 \
 BATCH_SIZE=4 \
 TEMPLATE_STYLE=llama3 \
 SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_nextlat_mse_3_epoch_lr1e-5_online_pause/ \
-bash dit-p/train_multigpu.sh dit
+bash dit-p/train_multigpu.sh ditp
 
 # PAUSE_SELECTION=prob_threshold \
 # PAUSE_PROB_THRESHOLD=0.4 \
