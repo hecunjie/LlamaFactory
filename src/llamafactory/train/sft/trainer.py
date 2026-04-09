@@ -232,6 +232,37 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.zeros((), device=device)
         return torch.stack(align_losses).mean()
 
+    def _compute_nextlat_loss(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        add_think_id: int,
+    ) -> tuple[torch.Tensor, int]:
+        r"""NextLat-style loss: align last-layer `h_t` at `<add_think>` with `h_{t+1}` (same as dit-p `[PAUSE]` pairing)."""
+        device = hidden.device
+        dtype = hidden.dtype
+        cur_mask = attention_mask.bool()
+        pause_pos = input_ids.eq(add_think_id)
+        valid_next = torch.zeros_like(cur_mask)
+        valid_next[:, :-1] = cur_mask[:, 1:]
+        pair_mask = pause_pos & cur_mask & valid_next
+        n_pairs = int(pair_mask.sum().item())
+        if n_pairs == 0:
+            return torch.zeros((), device=device, dtype=dtype), 0
+        src = hidden[:, :-1, :][pair_mask[:, :-1]]
+        tgt = hidden[:, 1:, :][pair_mask[:, :-1]]
+        if getattr(self.finetuning_args, "nextlat_stopgrad_target", False):
+            tgt = tgt.detach()
+        loss_type = getattr(self.finetuning_args, "nextlat_loss_type", "cosine")
+        if loss_type == "cosine":
+            nl = (1.0 - F.cosine_similarity(src, tgt, dim=-1)).mean()
+        elif loss_type == "mse":
+            nl = F.mse_loss(src, tgt)
+        else:
+            raise ValueError(f"Unknown nextlat_loss_type: {loss_type}")
+        return nl, n_pairs
+
     def compute_orthogonal_loss(self, model: "torch.nn.Module", n_sample: int = 512) -> torch.Tensor:
         r"""Push ``<add_think>`` embedding away from normal word-embedding directions."""
         unwrapped = model
@@ -1044,12 +1075,15 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         prob_threshold = float(args.online_add_think_prob_threshold)
         pad_token_id = tok.pad_token_id if tok.pad_token_id is not None else 0
 
+        # Do not insert immediately before these tokens (e.g. EOS / turn-end), nor before the
+        # first supervised response token (prompt/response boundary).
         exclude_before_token_ids: set[int] = set()
         if tok.eos_token_id is not None:
             exclude_before_token_ids.add(int(tok.eos_token_id))
-        eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
-        if isinstance(eot_id, int) and eot_id >= 0 and eot_id != tok.unk_token_id:
-            exclude_before_token_ids.add(int(eot_id))
+        for _special in ("<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>"):
+            _tid = tok.convert_tokens_to_ids(_special)
+            if isinstance(_tid, int) and _tid >= 0 and _tid != tok.unk_token_id:
+                exclude_before_token_ids.add(int(_tid))
 
         device = input_ids.device
         was_training = model.training
@@ -1102,7 +1136,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     target_ll.append(float("inf"))
 
             selected = self._select_online_add_think_positions(target_ll, m_dit, selection, prob_threshold)
-            selected = {i for i in selected if seq[resp_mask[i]] not in exclude_before_token_ids}
+            # Never insert before the first supervised response token (prompt/response boundary).
+            selected.discard(0)
+            selected = {
+                i
+                for i in selected
+                if seq[resp_mask[i]] not in exclude_before_token_ids
+            }
 
             new_in: list[int] = []
             new_lb: list[int] = []
@@ -1228,6 +1268,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         rgha_trigger_rate = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
         rgha_mean_risk = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
         rgha_mean_gate = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        nl_w = 0.0
+        nextlat_loss = torch.zeros((), device=inputs["input_ids"].device, dtype=torch.float32)
+        nextlat_pairs = 0
 
         if do_latent_chain:
             # ---- Forward 1: Sequential latent chain + answer CE ----
@@ -1322,9 +1365,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
+            nl_w = float(getattr(self.finetuning_args, "nextlat_weight", 0.0) or 0.0)
             self._maybe_apply_online_add_think(model, inputs)
             self._maybe_mask_add_think_labels_for_ce(inputs)
-            if self.use_align_loss or self.use_rgha:
+            if nl_w > 0.0 or self.use_align_loss or self.use_rgha:
                 inputs["output_hidden_states"] = True
             with self.compute_loss_context_manager():
                 loss_answer, outputs = super().compute_loss(
@@ -1346,6 +1390,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     self._align_warned_no_think_token = True
                 align_loss = self.compute_align_loss(model, hidden_states, inputs["input_ids"])
+            if nl_w > 0.0 and getattr(outputs, "hidden_states", None) is not None:
+                tid = self.processing_class.convert_tokens_to_ids(THINK_TOKEN)
+                if isinstance(tid, list):
+                    tid = tid[0] if tid else 0
+                if tid is None or (isinstance(tid, int) and tid < 0):
+                    tid = getattr(self.processing_class, "unk_token_id", 0)
+                hidden_nl = outputs.hidden_states[-1]
+                nextlat_loss, nextlat_pairs = self._compute_nextlat_loss(
+                    hidden_nl,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    int(tid),
+                )
             if self.use_rgha and getattr(outputs, "hidden_states", None) is not None and getattr(outputs, "logits", None) is not None:
                 hidden_states = outputs.hidden_states[-1]
                 logits = outputs.logits
@@ -1385,7 +1442,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                                 rgha_loss = flat_ce[risk_mask_shift].mean()
             del outputs
             loss_reasoning = torch.tensor(0.0, device=loss_answer.device)
-            total_loss = loss_answer + self.align_loss_weight * align_loss
+            total_loss = loss_answer + self.align_loss_weight * align_loss + nl_w * nextlat_loss
             if getattr(self.finetuning_args, "logits_analysis_in_sft", False):
                 labels_b = inputs.get("labels")
                 self._logits_analysis_batch = {
@@ -1446,6 +1503,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 "rgha_trigger_rate": [],
                 "rgha_mean_risk": [],
                 "rgha_mean_gate": [],
+                "nextlat": [],
+                "nextlat_pairs": [],
             }
         self._custom_loss_buffer["sft"].append(loss_answer.detach().float() / ga)
         self._custom_loss_buffer["reasoning"].append(loss_reasoning.detach().float() / ga)
@@ -1455,6 +1514,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._custom_loss_buffer["rgha_trigger_rate"].append(rgha_trigger_rate.detach().float() / ga)
         self._custom_loss_buffer["rgha_mean_risk"].append(rgha_mean_risk.detach().float() / ga)
         self._custom_loss_buffer["rgha_mean_gate"].append(rgha_mean_gate.detach().float() / ga)
+        self._custom_loss_buffer["nextlat"].append(nextlat_loss.detach().float() / ga)
+        self._custom_loss_buffer["nextlat_pairs"].append(
+            torch.tensor(float(nextlat_pairs), device=loss_answer.device, dtype=torch.float32)
+        )
 
         return total_loss.detach()
 
@@ -1490,6 +1553,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 "rgha_trigger_rate": [],
                 "rgha_mean_risk": [],
                 "rgha_mean_gate": [],
+                "nextlat": [],
+                "nextlat_pairs": [],
             }
 
         # Inject eval-time split losses

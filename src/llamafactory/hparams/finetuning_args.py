@@ -917,6 +917,24 @@ class FinetuningArguments(
             )
         },
     )
+    nextlat_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Standard SFT only: weight for NextLat-style latent loss — align last-layer hidden state "
+                "at each `<add_think>` position with the next position. "
+                "0 disables. Requires `add_think_token` and `<add_think>` in the batch; otherwise loss is 0."
+            )
+        },
+    )
+    nextlat_loss_type: Literal["cosine", "mse"] = field(
+        default="cosine",
+        metadata={"help": "NextLat auxiliary loss: cosine (1 - cos_sim) or MSE between h_t and h_{t+1}."},
+    )
+    nextlat_stopgrad_target: bool = field(
+        default=False,
+        metadata={"help": "If True, stop gradient on target hidden h_{t+1} in NextLat loss."},
+    )
     do_mark_low_confidence: bool = field(
         default=False,
         metadata={
@@ -1023,6 +1041,11 @@ class FinetuningArguments(
                 raise ValueError("`online_add_think_selection` must be `top_m` or `prob_threshold`.")
             if self.online_add_think_m < 0:
                 raise ValueError("`online_add_think_m` must be non-negative.")
+
+        if self.nextlat_weight < 0:
+            raise ValueError("`nextlat_weight` must be non-negative.")
+        if self.nextlat_weight > 0 and self.nextlat_loss_type not in {"cosine", "mse"}:
+            raise ValueError("`nextlat_loss_type` must be `cosine` or `mse`.")
 
         if self.align_loss_weight < 0:
             raise ValueError("`align_loss_weight` must be non-negative.")
