@@ -60,22 +60,39 @@ export WANDB_API_KEY="522a32e0a2b1b6781aabe86e432e96c99f5ca4f7"  # 替换为你�
 
 TRAIN_DATASET_NAME=gsm8k_pause \
 WANDB_PROJECT=ditp-exp \
-WANDB_RUN_NAME=llama3b-dit-online-md5-nextlat_mse \
+WANDB_RUN_NAME=llama3b-dit-online-md5-2_epoch_lr1e-5-pre_labeled-gsm8k_pause \
 NPROC_PER_NODE=8 \
-NEXTLAT_WEIGHT=0.02 \
-NEXTLAT_LOSS_TYPE=mse \
 PAUSE_SELECTION=pre_labeled
 MODEL_NAME=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Llama/Llama-3.2-3B \
 M_DIT=5 \
-EPOCHS=3 \
+EPOCHS=2 \
 LR=1e-5 \
 BATCH_SIZE=4 \
 TEMPLATE_STYLE=llama3 \
-SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_ditp_nextlat_mse_3_epoch_lr1e-5_online_pause/ \
-bash dit-p/train_multigpu.sh ditp
+SAVE_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_dit_md5_2_epoch_lr1e-5_pre_labeled_gsm8k_pause/ \
+bash dit-p/train_multigpu.sh dit
+
+NEXTLAT_WEIGHT=0.02 \
+NEXTLAT_LOSS_TYPE=mse \
 
 # PAUSE_SELECTION=prob_threshold \
 # PAUSE_PROB_THRESHOLD=0.4 \
+
+
+# MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-7B \
+MODEL_NAME=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B 
+ROLLOUTS_PER_PROMPT=3 \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3_4b_entropy_credit_outputs_32_64 \
+MAX_NEW_TOKENS=2048 \
+MAX_SAMPLES=32 \
+PHASE2_MAX_POSITIONS=64 \
+METHOD_B_M_SAMPLES=8 \
+PHASE2_PROGRESS=1 \
+SAVE_CASE_TRACES=1 \
+CONTEXT_WINDOW_TOKENS=24 \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_entropy_credit_experiment.sh 2>&1 \
+| tee /mnt/ali-sh-1/dataset/zeus/hecunjie/train_opd.log
 
 python experiment/analyze_partial_cancellation.py \
   --data /mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/llama_3b_base_sft_3_epoch/vllm_infer/last_ckp_infer_4_gsm_nl.jsonl \

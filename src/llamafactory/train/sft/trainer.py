@@ -985,6 +985,167 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if hasattr(model, "optimizer") and hasattr(model.optimizer, "parameter_offload"):
             pass  # Stage 3 doesn't use params_already_reduced
 
+    @staticmethod
+    def _select_online_add_think_positions(
+        target_log_probs: list[float],
+        m_dit: int,
+        selection: str,
+        prob_threshold: float,
+    ) -> set[int]:
+        r"""Pick up to ``m_dit`` response-token indices (0..len-1) for `<add_think>` insertion."""
+        if len(target_log_probs) == 0 or m_dit <= 0:
+            return set()
+        if selection == "top_m":
+            pairs = sorted(enumerate(target_log_probs), key=lambda x: x[1])
+            return {idx for idx, _ in pairs[: min(m_dit, len(pairs))]}
+        if selection == "prob_threshold":
+            probs = [math.exp(float(x)) for x in target_log_probs]
+            candidates = [i for i, p in enumerate(probs) if p < prob_threshold]
+            if len(candidates) <= m_dit:
+                return set(candidates)
+            candidates.sort(key=lambda i: probs[i])
+            return set(candidates[:m_dit])
+        raise ValueError(f"Unknown online_add_think_selection: {selection}")
+
+    def _maybe_apply_online_add_think(
+        self,
+        model: "torch.nn.Module",
+        inputs: dict[str, Union["torch.Tensor", Any]],
+    ) -> None:
+        r"""Per-step DIT / DIT-P: teacher-forcing forward → insert `<add_think>` before selected response tokens."""
+        args = self.finetuning_args
+        if not getattr(args, "online_add_think", False):
+            return
+        if getattr(args, "recurrent_add_think_training", False):
+            return
+        if int(getattr(args, "online_add_think_m", 0)) <= 0:
+            return
+
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        labels = inputs.get("labels")
+        if input_ids is None or attention_mask is None or labels is None:
+            return
+        if not labels.ne(IGNORE_INDEX).any():
+            return
+
+        tok = self.processing_class
+        add_think_id = tok.convert_tokens_to_ids(THINK_TOKEN)
+        if isinstance(add_think_id, list):
+            add_think_id = add_think_id[0] if add_think_id else None
+        if add_think_id is None or (isinstance(add_think_id, int) and add_think_id < 0):
+            return
+        if isinstance(add_think_id, int) and tok.unk_token_id is not None and add_think_id == tok.unk_token_id:
+            return
+
+        mode = args.online_add_think_mode
+        m_dit = int(args.online_add_think_m)
+        selection = args.online_add_think_selection
+        prob_threshold = float(args.online_add_think_prob_threshold)
+        pad_token_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+
+        exclude_before_token_ids: set[int] = set()
+        if tok.eos_token_id is not None:
+            exclude_before_token_ids.add(int(tok.eos_token_id))
+        eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
+        if isinstance(eot_id, int) and eot_id >= 0 and eot_id != tok.unk_token_id:
+            exclude_before_token_ids.add(int(eot_id))
+
+        device = input_ids.device
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            score_out = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = score_out.logits[:, :-1, :]
+            shifted = input_ids[:, 1:]
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_ll = log_probs.gather(dim=-1, index=shifted.unsqueeze(-1)).squeeze(-1)
+        if was_training:
+            model.train()
+
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        max_pos = int(getattr(unwrapped.config, "max_position_embeddings", 8192))
+
+        bsz = input_ids.size(0)
+        new_inputs: list[list[int]] = []
+        new_labels: list[list[int]] = []
+        new_masks: list[list[int]] = []
+
+        for b in range(bsz):
+            valid_len = int(attention_mask[b].sum().item())
+            if valid_len < 2:
+                new_inputs.append(input_ids[b, :valid_len].tolist())
+                new_labels.append(labels[b, :valid_len].tolist())
+                new_masks.append([1] * valid_len)
+                continue
+
+            seq = input_ids[b, :valid_len].tolist()
+            lbl_list = labels[b, :valid_len].tolist()
+            resp_mask = [i for i in range(valid_len) if lbl_list[i] != IGNORE_INDEX]
+            if not resp_mask:
+                new_inputs.append(seq)
+                new_labels.append(lbl_list)
+                new_masks.append([1] * valid_len)
+                continue
+
+            resp_start = resp_mask[0]
+            resp_len = len(resp_mask)
+            target_ll: list[float] = []
+            for k in range(resp_len):
+                j = resp_mask[k]
+                if j > 0:
+                    target_ll.append(float(token_ll[b, j - 1].item()))
+                else:
+                    # No logits position predicts token 0; avoid invalid index -1.
+                    target_ll.append(float("inf"))
+
+            selected = self._select_online_add_think_positions(target_ll, m_dit, selection, prob_threshold)
+            selected = {i for i in selected if seq[resp_mask[i]] not in exclude_before_token_ids}
+
+            new_in: list[int] = []
+            new_lb: list[int] = []
+            for i in range(resp_start):
+                new_in.append(seq[i])
+                new_lb.append(lbl_list[i])
+
+            for k in range(resp_len):
+                j = resp_mask[k]
+                tid = seq[j]
+                lab = lbl_list[j]
+                if k in selected:
+                    new_in.append(add_think_id)
+                    new_lb.append(int(add_think_id) if mode == "ditp" else IGNORE_INDEX)
+                new_in.append(tid)
+                new_lb.append(lab)
+
+            if len(new_in) > max_pos:
+                new_in = new_in[:max_pos]
+                new_lb = new_lb[:max_pos]
+            new_ms = [1] * len(new_in)
+
+            new_inputs.append(new_in)
+            new_labels.append(new_lb)
+            new_masks.append(new_ms)
+
+        max_new_len = max(len(x) for x in new_inputs)
+        padded_ids: list[list[int]] = []
+        padded_lb: list[list[int]] = []
+        padded_ms: list[list[int]] = []
+        for i in range(bsz):
+            pad_len = max_new_len - len(new_inputs[i])
+            padded_ids.append(new_inputs[i] + [pad_token_id] * pad_len)
+            padded_lb.append(new_labels[i] + [IGNORE_INDEX] * pad_len)
+            padded_ms.append(new_masks[i] + [0] * pad_len)
+
+        inputs["input_ids"] = torch.tensor(padded_ids, dtype=torch.long, device=device)
+        inputs["attention_mask"] = torch.tensor(padded_ms, dtype=torch.long, device=device)
+        inputs["labels"] = torch.tensor(padded_lb, dtype=torch.long, device=device)
+
+        if "token_type_ids" in inputs:
+            inputs.pop("token_type_ids", None)
+
     def _maybe_mask_add_think_labels_for_ce(
         self, inputs: dict[str, Union["torch.Tensor", Any]]
     ) -> None:
@@ -1161,6 +1322,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss_reasoning = torch.tensor(0.0, device=total_loss.device)
         else:
             # ---- Standard SFT forward (no latent tokens in data) ----
+            self._maybe_apply_online_add_think(model, inputs)
             self._maybe_mask_add_think_labels_for_ce(inputs)
             if self.use_align_loss or self.use_rgha:
                 inputs["output_hidden_states"] = True

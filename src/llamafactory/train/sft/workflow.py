@@ -115,6 +115,14 @@ def run_sft(
                 f"add_think_ce_loss={getattr(finetuning_args, 'add_think_ce_loss', True)})."
             )
 
+    if getattr(finetuning_args, "online_add_think", False):
+        logger.info_rank0(
+            "online_add_think: per-step DIT/DIT-P insertion in CustomSeq2SeqTrainer — "
+            f"mode={finetuning_args.online_add_think_mode}, m={finetuning_args.online_add_think_m}, "
+            f"selection={finetuning_args.online_add_think_selection}, "
+            f"prob_threshold={finetuning_args.online_add_think_prob_threshold}"
+        )
+
     # Add a dedicated LayerNorm for mapping latent hidden states → embedding-scale inputs.
     # The model's final_norm (RMSNorm) is trained for the LM head and does NOT produce
     # outputs with the same distribution as word embeddings. This learnable LayerNorm

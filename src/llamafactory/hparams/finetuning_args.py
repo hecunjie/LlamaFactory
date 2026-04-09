@@ -858,6 +858,42 @@ class FinetuningArguments(
             )
         },
     )
+    online_add_think: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True (requires `add_think_token` and standard SFT), each training step runs a no-grad "
+                "teacher-forcing forward to score response tokens, then inserts `<add_think>` before up to "
+                "`online_add_think_m` lowest-confidence gold tokens (see `online_add_think_selection`). "
+                "`online_add_think_mode=dit` masks CE on inserted `<add_think>` labels; `ditp` keeps CE on them. "
+                "Incompatible with `recurrent_add_think_training` and latent-chain data."
+            )
+        },
+    )
+    online_add_think_mode: Literal["dit", "ditp"] = field(
+        default="ditp",
+        metadata={
+            "help": "Used when `online_add_think` is True: `dit` = no CE on inserted `<add_think>`; `ditp` = CE on `<add_think>`."
+        },
+    )
+    online_add_think_m: int = field(
+        default=5,
+        metadata={"help": "Max number of `<add_think>` insertions per sequence (when `online_add_think` is True)."},
+    )
+    online_add_think_selection: Literal["top_m", "prob_threshold"] = field(
+        default="top_m",
+        metadata={
+            "help": (
+                "How to pick insertion points among response tokens: `top_m` = lowest gold-token log-prob up to "
+                "`online_add_think_m`; `prob_threshold` = tokens with p(gold) < `online_add_think_prob_threshold`, "
+                "at most `online_add_think_m`."
+            )
+        },
+    )
+    online_add_think_prob_threshold: float = field(
+        default=0.4,
+        metadata={"help": "Used when `online_add_think_selection` is `prob_threshold`."},
+    )
     recurrent_add_think_training: bool = field(
         default=False,
         metadata={
@@ -975,6 +1011,18 @@ class FinetuningArguments(
 
         if self.low_confidence_insert_position not in {"before", "after"}:
             raise ValueError("`low_confidence_insert_position` must be either `before` or `after`.")
+
+        if getattr(self, "online_add_think", False):
+            if not self.add_think_token:
+                raise ValueError("`online_add_think` requires `add_think_token: true`.")
+            if self.recurrent_add_think_training:
+                raise ValueError("`online_add_think` cannot be used with `recurrent_add_think_training`.")
+            if self.online_add_think_mode not in {"dit", "ditp"}:
+                raise ValueError("`online_add_think_mode` must be `dit` or `ditp`.")
+            if self.online_add_think_selection not in {"top_m", "prob_threshold"}:
+                raise ValueError("`online_add_think_selection` must be `top_m` or `prob_threshold`.")
+            if self.online_add_think_m < 0:
+                raise ValueError("`online_add_think_m` must be non-negative.")
 
         if self.align_loss_weight < 0:
             raise ValueError("`align_loss_weight` must be non-negative.")
